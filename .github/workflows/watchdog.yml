@@ -1,20 +1,16 @@
 # Measure the outcome, not the runs: has each target's latest stopped
 # following upstream? Have the schedules stopped firing? Does the Worker
-# still answer?
 #
 # ⭐ sync.yml's keepalive job runs the same schedule checks, so each workflow
 # witnesses the other. A schedule that stops firing leaves no run behind to
 # fail; this is the run that notices.
 #
-# Two crons. 41 7 runs every job once a day. 7 * runs only the Worker check,
-# each hour, 20 minutes after status.yml records its probes: a Worker that
-# fails its probe in 2 status runs in a row opens worker-down within the hour.
+# Once a day. The hourly Worker check is a job of status.yml.
 name: Watchdog
 
 on:
   schedule:
     - cron: '41 7 * * *'
-    - cron: '7 * * * *'
   workflow_dispatch:
 
 permissions: {}
@@ -29,7 +25,6 @@ defaults:
 
 jobs:
   staleness:
-    if: ${{ github.event_name != 'schedule' || github.event.schedule == '41 7 * * *' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -69,7 +64,6 @@ jobs:
           exit "$rc"
 
   schedules:
-    if: ${{ github.event_name != 'schedule' || github.event.schedule == '41 7 * * *' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -88,59 +82,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/check-schedules-fired
       # Each scheduled workflow starts the others when theirs did not fire.
+      # always(): a check above that fails must not stop the restart.
       - name: Start an overdue sync or status run
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          scripts/dispatch-overdue sync.yml 240
-          scripts/dispatch-overdue status.yml 120
-
-  worker:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Raise worker-down after 2 failed status runs in a row
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # status.yml probes the Worker each hour and counts the runs in a
-          # row with a failed probe (scripts/status-collect). This reads its
-          # last record from the status branch.
           rc=0
-          git ls-remote --exit-code --heads origin status > "$RUNNER_TEMP/heads.txt" || rc=$?
-          case "$rc" in
-            0) ;;
-            2)
-              echo "::notice::no status branch yet: status.yml has recorded no Worker probe"
-              exit 0
-              ;;
-            *)
-              echo "::error::git ls-remote origin status ended $rc"
-              exit "$rc"
-              ;;
-          esac
-          git fetch --quiet --depth 1 origin status
-          git show FETCH_HEAD:status.json > "$RUNNER_TEMP/status.json"
-          git show FETCH_HEAD:worker.md > "$RUNNER_TEMP/worker.md"
-          read -r generated age failed ok <<< "$(jq -r '[.generated, (now - .generated_epoch | floor), .worker.failed_runs, .worker.ok] | map(tostring) | join(" ")' "$RUNNER_TEMP/status.json")"
-          echo "status.json from $generated, $age s ago: Worker ok $ok, failed $failed run(s) in a row"
-          # Three status runs missed: the record says nothing about now.
-          if [ "$age" -gt 10800 ]; then
-            echo "::error::the last Worker probe is from $generated, $age s ago; status.yml has stopped recording"
-            echo "  reproduce: git fetch origin status && git show FETCH_HEAD:status.json | jq '{generated, worker}'"
-            exit 1
-          fi
-          if [ "$ok" = true ]; then
-            scripts/track-issue clear worker-down "The Worker passes its probes again, measured $generated: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/status/worker.md"
-          elif [ "$ok" = false ] && [ "$failed" -ge 2 ]; then
-            scripts/track-issue raise worker-down "The Worker fails its probe" "$RUNNER_TEMP/worker.md"
-          else
-            echo "nothing to raise or clear: worker-down opens at 2 failed runs in a row"
-          fi
+          scripts/dispatch-overdue sync.yml 240 || rc=$?
+          scripts/dispatch-overdue status.yml 120 || rc=$?
+          exit "$rc"

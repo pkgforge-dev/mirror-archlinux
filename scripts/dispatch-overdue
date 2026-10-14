@@ -52,6 +52,19 @@ esac
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+# A workflow that is not active is not started: GitHub refuses the dispatch.
+# One a person disabled stays so (scripts/keep-schedules-enabled leaves it
+# too), and one GitHub disabled for inactivity is enabled by that script.
+rc=0
+gh api "repos/$slug/actions/workflows/$wf" > "$work/workflow.json" || rc=$?
+[ "$rc" -eq 0 ] || die "could not read the state of $wf (gh ended $rc)" \
+  "reproduce: gh api repos/$slug/actions/workflows/$wf --jq .state"
+state="$(jq -r '.state // "unknown"' "$work/workflow.json")"
+if [ "$state" != active ]; then
+  echo "::notice::dispatch-overdue: $wf is $state; it is not started"
+  exit 0
+fi
+
 rc=0
 gh api "repos/$slug/actions/workflows/$wf/runs?branch=main&per_page=10" > "$work/runs.json" || rc=$?
 [ "$rc" -eq 0 ] || die "could not list the runs of $wf (gh ended $rc)" \

@@ -79,7 +79,9 @@ added_date() {
       "reproduce: git -C $dir rev-parse --is-shallow-repository"
     return 0
   fi
-  git -C "$dir" log --diff-filter=A --format=%cs -- "$base" | awk 'NR == 1'
+  # --first-parent: the date CONF reached this branch (the merge or squash
+  # commit), not the date of a commit on the branch it came from.
+  git -C "$dir" log --first-parent --diff-filter=A --format=%cs -- "$base" | awk 'NR == 1'
 }
 
 worst=0

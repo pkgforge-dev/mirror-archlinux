@@ -18,9 +18,12 @@ cat > "$work/bin/gh" << 'EOF'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$STUB_DIR/calls.log"
 case "$1 $2" in
-  "api repos/"*)
+  "api repos/"*/runs\?*)
     [ "${STUB_FAIL:-0}" = 1 ] && exit 4
     cat "$STUB_DIR/runs.json"
+    ;;
+  "api repos/"*)
+    printf '{"state":"%s"}\n' "${STUB_STATE:-active}"
     ;;
   "workflow run") exit 0 ;;
   *)
@@ -65,5 +68,7 @@ case_run "a workflow name that is not a file name" '{"workflow_runs":[]}' 2 no '
 case_run "a limit that is not a number" '{"workflow_runs":[]}' 2 no sync.yml soon
 
 STUB_FAIL=1 case_run "the runs list does not read" '{"workflow_runs":[]}' 1 no sync.yml 240
+STUB_STATE=disabled_manually case_run "a workflow a person disabled" '{"workflow_runs":[]}' 0 no sync.yml 240
+STUB_STATE=disabled_inactivity case_run "a workflow GitHub disabled for inactivity" '{"workflow_runs":[]}' 0 no sync.yml 240
 
 summary

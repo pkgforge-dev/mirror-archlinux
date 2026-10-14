@@ -214,7 +214,9 @@ sync() {
       > "$o/collect-$t.log" 2>&1
   done
   rc=0
-  "$REPO_ROOT/scripts/report" "$o/plan" "$o/summaries" > "$o/report.md" 2> "$o/report.log" || rc=$?
+  # report writes its table to GITHUB_STEP_SUMMARY when that is set, as it is
+  # on a runner; here the table must go to stdout.
+  env -u GITHUB_STEP_SUMMARY "$REPO_ROOT/scripts/report" "$o/plan" "$o/summaries" > "$o/report.md" 2> "$o/report.log" || rc=$?
   printf '%s\n' "$rc" > "$o/report.rc"
   return 0
 }

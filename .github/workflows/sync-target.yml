@@ -112,7 +112,7 @@ jobs:
           path: ${{ runner.temp }}/plan/${{ inputs.target }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: results-${{ inputs.target }}-*
+          pattern: results-${{ inputs.target }}-[0-9]*
           path: ${{ runner.temp }}/results
           merge-multiple: false
       - name: Stage
@@ -197,7 +197,7 @@ jobs:
           path: ${{ runner.temp }}/stage
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: verify-${{ inputs.target }}-*
+          pattern: verify-${{ inputs.target }}-[0-9]*
           path: ${{ runner.temp }}/verify
           merge-multiple: false
       - name: Promote
@@ -248,7 +248,7 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: verify-${{ inputs.target }}-*
+          pattern: verify-${{ inputs.target }}-[0-9]*
           path: ${{ runner.temp }}/verify
           merge-multiple: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

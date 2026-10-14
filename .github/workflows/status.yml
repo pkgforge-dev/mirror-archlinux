@@ -62,8 +62,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          scripts/dispatch-overdue sync.yml 240
-          scripts/dispatch-overdue watchdog.yml 1560
+          rc=0
+          scripts/dispatch-overdue sync.yml 240 || rc=$?
+          scripts/dispatch-overdue watchdog.yml 1560 || rc=$?
+          exit "$rc"
 
   decide:
     runs-on: ubuntu-24.04
@@ -241,9 +243,12 @@ jobs:
         with:
           path: ${{ runner.temp }}/site
 
+  # Each of these names its needs' results: with no status function an if gets
+  # an implicit success() over every job before it, and bench is skipped in
+  # most runs.
   deploy:
     needs: build
-    if: ${{ github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && needs.build.result == 'success' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -283,3 +288,57 @@ jobs:
         id: deploy
         if: ${{ steps.pages.outputs.deploy == 'true' }}
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  # The Worker check reads the record build has just pushed to the status
+  # branch. Here, not in watchdog.yml: an hourly cron there would cancel a
+  # pending daily run, which shares its concurrency group.
+  worker:
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Raise worker-down after 2 failed status runs in a row
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # status.yml probes the Worker each hour and counts the runs in a
+          # row with a failed probe (scripts/status-collect). This reads its
+          # last record from the status branch.
+          rc=0
+          git ls-remote --exit-code --heads origin status > "$RUNNER_TEMP/heads.txt" || rc=$?
+          case "$rc" in
+            0) ;;
+            2)
+              echo "::notice::no status branch yet: status.yml has recorded no Worker probe"
+              exit 0
+              ;;
+            *)
+              echo "::error::git ls-remote origin status ended $rc"
+              exit "$rc"
+              ;;
+          esac
+          git fetch --quiet --depth 1 origin status
+          git show FETCH_HEAD:status.json > "$RUNNER_TEMP/status.json"
+          git show FETCH_HEAD:worker.md > "$RUNNER_TEMP/worker.md"
+          read -r generated age failed ok <<< "$(jq -r '[.generated, (now - .generated_epoch | floor), .worker.failed_runs, .worker.ok] | map(tostring) | join(" ")' "$RUNNER_TEMP/status.json")"
+          echo "status.json from $generated, $age s ago: Worker ok $ok, failed $failed run(s) in a row"
+          # Three status runs missed: the record says nothing about now.
+          if [ "$age" -gt 10800 ]; then
+            echo "::error::the last Worker probe is from $generated, $age s ago; status.yml has stopped recording"
+            echo "  reproduce: git fetch origin status && git show FETCH_HEAD:status.json | jq '{generated, worker}'"
+            exit 1
+          fi
+          if [ "$ok" = true ]; then
+            scripts/track-issue clear worker-down "The Worker passes its probes again, measured $generated: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/status/worker.md"
+          elif [ "$ok" = false ] && [ "$failed" -ge 2 ]; then
+            scripts/track-issue raise worker-down "The Worker fails its probe" "$RUNNER_TEMP/worker.md"
+          else
+            echo "nothing to raise or clear: worker-down opens at 2 failed runs in a row"
+          fi

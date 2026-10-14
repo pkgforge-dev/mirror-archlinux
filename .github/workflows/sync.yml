@@ -343,8 +343,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/check-schedules-fired
       # Each scheduled workflow starts the others when theirs did not fire.
+      # always(): a check above that fails must not stop the restart.
       - name: Start an overdue status run
-        if: ${{ github.ref == 'refs/heads/main' }}
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/dispatch-overdue status.yml 120
