@@ -166,6 +166,95 @@ check "PACMAN_OCI_SIG=registry: no .sig from %g" "" \
 : > "$work/lines"
 
 #---------------------------------------------------------------------------#
+# pacman can hold a .part in the cache. %s leaves it out, so the index adds
+# its size back, from the file's metadata, as pacman's own stat() does. Under
+# DownloadUser, a .part that root left with mode 0600 is not readable. It
+# must still have its size, and the prefetch must go on.
+#
+# The wrapper runs as a user who cannot read locked...part. A user that is
+# not root runs it with the file at mode 000. Root runs it as uid 65534,
+# through setpriv or busybox su. Each must keep this shell as the parent, and
+# a probe checks that first. busybox su also reads options after the user, so
+# no argument after it starts with -.
+#---------------------------------------------------------------------------#
+cache="$work/cache"
+dlp="$cache/download-PaRt01"
+locked="$cache/locked-1-1-any.pkg.tar.zst.part"
+mkdir -p "$dlp"
+head -c 1000 /dev/zero > "$cache/held-1-1-any.pkg.tar.zst.part"
+head -c 3000 /dev/zero > "$locked"
+as_other=()
+how=''
+why=''
+if [ "$(id -u)" -ne 0 ]; then
+  chmod 000 "$locked"
+  how="this user, with the .part at mode 000"
+else
+  chmod 755 "$work"
+  mkdir -p "$work/probe"
+  chmod 777 "$work/probe"
+  cat > "$work/probe/probe" << 'EOF'
+#!/bin/sh
+printf '%s %s\n' "$PPID" "$(id -u)" > "$1"
+EOF
+  chmod 755 "$work/probe/probe"
+  for try in setpriv su; do
+    command -v "$try" > /dev/null 2>&1 || continue
+    case $try in
+      setpriv) cand=(setpriv --reuid=65534 --regid=65534 --clear-groups --) ;;
+      *)
+        # shellcheck disable=SC2016 # the shell su starts expands it, this one must not
+        cand=(su -s /bin/sh nobody -c 'exec "$0" "$@"')
+        ;;
+    esac
+    rm -f "$work/probe/out"
+    rc=0
+    "${cand[@]}" "$work/probe/probe" "$work/probe/out" > "$work/probe/log" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ] && [ -f "$work/probe/out" ] && [ "$(cat "$work/probe/out")" = "$$ 65534" ]; then
+      as_other=("${cand[@]}")
+      how="uid 65534 through $try, with the .part of root at mode 0600"
+      break
+    fi
+    printed=''
+    if [ -f "$work/probe/out" ]; then
+      printed="$(cat "$work/probe/out")"
+    fi
+    why="$why; $try: exit $rc, printed '$printed', said '$(cat "$work/probe/log")'"
+  done
+  if [ -n "$how" ]; then
+    chmod 600 "$locked"
+    chown 65534:65534 "$dlp"
+    chmod 700 "$dlp"
+  fi
+fi
+start=$((start + 1))
+printf '%s (pacman) S 1 1 1 0 -1 4194560 837 0 0 0 0 0 0 0 20 0 1 0 %s 62676992 3236\n' "$$" "$start" > "$fake/$$/stat"
+printf '%s\0' pacman -S held locked > "$fake/$$/cmdline"
+{
+  printf '%s/held-1-1-any.pkg.tar.zst\t%s\t24\t%s\n' "$U" "$H1" "$SIG"
+  printf '%s/locked-1-1-any.pkg.tar.zst\t%s\t7\t%s\n' "$U" "$H2" "$SIG"
+} > "$work/lines"
+rc=0
+FAKE_ARGS=/dev/null PACMAN_OCI_DEBUG=1 ${as_other[@]+"${as_other[@]}"} "$W" "$dlp/held-1-1-any.pkg.tar.zst.part" "$U/held-1-1-any.pkg.tar.zst" > /dev/null 2> "$work/err" || rc=$?
+index="$dlp/.pacman-oci.$$-$start.,index"
+if [ -f "$index" ]; then
+  got="$(tr '\t' ' ' < "$index" | paste -sd '|' -)"
+else
+  got="no index; the wrapper ended $rc: $(awk '!/^pacman-oci: /' "$work/err" | paste -sd ' ' -)"
+fi
+check "a .part pacman holds is added back to the planned size" \
+  "held-1-1-any.pkg.tar.zst $H1 1024" "${got%%|*}" "head -c 1000 > CACHE/held...part; a print line with %s 24; cat DIR/.pacman-oci.KEY.,index"
+if [ -n "$how" ]; then
+  check "a .part the wrapper cannot read is sized from its metadata ($how)" \
+    "held-1-1-any.pkg.tar.zst $H1 1024|locked-1-1-any.pkg.tar.zst $H2 3007" "$got" \
+    "an unreadable CACHE/locked...part of 3000 bytes; a print line with %s 7; cat DIR/.pacman-oci.KEY.,index"
+else
+  diag "no command here runs the wrapper as uid 65534 with this shell ($$) as its parent${why:-; no setpriv and no su}"
+  ok "skipped: no way here to run the wrapper as a user who cannot read a .part"
+fi
+: > "$work/lines"
+
+#---------------------------------------------------------------------------#
 # The database prefetch reads pacman's config through pacman-conf, never
 # with --sysroot.
 #---------------------------------------------------------------------------#

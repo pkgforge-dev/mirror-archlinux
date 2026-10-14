@@ -15,16 +15,23 @@ MODE is one of:
           headers, with the full Content-Length, and 64 KiB of its body; then
           nothing for 40 s, and the connection closes. Every other GET is
           passed through.
+    norange
+          not a proxy: a plain http server for the files under UPSTREAM, a
+          directory. Each GET gets the whole file with 200, whatever its Range
+          header says. The first GET of each file over 1 MiB gets its
+          headers, with the full Content-Length, and 64 KiB of its body; then
+          nothing for 35 s, and the connection closes.
 
-UPSTREAM is the registry, host:port. The proxy listens on 127.0.0.1 on a port
-the system picks, and prints "PORT <n>" first. Then each request is one line:
-"<method> <path> range=<Range header or ->".
+UPSTREAM is the registry, host:port, or the directory for norange. The proxy
+listens on 127.0.0.1 on a port the system picks, and prints "PORT <n>" first.
+Then each request is one line: "<method> <path> range=<Range header or ->".
 
 Standard library only.
 """
 
 import http.client
 import http.server
+import os
 import sys
 import threading
 import time
@@ -60,9 +67,36 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         if body:
             self.wfile.write(body)
 
+    def serve_file(self):
+        """MODE norange: the file under UPSTREAM, whole, whatever Range says."""
+        rel = os.path.normpath("/" + self.path.split("?", 1)[0]).lstrip("/")
+        full = os.path.join(UPSTREAM, rel)
+        if not rel or not os.path.isfile(full):
+            self.answer(404, [("Content-Length", "0")], b"")
+            return
+        with open(full, "rb") as f:
+            body = f.read()
+        keep = [("Content-Type", "application/octet-stream"), ("Content-Length", str(len(body)))]
+        if len(body) > 1048576 and first_time(self.path):
+            self.send_response(200)
+            for name, value in keep:
+                self.send_header(name, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body[:65536])
+            self.wfile.flush()
+            print("  stalled after 65536 of %d bytes" % len(body), flush=True)
+            time.sleep(35)
+            self.close_connection = True
+            return
+        self.answer(200, keep, body)
+
     def handle_one(self):
         rng = self.headers.get("Range")
         print("%s %s range=%s" % (self.command, self.path, rng or "-"), flush=True)
+        if MODE == "norange":
+            self.serve_file()
+            return
         if MODE == "503":
             self.answer(503, [("Content-Length", "0")], b"")
             return

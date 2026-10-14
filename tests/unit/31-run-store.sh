@@ -120,6 +120,7 @@ check "the file a link points to is left as it was" planted "$(cat "$work/target
 #---------------------------------------------------------------------------#
 # Markers: a .sig the database manifest does not have misses with no request,
 # and a host that failed is skipped for the rest of the run, never for a .sig.
+# A .sig that fails marks no host.
 #---------------------------------------------------------------------------#
 parent 810
 K="$$-810"
@@ -138,9 +139,29 @@ check "the next package from that host misses with no request" "1:0" "$rc:$(gets
 call "$d/two-1-1-any.pkg.tar.zst.sig.part" "$U/two-1-1-any.pkg.tar.zst.sig"
 check "a .sig is still asked of that host" "1:1" "$rc:$(gets)" "client/pacman-oci DIR/two...sig.part URL"
 
+# A signature that gets no answer marks no host down. pacman ignores a failed
+# optional signature, then asks the same host for the next file.
+start=811
+while IFS='|' read -r label sig next; do
+  start=$((start + 1))
+  parent "$start"
+  d="$work/sig.$start"
+  mkdir -p "$d"
+  call "$d/${sig##*/}.part" "$sig"
+  marks="$rc:$(gets):$(find "$d" -name ".pacman-oci.$$-$start.,down.*" | wc -l | tr -d ' ')"
+  call "$d/${next##*/}.part" "$next"
+  check "$label: no host is marked down, so the next file is still asked for" "1:1:0 1:1" \
+    "$marks $rc:$(gets)" \
+    "client/pacman-oci DIR/SIG.part '$sig'; ls -a DIR; client/pacman-oci DIR/NEXT.part '$next'"
+done << EOF
+a database signature|$U/core.db.sig|$U/two-1-1-any.pkg.tar.zst
+a package signature|$U/one-1-1-any.pkg.tar.zst.sig|$U/two-1-1-any.pkg.tar.zst
+a database signature from a plain Server|http://127.0.0.1:9/core/os/x86_64/core.db.sig|http://127.0.0.1:9/core/os/x86_64/core.db
+EOF
+
 #---------------------------------------------------------------------------#
 # The sweep: entries of runs that are gone go; those of live runs, links, and
-# names that are no key stay.
+# names that are no key stay. A run with a fresh ,open is live.
 #---------------------------------------------------------------------------#
 parent 820
 d="$work/sweep"
@@ -156,6 +177,22 @@ check "the sweep keeps a live run, a link and a name that is no key" \
   ".pacman-oci.4242-5.live-1-1-any.pkg.tar.zst .pacman-oci.999999999-1.link .pacman-oci.notakey " \
   "$(entries "$d")" "ls -a DIR after one call"
 
+# A run in another pid namespace has a pid that this /proc cannot show. Its
+# ,open had a heartbeat less than 2 minutes ago, so its entries stay. A run
+# whose ,open is older than that is gone.
+parent 821
+d="$work/heartbeat"
+mkdir -p "$d"
+: > "$d/.pacman-oci.999999998-2.,open"
+: > "$d/.pacman-oci.999999998-2.tmp.AbCdEf"
+: > "$d/.pacman-oci.999999997-3.,open"
+: > "$d/.pacman-oci.999999997-3.tmp.GhIjKl"
+touch -t 200001010000 "$d/.pacman-oci.999999997-3.,open"
+call "$d/x.part" "file://$work/no-such-file"
+check "the sweep keeps a run whose ,open is fresh, and removes one whose ,open is old" \
+  ".pacman-oci.999999998-2.,open .pacman-oci.999999998-2.tmp.AbCdEf " "$(entries "$d")" \
+  "ls -a DIR after one call, with the ,open of 999999997-3 at 2000-01-01"
+
 #---------------------------------------------------------------------------#
 # The background remover: when the run ends, its entries go.
 #---------------------------------------------------------------------------#
@@ -165,6 +202,18 @@ d="$work/reap"
 mkdir -p "$d"
 call "$d/foo-1-1-any.pkg.tar.zst.part" "$U/foo-1-1-any.pkg.tar.zst"
 before="$(find "$d" -name ".pacman-oci.$K.*" | wc -l | tr -d ' ')"
+# While the run is live, the remover touches its ,open once a second.
+beat=''
+if [ -f "$d/.pacman-oci.$K.,open" ]; then
+  touch -t 200001010000 "$d/.pacman-oci.$K.,open"
+  for _ in 1 2 3 4 5 6; do
+    sleep 0.5
+    beat="$(find "$d/.pacman-oci.$K.,open" -prune -mmin -2)"
+    [ -z "$beat" ] || break
+  done
+fi
+check "the remover touches ,open within 3 s while the run is live" "$d/.pacman-oci.$K.,open" "$beat" \
+  "touch -t 200001010000 DIR/.pacman-oci.KEY.,open; sleep 3; find it -prune -mmin -2"
 parent 831
 left=1
 for _ in 1 2 3 4 5 6; do

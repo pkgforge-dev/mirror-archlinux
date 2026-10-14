@@ -9,8 +9,8 @@
 # without DownloadUser, with the signatures from the registry, with a provider
 # other than the default, through a proxy that answers 503, through a proxy
 # that cuts every blob in half, through a proxy that stops sending a large
-# blob, and through a proxy that changes one byte of the first answer for each
-# blob.
+# blob, through a proxy that changes one byte of the first answer for each
+# blob, and from a plain http Server that ignores Range.
 #
 # Needs docker or podman (CONTAINER_RUNTIME), curl, jq, sha256sum, and network
 # to pull the pinned images and oras. Ports are picked at run time and every
@@ -36,9 +36,10 @@ cut_name="client-it-cut-$id"
 dead_name="client-it-dead-$id"
 flip_name="client-it-flip-$id"
 stall_name="client-it-stall-$id"
+norange_name="client-it-norange-$id"
 cleanup() {
   local out
-  out="$("$RUNTIME" rm -f "$reg_name" "$cut_name" "$dead_name" "$flip_name" "$stall_name" 2>&1)" || diag "cleanup: $out"
+  out="$("$RUNTIME" rm -f "$reg_name" "$cut_name" "$dead_name" "$flip_name" "$stall_name" "$norange_name" 2>&1)" || diag "cleanup: $out"
   if [ "${IT_KEEP:-0}" = 1 ]; then
     echo "# kept $work" >&2
   else
@@ -112,13 +113,17 @@ check "a package is pushed as the mirror lays it out" "alpha-1.0-1-any.pkg.tar.z
   "curl http://$REG/v2/it/client/x86_64/one/manifests/<alpha tag>"
 
 #---------------------------------------------------------------------------#
-# The four proxies, on ports they pick themselves
+# The four proxies and the plain server, on ports they pick themselves
 #---------------------------------------------------------------------------#
-# proxy NAME MODE: start one and print its port
+# proxy NAME MODE: start one and print its port. The norange mode serves the
+# files of the repositories, mounted at /up, and no registry.
 proxy() {
-  local p=''
+  local p='' up="$REG"
+  if [ "$2" = norange ]; then
+    up=/up
+  fi
   "$RUNTIME" run -d --rm --name "$1" --network host -v "$FIX/fault-proxy.py:/proxy.py:ro" \
-    "$PYTHON_IMAGE" python3 -I -u /proxy.py "$2" "$REG" > /dev/null
+    -v "$work/up:/up:ro" "$PYTHON_IMAGE" python3 -I -u /proxy.py "$2" "$up" > /dev/null
   for _ in $(seq 1 30); do
     p="$("$RUNTIME" logs "$1" 2>&1 | awk '$1 == "PORT" { print $2 }')"
     [ -z "$p" ] || break
@@ -130,8 +135,11 @@ cut_port="$(proxy "$cut_name" cut)"
 dead_port="$(proxy "$dead_name" 503)"
 flip_port="$(proxy "$flip_name" flip)"
 stall_port="$(proxy "$stall_name" stall)"
-[ -n "$cut_port" ] && [ -n "$dead_port" ] && [ -n "$flip_port" ] && [ -n "$stall_port" ] || stop "the fault proxies start" \
-  "cut '$cut_port' 503 '$dead_port' flip '$flip_port' stall '$stall_port'" "reproduce: $RUNTIME logs $cut_name"
+norange_port="$(proxy "$norange_name" norange)"
+[ -n "$cut_port" ] && [ -n "$dead_port" ] && [ -n "$flip_port" ] && [ -n "$stall_port" ] && [ -n "$norange_port" ] ||
+  stop "the fault proxies start" \
+    "cut '$cut_port' 503 '$dead_port' flip '$flip_port' stall '$stall_port' norange '$norange_port'" \
+    "reproduce: $RUNTIME logs $cut_name"
 
 #---------------------------------------------------------------------------#
 # The cases
@@ -253,6 +261,17 @@ want stall s_get 0 "a blob that stops after 64 KiB: the prefetch got it, the ser
 want_cmp stall s_ms lt 20000 "a blob that stops for 40 s: pacman -S big takes less than 20 s"
 check "stall: the prefetch cut the stopped transfer and resumed it from 64 KiB" 1 "$ranges" \
   "$RUNTIME logs $stall_name | grep $big_hex"
+
+# The plain Server ignores Range. The first GET of big stops after 64 KiB for
+# 35 s, so the attempt that resumes it starts after 30 s. That attempt gets
+# curl exit 33, and the next one reads big from zero.
+consumer norange "http://127.0.0.1:$norange_port"
+big_gets="$("$RUNTIME" logs "$norange_name" 2>&1 | awk '$1 == "GET" && $2 == "/one/big-1-1-any.pkg.tar.zst" { print $3 }' | paste -sd ' ' -)"
+want norange sy_rc 0 "a plain Server that ignores Range: pacman -Sy succeeds"
+want norange s_rc 0 "a plain Server that ignores Range: pacman -S big succeeds after its range is refused past 30 s"
+want norange installed_big 0 "a plain Server that ignores Range: big is installed"
+check "norange: the refused range is followed by one GET from zero" "range=- range=bytes=65536- range=-" "$big_gets" \
+  "$RUNTIME logs $norange_name | grep big"
 
 consumer flip "oci+http://127.0.0.1:$flip_port/it/client/x86_64"
 want flip sy_rc 0 "one byte changed in each first answer: pacman -Sy succeeds"

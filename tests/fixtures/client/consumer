@@ -24,6 +24,9 @@
 #                40 s after its first 64 KiB
 #   flip         -Sy and -S alpha gamma through the proxy that changes the
 #                last byte of the first answer for each blob
+#   norange      -Sy and -S big with PACMAN_OCI_PREFETCH=0 from a plain http
+#                Server that ignores Range and stops sending big for 35 s
+#                after its first 64 KiB
 #
 # Exit status: 0 the case ran (its results say how it went), 1 it could not.
 set -euo pipefail
@@ -188,6 +191,13 @@ EOS
     t0=$(date +%s%N)
     sync s -S big
     result s_ms "$((($(date +%s%N) - t0) / 1000000))"
+    installed big
+    ;;
+  norange)
+    conf yes 'Required DatabaseNever'
+    export PACMAN_OCI_PREFETCH=0
+    sync sy -Sy
+    sync s -S big
     installed big
     ;;
   flip)

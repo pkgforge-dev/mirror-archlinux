@@ -52,7 +52,7 @@ The wrapper sorts each request into one kind:
 
 ## Requirements
 
-The wrapper needs `curl`, `awk`, `sed`, `grep`, `sha256sum`, `mktemp` and `base64`, and the other usual tools of coreutils or busybox. It uses `pacman`, `pacman-conf` and `timeout` when they are there. The test suite runs it under bash with gawk, dash with mawk, and busybox.
+The wrapper needs `curl`, `awk`, `sed`, `grep`, `sha256sum`, `mktemp` and `base64`, and the other usual tools of coreutils or busybox. Its `find` must know `-mmin`, as GNU findutils and busybox do. It uses `pacman`, `pacman-conf` and `timeout` when they are there. The test suite runs it under bash with gawk, dash with mawk, and busybox.
 
 pacman runs it with fork and execvp, never through a shell. With `DownloadUser` set, it runs as that user, from a `download-XXXXXX` directory in the sync or cache directory. Without `DownloadUser`, it runs as root, in the sync or cache directory.
 
@@ -69,7 +69,7 @@ A run of pacman makes many calls of the wrapper, one per file. The run store let
 | entry | means |
 | --- | --- |
 | `<file>` | a file ready for pacman |
-| `,open` | the store of this run is open in this directory |
+| `,open` | the store of this run is open in this directory; the background remover touches it once a second |
 | `,prefetch` | the package prefetch of this run ran here |
 | `,dbprefetch` | the database prefetch of this run ran here |
 | `,down.<host>` | the host failed once its retries were spent |
@@ -83,7 +83,9 @@ Three things remove the entries:
 
 1. pacman unlinks every regular file of its `download-XXXXXX` directory when it removes that directory.
 2. The call that opens the store starts a background remover. It waits until the pacman run ends, then removes the run's entries.
-3. Until the store of its run is open in a directory, each call removes the entries of runs that are gone there. A run is gone when its pid is missing or its start time differs.
+3. Until the store of its run is open in a directory, each call removes the entries of runs that are gone there. A run is gone when two things are true. Its pid is missing or has another start time. It has no `,open` there that is less than 2 minutes old.
+
+While a run is live, its background remover touches its `,open` once a second. A run in another pid namespace has a pid that this `/proc` cannot show. Its fresh `,open` keeps its entries. When a pid namespace ends, its remover ends with it. The first call there after 2 minutes removes the entries that the run left.
 
 ⚠ Entries stay flat in OUTPUT's directory, never in a subdirectory. pacman cannot remove a `download-XXXXXX` directory that holds a subdirectory, and leaves it behind. The private work directory goes there only when `TMPDIR` is not writable, and the wrapper removes it on exit.
 
@@ -112,7 +114,11 @@ The prefetch runs once per run when all of these are true:
 3. It finds the pacman binary from `/proc/<ppid>/exe`, else from `argv[0]`. The download user cannot read `/proc/<ppid>/exe`.
 4. It runs pacman with `--print --print-format '%l<TAB>%h<TAB>%s<TAB>%g' --noconfirm --noprogressbar`, under `timeout 120` when `timeout` exists. `pacman -S --print` takes no lock and needs no root.
 
-Each line names the first Server URL (`%l`), the sha256 (`%h`), the download size (`%s`) and the base64 `%PGPSIG%` (`%g`). A `file://` line is a cached file and is skipped. A line is work when all of these are true:
+Each line names the first Server URL (`%l`), the sha256 (`%h`), the download size (`%s`) and the base64 `%PGPSIG%` (`%g`). A `file://` line is a cached file and is skipped.
+
+`%s` leaves out a `.part` that pacman holds in the cache, so the wrapper adds the size of that `.part` back. It reads the size from the file's metadata (`ls -ln`), as pacman's own `stat()` does. So a `.part` that root left with mode 0600 still counts under `DownloadUser`.
+
+A line is work when all of these are true:
 
 - it starts with `oci://`, `oci+http://`, `https://` or `http://`
 - it names a package file, not a `.sig`, and `%s` is a number
@@ -176,9 +182,9 @@ A file the store does not hold is read alone.
 
 A blob download keeps OUTPUT between attempts and resumes with `--continue-at -`. A resumed file that fails the sha256 check is removed and fetched once more from zero.
 
-An attempt is tried again after HTTP 408, 429 or 5xx. It is also tried again after curl exits 6, 16, 18, 28, 35, 52, 55, 56 or 92. These are a name, TLS, HTTP/2 or time failure, an empty answer, or a cut transfer. After curl exit 33 (a range the server refuses), OUTPUT is removed and the attempt is tried again. Any other failure misses at once. The waits between attempts are 1 s, then 2 s.
+An attempt is tried again after HTTP 408, 429 or 5xx. It is also tried again after curl exits 6, 16, 18, 28, 35, 52, 55, 56 or 92. These are a name, TLS, HTTP/2 or time failure, an empty answer, or a cut transfer. After curl exit 33 (a range the server refuses), OUTPUT is removed, and the attempts after it start from zero. Any other failure misses at once. The waits between attempts are 1 s, then 2 s.
 
-When the size of the file is known, each attempt has a time limit:
+When the size of the file is known and the file can resume, each attempt has a time limit:
 
 | attempt | time limit |
 | --- | --- |
@@ -186,7 +192,9 @@ When the size of the file is known, each attempt has a time limit:
 | 2 | 30 s plus 1 s per 128 KiB |
 | 3 | none |
 
-No attempt starts after 30 s, unless the one before it added bytes.
+An attempt that cannot resume has no time limit, because a cut would lose all its bytes. That is an attempt after a refused range, and the fetch from zero after a resumed file failed its sha256 check.
+
+No attempt starts after 30 s, unless the one before it added bytes. A refused range starts these 30 s again.
 
 ### Plain URLs
 
@@ -194,7 +202,9 @@ pacman's own downloader is off when an `XferCommand` is set. So the wrapper also
 
 ### The host blacklist
 
-A request that ends with no answer (HTTP 000), 429 or 5xx, once its own retries are spent, writes `,down.<host>`. Later `pkg` and `db` requests of the same run, in the same directory, to that host miss at once. pacman then tries the next Server with no wait for timeouts.
+A `pkg` or `db` request that ends with no answer (HTTP 000), 429 or 5xx, once its own retries are spent, writes `,down.<host>`. Later `pkg` and `db` requests of the same run, in the same directory, to that host miss at once. pacman then tries the next Server with no wait for timeouts.
+
+A signature request never writes `,down.<host>`. pacman ignores a failed optional signature, then asks the same host for the next file. A failed required signature stops the transaction anyway. pacman's own downloader also never counts an optional request against a server.
 
 ### An absent database signature
 
