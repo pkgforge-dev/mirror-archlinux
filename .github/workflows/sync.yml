@@ -57,9 +57,16 @@ on:
 
 permissions: {}
 
+# With the default queue (single), a group holds one pending run, and a newer
+# run cancels it: a dispatch with allow_older could be replaced by the next
+# scheduled run. queue: max keeps up to 100 pending runs, each in its turn
+# (docs.github.com, "Control the concurrency of workflows and jobs").
+# actionlint 1.7.12 does not know the key: tests/static/20-actionlint.sh
+# ignores that one message.
 concurrency:
   group: sync
   cancel-in-progress: false
+  queue: max
 
 defaults:
   run:
@@ -323,11 +330,27 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/dl-plan" "$RUNNER_TEMP/summaries"
           scripts/report "$RUNNER_TEMP/dl-plan" "$RUNNER_TEMP/summaries"
+      # GitHub refuses to start a workflow that is not active, and a person
+      # may disable status.yml on purpose: a notice, as in
+      # scripts/dispatch-overdue, not a red sync. A state that does not read
+      # still fails the step.
       - name: Start the status workflow
         if: ${{ always() && github.ref == 'refs/heads/main' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run status.yml --ref main --repo "$GITHUB_REPOSITORY"
+        run: |
+          rc=0
+          state="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/status.yml" --jq .state)" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::could not read the state of status.yml (gh ended $rc)"
+            echo "  reproduce: gh api repos/$GITHUB_REPOSITORY/actions/workflows/status.yml --jq .state"
+            exit "$rc"
+          fi
+          if [ "$state" = active ]; then
+            gh workflow run status.yml --ref main --repo "$GITHUB_REPOSITORY"
+          else
+            echo "::notice::status.yml is $state; it is not started"
+          fi
 
   # No needs, in either direction: this runs whatever the sync does, and the
   # watchdog workflow runs the same two checks, so each witnesses the other.

@@ -33,12 +33,23 @@
 #   schema 1, generated, generated_epoch, source, site_url, registry,
 #   namespace, worker_url
 #   sync      {workflow, interval_minutes, tolerance_days}, from sync.yml's cron
-#   summary   {targets, promoted, current, upstream_files, upstream_bytes,
-#             mirrored_files, mirrored_bytes, coverage_files, coverage_bytes,
-#             oldest_age_seconds, newest_age_seconds}
+#   summary   {targets, promoted, current, measured, mirror_unread,
+#             upstream_files, upstream_bytes, mirrored_files, mirrored_bytes,
+#             coverage_files, coverage_bytes, oldest_age_seconds,
+#             newest_age_seconds}
+#             measured counts the targets with a coverage, read on both
+#             sides. The files, bytes and coverage sums are over those
+#             targets only, and null when there is none. mirror_unread counts
+#             the targets whose registry did not answer (mirror state error):
+#             promoted does not count them, whatever they hold.
 #   worker    {probed, ok, probes, failures, failed_runs, failing_since,
+#             failing_seconds, down, down_after {runs, seconds},
 #             median_seconds}; failed_runs counts the runs in a row, this one
-#             included, in which a probe failed
+#             included, in which a probe failed. failing_seconds is the time
+#             from failing_since to this run. down is true when failed_runs
+#             and failing_seconds both reach down_after: status.yml raises
+#             worker-down then. Runs are not an hour apart: sync.yml also
+#             starts a status run when it ends.
 #   ghcr      {median_manifest_seconds}
 #   targets[] {target, arch, repo, repository,
 #     upstream {ok, server, sha256, files, bytes, newest_builddate, tried[]
@@ -48,7 +59,8 @@
 #               newest_builddate},
 #     current  true when the mirror database is upstream's database,
 #     coverage {files, of_files, ratio_files, bytes, of_bytes, ratio_bytes,
-#               missing, missing_names[]} or null when upstream is unread,
+#               missing, missing_names[]} or null when upstream or the
+#               registry is unread (mirror state error),
 #     age_seconds, lag_seconds,
 #     worker   {db, package}, each {url, code, expect, seconds, location, ok,
 #               error} or null}
@@ -56,8 +68,11 @@
 # history.jsonl, one object per line:
 #   {"t": generated, "w": {"ok", "f": failed_runs, "s": failing_since, "ms"},
 #    "g": {"ms"}, "x": {"<target>": {"n": upstream files, "m": mirrored
-#    files, "b": upstream bytes, "mb": mirrored bytes, "a": age, "l": lag,
-#    "c": 1 current, 0 not, null unknown}}}
+#    files, "b": upstream bytes, "mb": mirrored bytes, "k": 1 carried, "a":
+#    age, "l": lag, "c": 1 current, 0 not, null unknown}}}
+# A target with no coverage in this run keeps n, m, b and mb from the last
+# line that has them, with "k": 1. So a read that fails once does not move
+# the coverage history of its architecture. With no such line they are null.
 #
 # Environment:
 #   MIRROR_NAMESPACE      owner/name, default from GITHUB_REPOSITORY
@@ -93,6 +108,11 @@ WORKER_URL="${STATUS_WORKER_URL-https://ghcr.mirror.archlinux.pkgforge.dev}"
 WORKER_URL="${WORKER_URL%/}"
 HISTORY_LINES="${STATUS_HISTORY_LINES:-2000}"
 [[ "$HISTORY_LINES" =~ ^[1-9][0-9]*$ ]] || die "STATUS_HISTORY_LINES must be a positive integer, not '$HISTORY_LINES'"
+# worker-down: failed probes in this many runs in a row, over at least this
+# many seconds. The cron runs status.yml at :47 each hour, and sync.yml starts
+# it after each sync, so two runs can be minutes apart.
+WORKER_DOWN_RUNS=2
+WORKER_DOWN_SECONDS=3000
 owner="${MIRROR_NAMESPACE%%/*}"
 name_part="${MIRROR_NAMESPACE#*/}"
 SITE_URL="${STATUS_SITE_URL:-https://$owner.github.io/${name_part%%/*}/}"
@@ -424,6 +444,11 @@ if [ -s "$out/history.jsonl" ]; then
   if [ "$rc" -eq 0 ] && [[ "$parsed" =~ ^([0-9]+)\ ?(.*)$ ]]; then
     prev_f="${BASH_REMATCH[1]}"
     prev_s="${BASH_REMATCH[2]}"
+    if [ -n "$prev_s" ] && ! [[ "$prev_s" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+      warn "the last line of $out/history.jsonl names a failing time '$prev_s' that is not ISO 8601 UTC; the Worker failure time starts again" \
+        "reproduce: tail -n 1 $out/history.jsonl | jq .w"
+      prev_s=""
+    fi
   else
     warn "the last line of $out/history.jsonl does not read; the Worker failure count starts again" \
       "$(cat "$work/jq.err")" "reproduce: tail -n 1 $out/history.jsonl | jq ."
@@ -435,10 +460,12 @@ jq -s \
   --arg site "$SITE_URL" --arg registry "$MIRROR_REGISTRY" --arg ns "$MIRROR_NAMESPACE" \
   --arg worker "$WORKER_URL" --argjson interval "$(num "$interval")" \
   --argjson tolerance "$(num "${tolerance:-}")" \
-  --argjson prev_f "$prev_f" --arg prev_s "$prev_s" '
+  --argjson prev_f "$prev_f" --arg prev_s "$prev_s" \
+  --argjson down_runs "$WORKER_DOWN_RUNS" --argjson down_secs "$WORKER_DOWN_SECONDS" '
   def median: sort | if length == 0 then null elif length % 2 == 1 then .[length / 2 | floor]
     else (.[length / 2 - 1] + .[length / 2]) / 2 end;
-  def sum_of(f): map(f // 0) | add // 0;
+  # A sum over the measured targets; null when none was measured, not 0.
+  def total(f): if length == 0 then null else map(f // 0) | add end;
   . as $t
   | ([$t[] | .worker.db, .worker.package | select(. != null)]) as $probes
   | ([$probes[] | select(.ok == false)] | length) as $fail
@@ -446,7 +473,14 @@ jq -s \
      elif $fail > 0 then false
      elif ([$probes[] | select(.ok == true)] | length) > 0 then true
      else null end) as $wok
+  | (if $wok == false then $prev_f + 1 else 0 end) as $f_runs
+  | (if $wok == false then (if $prev_f > 0 and $prev_s != "" then $prev_s else $generated end) else null end) as $f_since
+  | (if $f_since == null then null else $now - ($f_since | fromdateiso8601) end) as $f_secs
   | ([$t[] | select(.coverage != null)]) as $cov
+  | ($cov | total(.coverage.of_files)) as $nf
+  | ($cov | total(.coverage.files)) as $mf
+  | ($cov | total(.coverage.of_bytes)) as $nb
+  | ($cov | total(.coverage.bytes)) as $mb
   | ([$t[] | .age_seconds | select(. != null)]) as $ages
   | {
       schema: 1,
@@ -462,14 +496,14 @@ jq -s \
         targets: ($t | length),
         promoted: ([$t[] | select(.mirror.state == "promoted")] | length),
         current: ([$t[] | select(.current == true)] | length),
-        upstream_files: ($cov | sum_of(.coverage.of_files)),
-        upstream_bytes: ($cov | sum_of(.coverage.of_bytes)),
-        mirrored_files: ($cov | sum_of(.coverage.files)),
-        mirrored_bytes: ($cov | sum_of(.coverage.bytes)),
-        coverage_files: (($cov | sum_of(.coverage.of_files)) as $n
-          | if $n > 0 then ($cov | sum_of(.coverage.files)) / $n else null end),
-        coverage_bytes: (($cov | sum_of(.coverage.of_bytes)) as $n
-          | if $n > 0 then ($cov | sum_of(.coverage.bytes)) / $n else null end),
+        measured: ($cov | length),
+        mirror_unread: ([$t[] | select(.mirror.state == "error")] | length),
+        upstream_files: $nf,
+        upstream_bytes: $nb,
+        mirrored_files: $mf,
+        mirrored_bytes: $mb,
+        coverage_files: (if ($nf // 0) > 0 then $mf / $nf else null end),
+        coverage_bytes: (if ($nb // 0) > 0 then $mb / $nb else null end),
         oldest_age_seconds: ($ages | max),
         newest_age_seconds: ($ages | min)
       },
@@ -478,8 +512,11 @@ jq -s \
         ok: $wok,
         probes: ($probes | length),
         failures: $fail,
-        failed_runs: (if $wok == false then $prev_f + 1 else 0 end),
-        failing_since: (if $wok == false then (if $prev_f > 0 and $prev_s != "" then $prev_s else $generated end) else null end),
+        failed_runs: $f_runs,
+        failing_since: $f_since,
+        failing_seconds: $f_secs,
+        down: ($wok == false and $f_runs >= $down_runs and $f_secs >= $down_secs),
+        down_after: {runs: $down_runs, seconds: $down_secs},
         median_seconds: ([$probes[] | .seconds | select(. != null)] | median)
       },
       ghcr: {median_manifest_seconds: ([$t[] | .mirror.manifest_seconds | select(. != null)] | median)},
@@ -490,15 +527,39 @@ mv "$work/status.json" "$out/status.json"
 #---------------------------------------------------------------------------#
 # History: one compact line per run, the last HISTORY_LINES kept
 #---------------------------------------------------------------------------#
-jq -c '{
+# The last measured files and bytes of each target, from the lines before.
+# A line that does not read is left out here, and counted.
+known='{"x":{},"bad":0}'
+if [ -s "$out/history.jsonl" ]; then
+  rc=0
+  known="$(jq -c -n -R '
+    reduce (inputs | try fromjson catch "unreadable") as $l ({x: {}, bad: 0};
+      if ($l | type) != "object" then .bad += 1
+      else reduce (($l.x // {}) | if type == "object" then to_entries[] else empty end
+                   | select((.value | type) == "object" and (.value.n | type) == "number"
+                            and (.value.m | type) == "number")) as $e (.;
+             .x[$e.key] = ($e.value | {n, m, b, mb}))
+      end)' "$out/history.jsonl" 2> "$work/known.err")" || rc=$?
+  [ "$rc" -eq 0 ] || die "could not read $out/history.jsonl for the last measured files (jq ended $rc)" \
+    "$(cat "$work/known.err")" "reproduce: jq -R 'fromjson? | .x' $out/history.jsonl"
+  bad="$(jq -r .bad <<< "$known")"
+  if [ "$bad" -gt 0 ]; then
+    warn "$bad line(s) of $out/history.jsonl do not read as JSON objects; they give no last measured files" \
+      "reproduce: jq -c . $out/history.jsonl"
+  fi
+fi
+jq -c --argjson known "$known" '{
     t: .generated,
     w: {ok: .worker.ok, f: .worker.failed_runs, s: .worker.failing_since,
         ms: (if .worker.median_seconds == null then null else (.worker.median_seconds * 1000 | round) end)},
     g: {ms: (if .ghcr.median_manifest_seconds == null then null else (.ghcr.median_manifest_seconds * 1000 | round) end)},
-    x: (.targets | map({key: .target, value: {
-          n: .coverage.of_files, m: .coverage.files, b: .coverage.of_bytes, mb: .coverage.bytes,
-          a: .age_seconds, l: .lag_seconds,
-          c: (if .current == true then 1 elif .current == false then 0 else null end)}}) | from_entries)
+    x: (.targets | map({key: .target, value: (
+          (if .coverage != null then
+             {n: .coverage.of_files, m: .coverage.files, b: .coverage.of_bytes, mb: .coverage.bytes}
+           elif $known.x[.target] != null then $known.x[.target] + {k: 1}
+           else {n: null, m: null, b: null, mb: null} end)
+          + {a: .age_seconds, l: .lag_seconds,
+             c: (if .current == true then 1 elif .current == false then 0 else null end)})}) | from_entries)
   }' "$out/status.json" > "$work/line.json"
 if [ -f "$out/history.jsonl" ]; then
   cat "$out/history.jsonl" "$work/line.json" > "$work/history.all"
@@ -516,7 +577,7 @@ jq -r '
   def cell: if . == null then "-" else tostring end;
   "<!-- written by scripts/status-collect on \(.generated) -->",
   (if .worker.ok == false then
-     "The Worker fails its probe in \(.worker.failed_runs) run(s) in a row, since \(.worker.failing_since)."
+     "The Worker fails its probe in \(.worker.failed_runs) run(s) in a row, since \(.worker.failing_since). worker-down opens at \(.worker.down_after.runs) runs in a row over \(.worker.down_after.seconds / 60 | floor) minutes or more."
    elif .worker.ok == true then "The Worker passes every probe."
    else "The Worker was not probed, or no probe could be judged." end),
   "",
@@ -536,4 +597,4 @@ jq -r '
 ' "$out/status.json" > "$work/worker.md"
 mv "$work/worker.md" "$out/worker.md"
 
-jq -r '"status-collect: \(.summary.targets) target(s), \(.summary.promoted) promoted, coverage \(if .summary.coverage_files == null then "unknown" else (.summary.coverage_files * 1000 | floor / 10 | tostring) + "%" end), worker \(.worker.ok | if . == null then "not judged" else tostring end), failed runs \(.worker.failed_runs)"' "$out/status.json" >&2
+jq -r '"status-collect: \(.summary.targets) target(s), \(.summary.promoted) promoted, \(.summary.mirror_unread) not read from the registry, coverage \(if .summary.coverage_files == null then "unknown" else (.summary.coverage_files * 1000 | floor / 10 | tostring) + "%" end) over \(.summary.measured) measured, worker \(.worker.ok | if . == null then "not judged" else tostring end), failed runs \(.worker.failed_runs), down \(.worker.down)"' "$out/status.json" >&2

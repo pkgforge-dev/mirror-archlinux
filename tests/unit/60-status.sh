@@ -7,7 +7,9 @@
 # first on PATH as curl. scripts/status-render then runs on what was
 # collected, with a fixture history and bench file. Every SVG must parse as
 # XML, every badge must carry its text, and the page must reference every
-# chart and badge.
+# chart and badge. With one registry read that fails, and with none that
+# answers, a sum over part of the targets must say which part, and nothing
+# may say "not mirrored" for a registry that did not answer.
 #
 # ⚠ db_records needs GNU tar, and status-render needs python3. A shell that
 # lacks one skips that part and says why: busybox has neither, Arch has no
@@ -244,8 +246,12 @@ check "x86_64-multilib: no db_server answers: upstream not read, coverage unknow
 
 check "summary: 5 targets, 2 promoted, 1 current, 7 of 13 files" "5 2 1 7 13" \
   "$(q '.summary | "\(.targets) \(.promoted) \(.current) \(.mirrored_files) \(.upstream_files)"')" "jq .summary OUT/status.json"
+check "summary: the sums count 4 measured targets; x86_64-multilib is not read upstream" "4 0" \
+  "$(q '.summary | "\(.measured) \(.mirror_unread)"')" "jq .summary OUT/status.json"
 check "worker: one failed probe fails the run, the first in a row" "false 1 1 2026-10-14T03:00:00Z" \
   "$(q '.worker | "\(.ok) \(.failures) \(.failed_runs) \(.failing_since)"')" "jq .worker OUT/status.json"
+check "worker: one failed run is not down" "0 false" \
+  "$(q '.worker | "\(.failing_seconds) \(.down)"')" "jq .worker OUT/status.json"
 check "history.jsonl has one line for one run" 1 "$(awk 'END { print NR }' "$out/history.jsonl")" "wc -l OUT/history.jsonl"
 check "history keeps files, mirrored files and age per target" "5 3 10800" \
   "$(jq -r '.x["x86_64-extra"] | "\(.n) \(.m) \(.a)"' "$out/history.jsonl")" "jq -c . OUT/history.jsonl"
@@ -269,6 +275,8 @@ collect "$out" "$((NOW + 3600))" || rc=$?
 check "a second run measures and exits 0" 0 "$rc" "$RP"
 check "worker: two failed runs in a row, failing since the first" "false 2 2026-10-14T03:00:00Z" \
   "$(q '.worker | "\(.ok) \(.failed_runs) \(.failing_since)"')" "jq .worker OUT/status.json"
+check "worker: two failed runs an hour apart are down" "3600 true" \
+  "$(q '.worker | "\(.failing_seconds) \(.down)"')" "jq .worker OUT/status.json"
 check "worker: a 302 to http is not a redirect to https://*.githubusercontent.com" \
   "302 to 'pkg-containers.githubusercontent.com', not to https://*.githubusercontent.com" \
   "$(q '.targets[] | select(.target == "x86_64-extra") | .worker.package.error')" "jq .targets OUT/status.json"
@@ -278,8 +286,20 @@ check "history.jsonl has two lines after two runs" 2 "$(awk 'END { print NR }' "
 redirect x86_64/extra/alpha-1-1-x86_64.pkg.tar.zst
 rc=0
 collect "$out" "$((NOW + 7200))" || rc=$?
-check "worker: a run that passes clears the count" "true 0 null" \
-  "$(q '.worker | "\(.ok) \(.failed_runs) \(.failing_since)"')" "jq .worker OUT/status.json"
+check "worker: a run that passes clears the count" "true 0 null false" \
+  "$(q '.worker | "\(.ok) \(.failed_runs) \(.failing_since) \(.down)"')" "jq .worker OUT/status.json"
+
+# sync.yml starts a status run when it ends, so the :47 run can follow it
+# within minutes. Two failed runs 7 minutes apart are not yet down.
+out="$work/run2b"
+mkdir -p "$out"
+cp "$out1/history.jsonl" "$out/history.jsonl"
+redirect x86_64/extra/alpha-1-1-x86_64.pkg.tar.zst 503 ''
+rc=0
+collect "$out" "$((NOW + 420))" || rc=$?
+check "worker: two failed runs 7 minutes apart are not down; down needs 50 minutes" "false 2 420 false" \
+  "$(q '.worker | "\(.ok) \(.failed_runs) \(.failing_seconds) \(.down)"')" "jq .worker OUT/status.json"
+redirect x86_64/extra/alpha-1-1-x86_64.pkg.tar.zst
 
 # History is cut to the last 2000 lines, the new line last.
 out="$work/run3"
@@ -305,6 +325,43 @@ if grep -q 'history.jsonl does not read' "$out.err"; then
 else
   fail "the line that does not read is named on stderr" "$(sed -n 1,20p "$out.err")" "$RP"
 fi
+redirect x86_64/extra/alpha-1-1-x86_64.pkg.tar.zst
+
+# The registry answers 503 for x86_64-extra's latest. Its coverage is not
+# measured: the sums say over which targets they are, and the history keeps
+# its last measured files.
+out="$work/run5"
+mkdir -p "$out"
+cp "$out1/history.jsonl" "$out/history.jsonl"
+printf '503\n' > "$net/ghcr.io/v2/test/mirror/x86_64/extra/manifests/latest.code"
+rc=0
+collect "$out" "$((NOW + 3600))" || rc=$?
+rm "$net/ghcr.io/v2/test/mirror/x86_64/extra/manifests/latest.code"
+check "a registry that answers 503 for one target: the collect measures and exits 0" 0 "$rc" "$RP"
+check "x86_64-extra: latest answers 503: mirror state error, coverage unknown" "error null" \
+  "$(q '.targets[] | select(.target == "x86_64-extra") | "\(.mirror.state) \(.coverage)"')" "jq .targets OUT/status.json"
+check "summary: 1 promoted, 3 measured, 1 not read from the registry, 4 of 8 files" "1 3 1 4 8" \
+  "$(q '.summary | "\(.promoted) \(.measured) \(.mirror_unread) \(.mirrored_files) \(.upstream_files)"')" "jq .summary OUT/status.json"
+check "history: x86_64-extra keeps its last measured files, marked carried" "5 3 1500 600 1" \
+  "$(jq -rs '.[-1].x["x86_64-extra"] | "\(.n) \(.m) \(.b) \(.mb) \(.k)"' "$out/history.jsonl")" "tail -n 1 OUT/history.jsonl | jq ."
+check "history: a measured target is not marked carried" "4 4 null" \
+  "$(jq -rs '.[-1].x["x86_64-core"] | "\(.n) \(.m) \(.k)"' "$out/history.jsonl")" "tail -n 1 OUT/history.jsonl | jq ."
+check "history: a target never measured stays unknown" "null null null" \
+  "$(jq -rs '.[-1].x["x86_64-multilib"] | "\(.n) \(.m) \(.k)"' "$out/history.jsonl")" "tail -n 1 OUT/history.jsonl | jq ."
+
+# GHCR does not resolve: no target's registry reads. Nothing says a target
+# is not mirrored, and no sum is 0.
+out="$work/run6"
+mkdir -p "$out"
+cp "$out1/history.jsonl" "$out/history.jsonl"
+mv "$net/ghcr.io" "$net/ghcr.io.off"
+rc=0
+collect "$out" "$((NOW + 3600))" || rc=$?
+mv "$net/ghcr.io.off" "$net/ghcr.io"
+check "a registry that does not resolve: the collect measures and exits 0" 0 "$rc" "$RP"
+check "summary: no registry read: 0 promoted, 5 not read, 0 measured, every sum unknown" "0 5 0 null null null null null" \
+  "$(q '.summary | "\(.promoted) \(.mirror_unread) \(.measured) \(.mirrored_files) \(.upstream_files) \(.mirrored_bytes) \(.upstream_bytes) \(.coverage_files)"')" \
+  "jq .summary OUT/status.json"
 
 #---------------------------------------------------------------------------#
 # check-staleness: a target with no latest is new while git says its file is
@@ -325,6 +382,20 @@ else
   }
   add_target aarch64 2026-10-01
   add_target loong64 2026-10-13
+  # riscv64-core: added with enabled = no long ago, enabled one day ago. Its
+  # grace starts when it is enabled.
+  mkdir -p "$net/up.test/riscv64/core"
+  cp "$net/up.test/aarch64/core/core.db" "$net/up.test/riscv64/core/core.db"
+  # shellcheck disable=SC2016 # the target file's own placeholders
+  printf 'arch = riscv64\nrepo = core\ndb_server = https://up.test/$arch/$repo\nenabled = no\n' > "$srepo/targets/riscv64-core.conf"
+  git -C "$srepo" add targets/riscv64-core.conf
+  GIT_AUTHOR_DATE="2026-09-01T12:00:00Z" GIT_COMMITTER_DATE="2026-09-01T12:00:00Z" \
+    git -C "$srepo" -c user.name=test -c user.email=test@example.invalid commit --quiet -m "add riscv64-core, disabled"
+  # shellcheck disable=SC2016 # the target file's own placeholders
+  printf 'arch = riscv64\nrepo = core\ndb_server = https://up.test/$arch/$repo\n' > "$srepo/targets/riscv64-core.conf"
+  git -C "$srepo" add targets/riscv64-core.conf
+  GIT_AUTHOR_DATE="2026-10-13T12:00:00Z" GIT_COMMITTER_DATE="2026-10-13T12:00:00Z" \
+    git -C "$srepo" -c user.name=test -c user.email=test@example.invalid commit --quiet -m "enable riscv64-core"
   staleness() {
     local rc=0
     PATH="$bin:$PATH" FAKE_CURL_ROOT="$net" TARGETS_DIR="$2" MIRROR_NAMESPACE=test/mirror \
@@ -340,7 +411,9 @@ else
     "$(cat "$work/stale1/aarch64-core.state")" "$RS"
   check "check-staleness: no latest, added 1 day ago, tolerance 3: new" new \
     "$(cat "$work/stale1/loong64-core.state")" "$RS"
-  if grep -q '| target file added | 2026-10-01 |' "$work/stale1/aarch64-core.md"; then
+  check "check-staleness: no latest, added disabled 43 days ago, enabled 1 day ago: new" new \
+    "$(cat "$work/stale1/riscv64-core.state")" "$RS; git -C <repo> log -- targets/riscv64-core.conf"
+  if grep -q '| target file added or enabled | 2026-10-01 |' "$work/stale1/aarch64-core.md"; then
     ok "check-staleness: the issue body says when the target was added"
   else
     fail "check-staleness: the issue body says when the target was added" \
@@ -433,6 +506,15 @@ for name, words in sorted(spec["badges"].items()):
     lost = [w for w in words if w not in t]
     say(not lost, "badge %s carries its text: %s" % (name, " | ".join(words)), "text: %s; not found: %s" % (t, lost))
 
+for name, words in sorted(spec.get("badges_without", {}).items()):
+    try:
+        t = texts(os.path.join(site, "badges", name + ".svg"))
+    except (OSError, ET.ParseError) as e:
+        say(False, "badge %s does not say %s" % (name, " | ".join(words)), str(e))
+        continue
+    seen = [w for w in words if w in t]
+    say(not seen, "badge %s does not say %s" % (name, " | ".join(words)), "text: %s; found: %s" % (t, seen))
+
 for name, words in sorted(spec.get("chart_text", {}).items()):
     try:
         t = texts(os.path.join(site, "charts", name + ".svg"))
@@ -447,16 +529,23 @@ class Refs(HTMLParser):
     def __init__(self):
         super().__init__()
         self.refs = set()
+        self.text = []
 
     def handle_starttag(self, tag, attrs):
         for k, v in attrs:
             if k in ("src", "href", "srcset") and v and "://" not in v and not v.startswith("#"):
                 self.refs.add(v)
 
+    def handle_data(self, data):
+        self.text.append(data)
+
 
 r = Refs()
 with open(os.path.join(site, "index.html"), encoding="utf-8") as f:
     r.feed(f.read())
+page_text = " ".join(" ".join(r.text).split())
+for words in spec.get("page_text", []):
+    say(words in page_text, "index.html says: %s" % words, "not found in the page text")
 want = (["charts/%s.svg" % c for c in spec["charts"]] + ["charts/narrow/%s.svg" % c for c in spec["charts"]]
         + ["badges/%s.svg" % b for b in spec["badges"]])
 lost = [w for w in want if w not in r.refs]
@@ -497,8 +586,13 @@ render() {
 
 CHARTS='["coverage","freshness","size","history-coverage","history-age","speed"]'
 spec() {
-  # spec BENCH_CASES HISTORY SPEED_WORDS
-  jq -nc --argjson charts "$CHARTS" --argjson cases "$1" --argjson history "$2" --argjson speed "$3" '{
+  # spec BENCH_CASES HISTORY SPEED_WORDS [OVERRIDES]: OVERRIDES is merged
+  # into the spec, an object at a time; a list in it replaces the list.
+  # page_text_more adds to page_text.
+  local over="${4:-}"
+  [ -n "$over" ] || over='{}'
+  jq -nc --argjson charts "$CHARTS" --argjson cases "$1" --argjson history "$2" --argjson speed "$3" \
+    --argjson over "$over" '{
     charts: $charts, bench_cases: $cases, history: $history,
     svgs: (($charts | length) * 2 + 10),
     files: (["index.html", "status.json", "history.json", "bench.json"]
@@ -509,20 +603,28 @@ spec() {
       "x86_64-multilib": ["x86_64-multilib", "not mirrored"],
       "aarch64-core": ["aarch64-core", "not mirrored"],
       "loong64-core": ["loong64-core", "not mirrored"],
-      "x86_64": ["x86_64", "77.7%"],
+      "x86_64": ["x86_64", "77.7%", "3.0 h", "2 of 3 measured"],
       "aarch64": ["aarch64", "not mirrored"],
       "loong64": ["loong64", "not mirrored"],
-      "all": ["mirror", "53.8%", "2/5 repos"],
+      "all": ["mirror", "53.8%", "2/5 repos", "4 of 5 measured"],
       "speed": $speed},
+    badges_without: {"x86_64-core": ["measured"], "speed": ["ago", "date unknown"]},
     chart_text: {
-      coverage: ["Coverage by repository", "53.8%", "x86_64", "aarch64", "loong64", "core", "extra", "multilib", "upstream only"],
+      coverage: ["Coverage by repository", "53.8%", "in 4 of 5 repositories", "x86_64", "aarch64", "loong64", "core", "extra", "multilib", "upstream only"],
       freshness: ["Snapshot age", "3.0 h", "sync every 3 h", "not mirrored yet", "matches upstream"],
-      size: ["Size by repository", "GiB"],
+      size: ["Size by repository", "GiB", "in 4 of 5 repositories"],
       "history-coverage": ["Coverage, last 30 days", "x86_64", "aarch64", "Time, UTC"],
-      "history-age": ["Snapshot age, last 30 days", "sync every 3 h", "log scale"]}}'
+      "history-age": ["Snapshot age, last 30 days", "sync every 3 h", "log scale"]},
+    page_text: ([
+      "over the 4 of 5 repositories measured in this run. 1 could not be read.",
+      "of 13 upstream, in 4 of 5 repositories",
+      "Failed probes in 2 runs in a row, over 50 minutes or more, open the worker-down issue."]
+      + ($over.page_text_more // []))}
+    * ($over | del(.page_text_more))'
 }
 
-render "$in" "$work/site" "$(spec 12 120 '["pacman speed", "oci 13.3 s", "official 15.6 s"]')"
+render "$in" "$work/site" "$(spec 12 120 '["pacman speed", "oci 13.3 s", "official 15.6 s"]' \
+  '{"page_text_more": ["official mirror 15.6 s; measured 2026-10-14"]}')"
 
 # No bench, and a history line that does not read
 in2="$work/render-in2"
@@ -549,6 +651,67 @@ in3="$work/render-in3"
 mkdir -p "$in3"
 cp "$work/run1/status.json" "$work/run1/history.jsonl" "$in3/"
 render "$in3" "$work/site3" "$(spec 0 1 '["pacman speed", "no data"]')"
+
+# x86_64-extra's registry answered 503 (run5, an hour after run1): the
+# x86_64 and all badges say over how many targets they count, and the
+# history keeps x86_64 at 77.7%.
+in5="$work/render-in5"
+mkdir -p "$in5"
+cp "$work/run5/status.json" "$work/run5/history.jsonl" "$in5/"
+render "$in5" "$work/site5" "$(spec 0 2 '["pacman speed", "no data"]' '{
+  "badges": {
+    "x86_64-core": ["x86_64-core", "100%", "4.0 h"],
+    "x86_64-extra": ["x86_64-extra", "unknown"],
+    "x86_64": ["x86_64", "100%", "4.0 h", "1 of 3 measured"],
+    "all": ["mirror", "50%", "1/5 repos", "3 of 5 measured"]},
+  "chart_text": {
+    "coverage": ["Coverage by repository", "50%", "in 3 of 5 repositories", "registry not read"],
+    "freshness": ["Snapshot age", "4.0 h", "sync every 3 h", "not mirrored yet", "matches upstream"],
+    "size": ["Size by repository", "in 3 of 5 repositories"]},
+  "page_text": [
+    "over the 3 of 5 repositories measured in this run. 2 could not be read.",
+    "1 of 4 read", "1 not read from the registry; 1 match upstream now",
+    "x86_64 2026-10-14 03:00 77.7% 77.7%"]}')"
+
+# No registry read at all (run6): every group is unknown, never "not
+# mirrored", and no sum reads as 0.
+in6="$work/render-in6"
+mkdir -p "$in6"
+cp "$work/run6/status.json" "$work/run6/history.jsonl" "$in6/"
+render "$in6" "$work/site6" "$(spec 0 2 '["pacman speed", "no data"]' '{
+  "badges": {
+    "x86_64-core": ["x86_64-core", "unknown"], "x86_64-extra": ["x86_64-extra", "unknown"],
+    "x86_64-multilib": ["x86_64-multilib", "unknown"], "aarch64-core": ["aarch64-core", "unknown"],
+    "loong64-core": ["loong64-core", "unknown"],
+    "x86_64": ["x86_64", "unknown"], "aarch64": ["aarch64", "unknown"], "loong64": ["loong64", "unknown"],
+    "all": ["mirror", "unknown"]},
+  "badges_without": {"x86_64": ["not mirrored"], "all": ["not mirrored"]},
+  "chart_text": {
+    "coverage": ["Coverage by repository", "unknown"],
+    "freshness": ["Snapshot age", "none", "sync every 3 h"],
+    "size": ["Size by repository", "unknown"]},
+  "page_text": [
+    "Coverage is not known: no repository could be read on both sides in this run.",
+    "the registry did not answer for any of the 5", "Files in the mirror unknown",
+    "Size in the mirror unknown"]}')"
+
+# A bench from 2026-08-01, 73 days before the measurement: the badge and the
+# tile show its age in the warning colour.
+in7="$work/render-in7"
+mkdir -p "$in7"
+cp "$in/status.json" "$in7/status.json"
+jq '.date = "2026-08-01T05:50:00Z"' "$REPO_ROOT/tests/fixtures/status/bench.json" > "$in7/bench.json"
+render "$in7" "$work/site7" "$(spec 12 0 '["pacman speed", "oci 13.3 s", "official 15.6 s", "73 d ago"]' '{
+  "badges_without": {"speed": []},
+  "chart_text": {"speed": ["Measured 2026-08-01 (73 d ago)"],
+                 "history-coverage": ["Coverage, last 30 days", "No history yet"]},
+  "page_text_more": ["official mirror 15.6 s; measured 2026-08-01, 73 d ago"]}')"
+if grep -q 'fill:#9a6700' "$work/site7/badges/speed.svg"; then
+  ok "site7: a bench older than 2 days gives the speed badge the warning colour"
+else
+  fail "site7: a bench older than 2 days gives the speed badge the warning colour" \
+    "$(sed -n 3,4p "$work/site7/badges/speed.svg")" "python3 -I scripts/status-render IN SITE"
+fi
 
 # No status.json: refused, with the path named
 rc=0

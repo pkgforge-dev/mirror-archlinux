@@ -33,7 +33,23 @@ This document tells what runs by itself, which issues the automation raises and 
 
 `build` runs when `decide` passed, also when `bench` was skipped or failed. `deploy` and `worker` name the result of `build` in their `if`. An `if` with no status function gets an implicit `success()` over every job before it. `bench` is skipped in most runs, so that implicit check would skip `deploy` and `worker` too.
 
+The Pages artifact of `build` is named `github-pages-<run attempt>`. `deploy` reads that name from the outputs of `build`. A re-run that runs `build` again uploads a second artifact into the same run, and `deploy-pages` refuses a name that two artifacts share. Each `upload-artifact` step sets `overwrite: true` for the same reason. `tests/static/50-workflow-policy.sh` checks both.
+
 The Worker check is a job of `status.yml`, not of `watchdog.yml`. An hourly cron in `watchdog.yml` would cancel a pending daily run, because both share one concurrency group.
+
+### Concurrency
+
+⚠ By default a concurrency group holds one running run and one pending run. A newer run cancels the pending one. `cancel-in-progress: false` keeps only the running run.
+
+| workflow | group | queue | effect |
+| --- | --- | --- | --- |
+| `sync.yml` | `sync`, for every ref | `max` | up to 100 runs wait, each in its turn; a dispatch with `allow_older` is never replaced by the next scheduled run |
+| `ci.yml` | `ci-pr-<number>` for a pull request, else `ci-<run id>` | default | a newer push to a pull request cancels its run in progress; every other run has a group of its own, so each push to `main` gets a verdict |
+| `status.yml` | `status` | default | one run waits; a newer one replaces it, and each run measures everything again |
+| `watchdog.yml` | `watchdog` | default | one run waits |
+| `worker.yml` | `worker-<ref>` | default | one run waits |
+
+GitHub refuses `queue: max` with `cancel-in-progress: true`. actionlint 1.7.12 does not know the key `queue`, so `tests/static/20-actionlint.sh` ignores that one message, and `tests/static/50-workflow-policy.sh` checks the value instead. When a long seed holds the group `sync`, the scheduled runs queue behind it and then run one after another.
 
 ## Each scheduled workflow starts the others
 
@@ -51,6 +67,8 @@ A run that is queued or in progress counts as fresh, so nothing starts twice. A 
 
 `dispatch-overdue` starts only a workflow whose state is `active`. GitHub refuses to start a disabled workflow. The script skips a workflow that a person disabled, or that GitHub disabled for inactivity. It prints a notice and exits 0. In `sync.yml` and `watchdog.yml`, `keep-schedules-enabled` runs first, and enables again a workflow that GitHub disabled for inactivity.
 
+The job `report` of `sync.yml` starts `status.yml` after each sync on `main`, whether or not it is overdue. It follows the same rule: when `status.yml` is not `active`, it prints a notice and the sync stays green. When the state does not read, the step fails. `tests/static/50-workflow-policy.sh` runs each workflow step that calls `gh workflow run` against a stub `gh`, with the workflow active, disabled and unreadable.
+
 The restart steps in `sync.yml` and `watchdog.yml` run with `always()`. So a schedule check that fails earlier in the job does not stop the restart. A step with two `dispatch-overdue` calls runs both, then exits with the status of the last call that failed.
 
 `scripts/keep-schedules-enabled` runs in `sync.yml` and in `watchdog.yml`. GitHub disables the schedules of a repository after 60 days with no activity. The script enables each workflow of the tree again. ⚠ A workflow that a person disabled stays disabled, and the script names it.
@@ -67,13 +85,13 @@ The restart steps in `sync.yml` and `watchdog.yml` run with `always()`. So a sch
 | --- | --- |
 | `current` | the two databases are the same |
 | `fresh` | they differ, and the promoted snapshot was fetched within the tolerance |
-| `new` | there is no `latest`, and git added the target file within the tolerance |
+| `new` | there is no `latest`, and git added or enabled the target file within the tolerance |
 | `stale` | they differ for longer than the tolerance, or there is no `latest` for longer |
 | `unknown` | upstream could not be read |
 
 The tolerance comes from `scripts/cron-tolerance`: the largest gap in days of the cron, times 2, plus 1. The 3-hour cron of `sync.yml` gives a gap of 1 day and a tolerance of 3 days. ⚠ The tolerance is in days. A sub-daily cron gets the tolerance of a daily one, so a stop shows later than it could.
 
-The date a target file was added is the date of the commit that brought it to the checked-out branch (`git log --first-parent`). A commit on the branch it came from does not count.
+The date a target file was added is the date of the commit that brought it to the checked-out branch (`git log --first-parent`). A commit on the branch it came from does not count. The date it was enabled is the date of the last such commit that changed its `enabled` line. The later of the two dates counts. So a target file added with `enabled = no` gets its grace from the day that line goes or turns to `yes`.
 
 ⚠ When git cannot tell when a target file was added (no git, a shallow clone, an untracked file), the target is stale, never new. The `staleness` job checks out the whole history for this.
 
@@ -86,11 +104,13 @@ The date a target file was added is the date of the commit that brought it to th
 | `visibility-<target>` | the package reads with the workflow's token and not without one | a run reads the target anonymously | `scripts/report`, on `main` |
 | `replaced-<target>` | a package tag holds other bytes than the database names | the target stages or is current again | `scripts/report`, on `main` |
 | `stale-<target>` | `check-staleness` says `stale` or `unknown` | it says anything else | `watchdog.yml` job `staleness` |
-| `worker-down` | the Worker failed its probe in 2 status runs in a row | a status run records a probe that passes | `status.yml` job `worker` |
+| `worker-down` | the Worker failed its probe in 2 status runs in a row, over 50 minutes or more | a status run records a probe that passes | `status.yml` job `worker` |
 
 A target that is held, behind or in error raises nothing in the report. A run that fails once is ordinary. `stale-<target>` opens when the mirror has stopped following upstream.
 
 The `worker` job of `status.yml` reads the record that `build` pushed to branch `status` in the same run. The job fails when that record is more than 3 hours old.
+
+Status runs are not an hour apart. The cron runs `status.yml` at minute 47 of each hour, and `sync.yml` starts it after each sync, so two runs can be minutes apart. So `scripts/status-collect` sets `worker.down` in `status.json` only when two conditions are true. The probes failed in 2 runs in a row. The first of these failures is 3000 s (50 minutes) or more before this run. The `worker` job raises `worker-down` on `worker.down`. A Worker or GHCR fault of a few minutes opens no issue.
 
 ## What needs a person
 
@@ -147,7 +167,7 @@ The plan job reads every target's databases from upstream, one target after anot
 | Actions can approve pull requests | no |
 | `sha_pinning_required` | `true`: only actions pinned by commit run |
 
-`tests/static/50-workflow-policy.sh` checks the shape of every workflow. It checks `permissions: {}` at the top, the permissions of each job, and `timeout-minutes` on every job. It also checks that each action is pinned by commit, and that no untrusted value is inside a `run:` block.
+`tests/static/50-workflow-policy.sh` checks the shape of every workflow. It checks `permissions: {}` at the top, the permissions of each job, and `timeout-minutes` on every job. It also checks that each action is pinned by commit, and that no untrusted value is inside a `run:` block. It also checks the artifact names against re-runs, the steps that start another workflow, and the concurrency groups (above).
 
 ## Secrets
 
@@ -177,7 +197,7 @@ The site at <https://pkgforge-dev.github.io/mirror-archlinux/> holds:
 | `badges/<target>.svg` | coverage and snapshot age of one target |
 | `badges/<arch>.svg` | the same over the targets of one architecture |
 | `badges/all.svg` | the same over every target |
-| `badges/speed.svg` | pacman's time through the wrapper and through the official mirror, from the bench |
+| `badges/speed.svg` | pacman's time through the wrapper and through the official mirror, from the bench; a bench older than 2 days shows its age, in the warning colour |
 | `charts/coverage.svg` | share of upstream files in the mirror, per target |
 | `charts/freshness.svg` | snapshot age per target, against the sync interval |
 | `charts/size.svg` | GiB per target, in the mirror and upstream |
@@ -189,13 +209,27 @@ The site at <https://pkgforge-dev.github.io/mirror-archlinux/> holds:
 
 `status.json` has schema 1. The header of `scripts/status-collect` describes each field.
 
+A target has a coverage only when a run reads both upstream and the registry. A sum over the targets counts only those, and the page says so:
+
+| where | every target read | some targets not read |
+| --- | --- | --- |
+| `badges/<arch>.svg` | `77.7% · 3.0 h` | `77.7% · 3.0 h · 2 of 3 measured` |
+| `badges/all.svg` | `53.8% · 2/5 repos` | `53.8% · 2/5 repos · 4 of 5 measured` |
+| the headline | over 5 repositories | over the 4 of 5 repositories measured in this run |
+| the tiles `Files` and `Size in the mirror` | of the upstream total | of the upstream total, in 4 of 5 repositories |
+| the tile `Repositories with a snapshot` | `2 of 5` | `1 of 4 read`, and how many the registry did not answer |
+
+A group badge with no snapshot says `unknown` when its registry did not answer. It says `not mirrored` only when the registry says there is no `latest`. When no target is read on both sides, the headline and the file and size tiles say `unknown`.
+
+In `status.json`, `summary.measured` counts the targets read on both sides, and `summary.mirror_unread` the targets whose registry did not answer. The file and byte sums are `null` when no target was read.
+
 ## The status branch
 
 On `main`, job `build` pushes branch `status` as one orphan commit, with force, on each run. The branch holds the site, plus:
 
 | file | contents |
 | --- | --- |
-| `history.jsonl` | one line per status run; the last 2000 lines are kept |
+| `history.jsonl` | one line per status run; the last 2000 lines are kept. A target that a run could not read keeps the files and bytes of its last measured line, marked `"k": 1`. So a read that fails does not move the coverage history |
 | `worker.md` | the body of the `worker-down` issue: every probe, and how to reproduce the first failure |
 | `bench.json` | the newest bench |
 | `bench/<date>.json` | each daily bench |
