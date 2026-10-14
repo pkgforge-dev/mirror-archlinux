@@ -213,6 +213,23 @@ The tree itself is never changed. An integration fault runs with its own registr
 | integration/10-pipeline | `keyring_repo` emptied after `keyring_from`'s `latest` is read | not ok: `verify installs the keyring package from keyring_from's repository` |
 | integration/10-pipeline | plan's `%PGPSIG%` condition reverted | not ok: a file signed again with the same bytes is planned, its layer repaired, promoted |
 | integration/10-pipeline | the signature comparison turned off | not ok: `a signature layer that is not the %PGPSIG% fails verify, and is named`, `a batch with a bad signature layer is never promoted` |
+| unit/40-lib | `fetch_upstream` with `--max-time` and no `--retry-max-time` | not ok: a server at 16 KiB/s gets 3 requests in about 13 s, over a deadline of 3 s |
+| integration/10-pipeline | no share of `PLAN_BUDGET` per target | not ok: assertions 62 to 64 (a stalled first db_server), and the run takes 944 s |
+| integration/10-pipeline | a failed db_server ends the db_server loop | not ok: assertion 61 |
+| integration/10-pipeline | `fetch_sig` reads the shard's rotated order | not ok: assertion 108 (the `.sig` of a plain mirror becomes the layer) |
+| unit/40-lib | `down_last` ignores the down marks | not ok: assertion 95 |
+| unit/40-lib | `down_last` drops the hosts with no mark | not ok: assertion 94 |
+| integration/10-pipeline | no host is marked down | not ok: assertion 110 (a server that answers 503 gets more than 3 requests) |
+| integration/10-pipeline | the first failed server ends the search | not ok: assertion 109 |
+| integration/10-pipeline | the unsigned list is not written to the staged manifest | not ok: assertions 42, 44, 45, 46 |
+| integration/10-pipeline | plan ignores the unsigned list of `latest` | not ok: assertions 44, 45, 46 (a signature published later never reaches the mirror) |
+| unit/40-lib | an anonymous read uses the cached token | not ok: assertions 91, 92 |
+| unit/40-lib | the report reads every summary, of any plan | not ok: assertions 96, 97, 99, 100 |
+| unit/40-lib | `collect` reads verdicts of another digest | not ok: assertion 101 |
+| integration/10-pipeline | no plan id is written | not ok: assertions 76, 37, 38 (an earlier attempt's result is read) |
+| integration/10-pipeline | plan refuses a files database that leaves a package out | not ok: assertions 47 to 50 |
+| integration/10-pipeline | verify runs `-Fl` over every name of the batch | not ok: assertion 50 |
+| integration/10-pipeline | plan accepts a files database with an extra package | not ok: assertion 51 |
 | integration/10-pipeline | every `sig-refused` package excused | not ok: with no `%PGPSIG%`, a layer that is not upstream's `.sig` is not excused |
 | integration/10-pipeline | `build-repo` signs on every build | not ok: an update is planned as new files only; `latest` does not move backwards |
 | static/60-targets | five edits in a copy: a `docker.io` keyring image, a removed `# tag: aarch64`, another verify digest, renamed plan slots, a `keyring_from` that does not exist | one not ok for each edit, among them `every target verifies in the one image, on linux/amd64` |
