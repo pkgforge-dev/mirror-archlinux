@@ -25,7 +25,7 @@
 | `unit/20-json-parser.sh` | the JSON parser reads every legal shape and refuses anything else |
 | `unit/30-wrapper-urls.sh` | one manifest request per URL; a URL it cannot read is refused before the network |
 | `unit/31-run-store.sh` | the run store: key, ownership, sweep, remover, host blacklist |
-| `unit/32-prefetch-plan.sh` | the argument rewrite, the print lines, the signatures written from `%g` |
+| `unit/32-prefetch-plan.sh` | the argument rewrite, the print lines, the signatures written from `%g`, the size of a held `.part` |
 | `unit/40-lib.sh` | the decisions of the sync on fixed inputs |
 | `unit/45-dispatch-overdue.sh` | `scripts/dispatch-overdue` starts a workflow only when it is active and overdue |
 | `unit/60-status.sh` | `status-collect` and `status-render` on fixtures |
@@ -159,12 +159,17 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/30-wrapper-urls | an uncompressed `.pkg.tar` read as a database | not ok: `an uncompressed package` |
 | unit/30-wrapper-urls | a database signature read from the moving tag | not ok: `core.db.sig is read by the content of the core.db beside it` |
 | unit/30-wrapper-urls | a failed attempt leaves its `.part` behind | not ok: `a failed attempt removes the .part it was given` |
+| unit/31-run-store | a failed signature request marks its host down | 3 not ok, among them `a database signature: no host is marked down, so the next file is still asked for` |
+| unit/31-run-store | the sweep ignores the age of `,open` | not ok: `the sweep keeps a run whose ,open is fresh, and removes one whose ,open is old` |
+| unit/31-run-store | the remover never touches `,open` | not ok: `the remover touches ,open within 3 s while the run is live` |
+| unit/32-prefetch-plan | the size of a held `.part` read with `wc -c` | 2 not ok, among them `a .part the wrapper cannot read is sized from its metadata` |
 | integration/10-pipeline | the blob's sha256 no longer checked | not ok: `the wrapper refuses a blob whose sha256 is not its descriptor's` |
 | integration/20-client | no host is marked down; no transfer resumes; the background remover removes nothing | 12 not ok, among them `dead: a registry that answers 503: the second file makes no request`, `resume: the cut package was resumed with a Range request` and `main-root: no store file is left once pacman has ended` |
 | integration/20-client | the prefetch keeps a whole file with no size and sha256 check | 7 not ok, among them `flip: one byte changed in each first answer: the prefetch keeps neither database` |
 | integration/20-client | the batch check reads the `sha256sum` output one column off | 16 not ok, among them `main-du: the serial pass makes no network request` |
 | integration/20-client | a transfer cut by its time limit never goes on in the next pass | not ok: `stall: the prefetch cut the stopped transfer and resumed it from 64 KiB` |
 | integration/20-client | the prefetch makes one pass only | not ok: `resume: every blob cut in half: the prefetch resumed it, the serial pass made no request` |
+| integration/20-client | a refused range keeps the 30 s stop of the attempts | 3 not ok, among them `norange: a plain Server that ignores Range: pacman -S big succeeds after its range is refused past 30 s` |
 
 ### scripts
 
@@ -331,6 +336,7 @@ These are not code faults. They are hostile or broken inputs, built by `tests/fi
 | every blob cut in half | the install succeeds; the cut package resumes with a Range request |
 | a blob that stops after 64 KiB for 40 s | the install takes less than 20 s; the transfer resumes from 64 KiB |
 | one byte changed in the first answer for each blob | the prefetch keeps nothing; each file is read again alone; the install succeeds |
+| a plain Server of its own that ignores Range, and stops a large file for 35 s | the install succeeds; the refused range is followed by one fetch from zero |
 | a provider other than the default | the prefetch takes the first provider; the chosen one is read alone |
 | two repositories with no database signature, under the sandbox | both signatures answered with an empty file; `-Sy` takes less than 1.9 s |
 | the same with no sandbox | both stay misses; `-Sy` takes 4 s or more |

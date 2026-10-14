@@ -47,13 +47,15 @@
 # flat in OUTPUT's directory as .pacman-oci.<pid>-<start>.<name>. pacman
 # removes them with its download-XXXXXX directory, a background process removes
 # them when pacman exits, and each call removes those of runs that are gone. A
-# call whose parent is not pacman keeps no store.
+# run is gone when its pid is gone and its ,open has had no heartbeat for 2
+# minutes. A call whose parent is not pacman keeps no store.
 #
 # pacman runs this with fork and execvp, never through a shell. With
 # DownloadUser set (stock Arch) it runs as that user, from a download-XXXXXX
 # directory inside the sync or cache directory; without it, as root.
 #
-# Needs curl, awk, sed, grep, sha256sum, mktemp, base64 (coreutils or busybox).
+# Needs curl, awk, sed, grep, sha256sum, mktemp, base64, ls, and find with
+# -mmin (coreutils, findutils or busybox).
 # Uses pacman, pacman-conf and timeout when they are there.
 #
 # Environment:
@@ -106,7 +108,8 @@ debug() {
 # entry is used only when it is a regular file this user owns, never through a
 # symbolic link, and each is made under a mktemp name, then renamed.
 #   FILE           a file ready for pacman, its size and sha256 checked
-#   ,open          the store of this run is open in this directory
+#   ,open          the store of this run is open in this directory; the
+#                  background remover touches it once a second
 #   ,prefetch      the package prefetch of this run ran here
 #   ,dbprefetch    the database prefetch of this run ran here
 #   ,down.HOST     HOST failed once its retries were spent
@@ -515,6 +518,22 @@ size_of() {
   printf '%s\n' $((_n))
 }
 
+# meta_size FILE: the size of FILE from its metadata into $_ms, as pacman's
+# own stat() reads it. Unlike size_of, it needs no read permission. Under
+# DownloadUser, a .part that root left with mode 0600 still has a size here.
+meta_size() {
+  _ms=''
+  _ls=$(ls -ln -- "$1") || return 1
+  set -f
+  # shellcheck disable=SC2086 # the fields of ls -l are words
+  set -- $_ls
+  set +f
+  case ${5:-} in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  _ms=$5
+}
+
 # A clock in nanoseconds. busybox date has no %N, so there it counts seconds.
 now_ns() {
   _ns=$(date +%s%N)
@@ -557,31 +576,54 @@ put() {
   mv -f -- "$_t" "$store$1"
 }
 
-# Remove the entries of runs that are gone. Once this run's store is open in
-# this directory, that was done, and the call goes straight on.
+# beating KEY: run KEY touched its ,open in this directory in the last 2
+# minutes. Its remover touches that entry once a second while the run is live.
+beating() {
+  _o=$out_dir/.pacman-oci.$1.,open
+  owned "$_o" || return 1
+  case $_o in
+    /*) ;;
+    *) _o=./$_o ;;
+  esac
+  _m=$(find "$_o" -prune -mmin -2) || return 1
+  [ -n "$_m" ]
+}
+
+# Remove the entries of runs that are gone. A run is gone when its pid is
+# missing or has another start time, and its ,open here has no heartbeat. A
+# run in another pid namespace has a pid that this /proc cannot show. Its
+# heartbeat keeps its entries. Once this run's store is open in this
+# directory, that was done, and the call goes straight on.
 sweep() {
   [ -d "$PROC" ] || return 0
   if entry_ok ,open; then
     return 0
   fi
   set --
-  _live=''
+  # The entries of one key are next to each other, so each key is decided once.
+  _seen=''
+  _keep=1
   for _e in "$out_dir"/.pacman-oci.*; do
     owned "$_e" || continue
     _k=${_e##*/.pacman-oci.}
     _k=${_k%%.*}
-    [ "$_k" != "$key" ] && [ "$_k" != "$_live" ] || continue
-    _pid=${_k%%-*}
-    _start=${_k#*-}
-    case $_pid:$_start in
-      *[!0-9:]* | :* | *:) continue ;;
-    esac
-    start_of "$_pid"
-    if [ "$_st" = "$_start" ]; then
-      _live=$_k
-      continue
+    [ "$_k" != "$key" ] || continue
+    if [ "$_k" != "$_seen" ]; then
+      _seen=$_k
+      _keep=1
+      _pid=${_k%%-*}
+      _start=${_k#*-}
+      case $_pid:$_start in
+        *[!0-9:]* | :* | *:) continue ;;
+      esac
+      start_of "$_pid"
+      if [ "$_st" != "$_start" ] && ! beating "$_k"; then
+        _keep=0
+      fi
     fi
-    set -- "$@" "$_e"
+    if [ "$_keep" = 0 ]; then
+      set -- "$@" "$_e"
+    fi
   done
   if [ "$#" -gt 0 ]; then
     debug "removing $# file(s) of pacman runs that are gone"
@@ -590,11 +632,16 @@ sweep() {
 }
 
 # reap PID START PREFIX: wait for the pacman run to end, then remove its
-# entries in one directory. pacman waits for its child alone, never for this.
+# entries in one directory. While the run is live, it touches PREFIX,open
+# once a second: that is the heartbeat sweep reads. pacman waits for its
+# child alone, never for this.
 # shellcheck disable=SC2329 # run in the background by store_open
 reap() {
   trap '' HUP INT
   while start_of "$1" && [ "$_st" = "$2" ]; do
+    if owned "$3,open"; then
+      : > "$3,open"
+    fi
     sleep 1
   done
   rm -f -- "$3"*
@@ -688,8 +735,15 @@ host_of() {
 }
 
 # mark_down HOST HTTP: later requests of this run to HOST miss at once. Only no
-# answer at all, 429 and 5xx count.
+# answer at all, 429 and 5xx count. A signature request never marks a host:
+# pacman ignores a failed optional signature, then asks the same host for the
+# next file. A failed required signature stops the transaction anyway. pacman's
+# own downloader also never counts an optional request against a server
+# (libalpm dload.c, request_errors_ok).
 mark_down() {
+  case $kind in
+    pkgsig | dbsig) return 0 ;;
+  esac
   [ -n "$1" ] || return 0
   case $2 in
     000 | 429 | 5??) ;;
@@ -1190,7 +1244,8 @@ say_summary() {
 # line per file it would download: %l (the first Server, or file:// when the
 # file is cached), %h (sha256), %s (bytes to download) and %g (base64
 # %PGPSIG%). Print mode picks the first provider and never prompts. %s is the
-# size less any .part pacman holds in the cache, so that .part is added back.
+# size less any .part pacman holds in the cache, so the size of that .part,
+# from its metadata, is added back.
 #
 # PLAN_AWK prints, per file to fetch:
 #   TYPE FILE SHA256 SIZE PGPSIG BASE URL   (TYPE oci or http; "-" when absent)
@@ -1298,8 +1353,8 @@ plan_pkgs() {
   _n=0
   while IFS="$TAB" read -r _type _f _h _s _g _b _u; do
     _n=$((_n + 1))
-    if [ -f "$held_dir/$_f.part" ] && [ ! -L "$held_dir/$_f.part" ]; then
-      _s=$((_s + $(size_of "$held_dir/$_f.part")))
+    if [ -f "$held_dir/$_f.part" ] && [ ! -L "$held_dir/$_f.part" ] && meta_size "$held_dir/$_f.part"; then
+      _s=$((_s + _ms))
     fi
     if [ "$_h" != - ]; then
       printf '%s\t%s\t%s\n' "$_f" "$_h" "$_s" >> "$work/index"
@@ -1584,19 +1639,26 @@ parse_oci() {
 # fetch_one URL SIZE AUTH(0|1) PROTO RESUMABLE(0|1): OUTPUT from URL in up to
 # three attempts. A resumable file keeps what it got and the next attempt
 # resumes with --continue-at -; anything else starts from zero. When SIZE is
-# known, each attempt has its time limit (see deadline). No attempt
-# starts after 30 s, unless the one before it added bytes. Sets one_rc (curl's
-# exit), one_code (the last HTTP status) and one_resumed.
+# known and the file can resume, each attempt has its time limit (see
+# deadline). An attempt that cannot resume gets no time limit: a cut would
+# lose all its bytes. A server that refuses a range (curl 33) turns resume off
+# for the attempts after it. No attempt starts after 30 s, unless the one
+# before it added bytes. A refused range starts these 30 s again. Sets one_rc
+# (curl's exit), one_code (the last HTTP status) and one_resumed.
 #---------------------------------------------------------------------------#
 fetch_one() {
   _url=$1 _max=$2 _auth=$3 _proto=$4 _resumable=$5
   _try=1
   _stop=$(($(date +%s) + 30))
   while :; do
+    _resume=0
+    if [ "$_resumable" = 1 ] && [ "${no_resume:-0}" != 1 ]; then
+      _resume=1
+    fi
     one_resumed=0
     _had=0
     set --
-    if [ "$_resumable" = 1 ] && [ "${no_resume:-0}" != 1 ] && [ -s "$out" ]; then
+    if [ "$_resume" = 1 ] && [ -s "$out" ]; then
       _had=$(size_of "$out")
     fi
     if [ "$_had" -gt 0 ] && { [ -z "$_max" ] || [ "$_had" -lt "$_max" ]; }; then
@@ -1608,9 +1670,11 @@ fetch_one() {
     fi
     if [ -n "$_max" ]; then
       set -- "$@" --max-filesize "$_max"
-      deadline "$_max" "$_try"
-      if [ -n "$_dl" ]; then
-        set -- "$@" --max-time "$_dl"
+      if [ "$_resume" = 1 ]; then
+        deadline "$_max" "$_try"
+        if [ -n "$_dl" ]; then
+          set -- "$@" --max-time "$_dl"
+        fi
       fi
     fi
     if [ -n "$_proto" ]; then
@@ -1632,13 +1696,17 @@ fetch_one() {
     debug "GET $_url -> $one_code (curl $one_rc, resumed $one_resumed)"
     [ "$one_rc" -ne 0 ] || return 0
     case $one_rc:$one_code in
-      33:*) rm -f -- "$out" ;;
+      33:*)
+        rm -f -- "$out"
+        no_resume=1
+        _stop=$(($(date +%s) + 30))
+        ;;
       *:408 | *:429 | *:5?? | 6:* | 16:* | 18:* | 28:* | 35:* | 52:* | 55:* | 56:* | 92:*) ;;
       *) return 1 ;;
     esac
     [ "$_try" -lt 3 ] || return 1
     if [ "$(date +%s)" -ge "$_stop" ]; then
-      if [ "$_resumable" != 1 ] || [ ! -s "$out" ] || [ "$(size_of "$out")" -le "$_had" ]; then
+      if [ "$_resume" != 1 ] || [ ! -s "$out" ] || [ "$(size_of "$out")" -le "$_had" ]; then
         return 1
       fi
     fi
