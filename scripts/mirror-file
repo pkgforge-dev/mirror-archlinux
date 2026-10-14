@@ -253,18 +253,56 @@ fi
 
 pushed=0
 push_started="$(date -u +%s)"
-for attempt in 1 2 3; do
+# GHCR limits the requests of one token (measured: "toomanyrequests ...
+# allowed: 2000/minute", run 38570044665), and every push of every job shares
+# the workflow's token. A 429 costs no attempt. The first push of the shard
+# that meets one writes $WORK/throttle, the time its pause ends, and every
+# push of the shard waits for that time first. The pauses of one file may
+# add up to MIRROR_RATE_WAIT seconds (default 1800).
+RATE_WAIT="${MIRROR_RATE_WAIT:-1800}"
+throttle_wait() {
+  local until now
+  [ -f "$WORK/throttle" ] || return 0
+  until="$(cat "$WORK/throttle")"
+  now="$(date -u +%s)"
+  case "$until" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  if [ "$until" -gt "$now" ]; then
+    sleep "$((until - now))"
+  fi
+}
+attempt=0
+waited=0
+while :; do
+  throttle_wait
   rc=0
   (cd -- "$dir" && timeout --kill-after=30 "$deadline" "$ORAS" "${push_args[@]}" > "$dir/push.log" 2>&1) || rc=$?
   if [ "$rc" -eq 0 ]; then
     pushed=1
     break
   fi
+  if grep -qiE 'toomanyrequests|429 Too Many' "$dir/push.log"; then
+    pause=$((20 + RANDOM % 41))
+    waited=$((waited + pause))
+    if [ "$waited" -gt "$RATE_WAIT" ]; then
+      warn "$file: the registry still limits pushes after ${waited}s of pauses"
+      break
+    fi
+    tmp="$(mktemp "$WORK/.throttle.XXXXXX")"
+    printf '%s\n' "$(($(date -u +%s) + pause))" > "$tmp"
+    mv -f -- "$tmp" "$WORK/throttle"
+    log "$file: the registry limits pushes (429); every push of the shard waits ${pause}s"
+    sleep "$pause"
+    continue
+  fi
+  attempt=$((attempt + 1))
   warn "$file: push attempt $attempt ended $rc" "$(tail -n 3 "$dir/push.log")"
+  [ "$attempt" -lt 3 ] || break
   sleep $((attempt * attempt * 5))
 done
 if [ "$pushed" -ne 1 ]; then
-  result failed "oras push failed three times, last: $(tail -n 1 "$dir/push.log")"
+  result failed "oras push failed ($attempt attempt(s), ${waited}s of 429 pauses), last: $(tail -n 1 "$dir/push.log")"
   exit 1
 fi
 push_seconds=$(($(date -u +%s) - push_started))
