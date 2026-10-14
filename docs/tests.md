@@ -107,10 +107,12 @@ Each run picks its ports at run time, and each container name carries the shell'
 The unit and static suites run in the pinned `archlinux:base`. Mount the tools last on PATH, so the image's own tools stay the ones under test:
 
 ```bash
-docker run --rm -v "$PWD:/work:ro" -v /tmp/mirror-archlinux-tools:/tools:ro -w /work \
-  docker.io/library/archlinux:base@sha256:3c64b538588416593f69a1aebd2f2ec0f2541b29159f32556fa7def2167147a0 \
+image="$(sed -n 's/^verify_image = //p' targets/x86_64-core.conf)"
+docker run --rm -v "$PWD:/work:ro" -v /tmp/mirror-archlinux-tools:/tools:ro -w /work "$image" \
   sh -c 'PATH="$PATH:/tools" exec bash tests/run.sh unit'
 ```
+
+The image is the targets' verify image, so this command follows each Renovate update.
 
 ⚠ `40-executable-bits.sh` reads the git index. In a copy with no git index, it passes with one line that says it skipped.
 
@@ -121,7 +123,7 @@ docker run --rm -v "$PWD:/work:ro" -v /tmp/mirror-archlinux-tools:/tools:ro -w /
 | `static` | `tests/static/72-test-runner.sh` with bash first, then `tests/run.sh static`; `TESTS_REQUIRE_TOOLS='shellcheck actionlint jq python3'` |
 | `unit (dash-mawk)` | `tests/run.sh unit` on the runner, with dash and mawk; requires `jq curl python3` |
 | `unit (bash-gawk)` | the same in the pinned `archlinux:base`; requires `jq curl` |
-| `unit (busybox)` | the same in the pinned `alpine:3.22`; requires `jq curl` |
+| `unit (busybox)` | the same in the pinned alpine image; requires `jq curl` |
 | `integration` | one job per file of `tests/run.sh --list integration` |
 | `worker` | `tests/run.sh worker` in the pinned `node:24-alpine` |
 | `debloat` | `scripts/debloat-runner` on a real runner; a warning when it frees less than 1 GiB |
