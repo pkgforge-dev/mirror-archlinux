@@ -1,15 +1,35 @@
 #!/usr/bin/env bash
 #
-# Install the pinned shellcheck, actionlint and jq into a directory, each
-# checked against its sha256, for tests/run.sh.
+# Install pinned test tools into a directory, each checked against its sha256,
+# for tests/run.sh and the CI jobs.
 #
-#   scripts/install-test-tools DIR
+#   scripts/install-test-tools DIR [TOOL ...]
 #
-# ⛔ The versions and checksums are written here. Each checksum was read on
-# 2026-10-13 from the release's own checksum list and from GitHub's asset
-# digest, and the two agreed.
+# TOOL is shellcheck, actionlint, jq, curl or bash. With no TOOL, all five.
+# Each one is a static binary for x86_64 or aarch64 Linux. So one DIR serves
+# the runner and every container that mounts it (Arch, Alpine, the node
+# image), and no job installs a package from a distro mirror.
 #
-# Exit status: 0 all installed, 1 could not.
+# ⛔ The versions and checksums are written here. Where each checksum was read:
+#   ShellCheck, actionlint and jq: 2026-10-13, from the release's own
+#     checksum list and from GitHub's asset digest. The two agreed.
+#   curl   2026-10-14, stunnel/static-curl release 8.22.0, the static Linux
+#     build that curl.se/download.html links. The tarball sum is GitHub's
+#     asset digest. The binary sum is in the release notes ("Checksums of
+#     binaries") and in the SHA256SUMS file inside the tarball. All agreed
+#     with the downloaded files.
+#   bash   2026-10-14, Ubuntu 24.04 (noble) bash-static 5.2.21-2ubuntu4, from
+#     the release pocket, which does not change while noble is supported. The
+#     .deb sum is in noble's universe Packages index and in Launchpad's
+#     binaryFileUrls API. The two agreed with the downloaded files, from
+#     Launchpad and from the archive. The binary sum was measured from the
+#     extracted .deb.
+#
+# ⚠ The bash .deb is an ar archive with a zstd data member. It is read here
+# with dd, head and tail, then zstd. So the host needs zstd for bash, but no
+# ar, dpkg or bsdtar.
+#
+# Exit status: 0 all installed, 1 could not, 2 usage.
 set -euo pipefail
 
 SHELLCHECK_VERSION=0.11.0
@@ -24,6 +44,22 @@ JQ_VERSION=1.8.2
 JQ_SHA256_AMD64=b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
 JQ_SHA256_ARM64=8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309
 
+# The musl build: it has no loader or libc of its own to find, so it runs in
+# glibc and musl images alike.
+CURL_VERSION=8.22.0
+CURL_TAR_SHA256_X86_64=dfb02460ba2abe513087538f12a3cf79b74b64a5ea3787ce8ac0cdb11251f884
+CURL_TAR_SHA256_AARCH64=cf94cbeaae1b3c1944a4a761ef04478f8f0b23e93a324b5ed009b2082eda11f3
+CURL_SHA256_X86_64=b7443db66d622a27ef2152bb2032d6ada9fb29a8917f22b9521a993f8e61cd7f
+CURL_SHA256_AARCH64=c392bc0ea0c7951ee170e0eb7874c9d4000397254d788552ffaa4e7ccb75ae07
+
+BASH_DEB_VERSION=5.2.21-2ubuntu4
+BASH_DEB_SHA256_AMD64=684691928e746a29d4b97c3b58069666a3cdd73104c90b217501f5c1ae7cbd64
+BASH_DEB_SHA256_ARM64=1fd25dda094189ac7ad22acad78c298fdd7fedc60c2f45bb00512c13708224a2
+BASH_SHA256_AMD64=ea3065d65dd07162e42e6db082103ef7dda0578436f15da76ff17be7b31cf671
+BASH_SHA256_ARM64=923600157c5ec8cbd17c45127cbf34c766ad401722ceb0f0661f2a287538be47
+
+ALL_TOOLS="shellcheck actionlint jq curl bash"
+
 die() {
   echo "install-test-tools: $1" >&2
   shift
@@ -34,50 +70,189 @@ die() {
   exit 1
 }
 
+usage() {
+  echo "usage: scripts/install-test-tools DIR [TOOL ...]" >&2
+  echo "  TOOL: $ALL_TOOLS (default: all)" >&2
+  exit 2
+}
+
 dest="${1:-}"
-[ -n "$dest" ] || die "usage: scripts/install-test-tools DIR"
+[ -n "$dest" ] || usage
+case "$dest" in
+  -*) usage ;;
+esac
+shift
+tools="${*:-$ALL_TOOLS}"
+for t in $tools; do
+  case " $ALL_TOOLS " in
+    *" $t "*) ;;
+    *)
+      echo "install-test-tools: no pinned tool named '$t'" >&2
+      usage
+      ;;
+  esac
+done
 
 case "$(uname -m)" in
   x86_64)
     sc_arch=x86_64 sc_sum="$SHELLCHECK_SHA256_X86_64"
     al_arch=amd64 al_sum="$ACTIONLINT_SHA256_AMD64"
     jq_arch=amd64 jq_sum="$JQ_SHA256_AMD64"
+    curl_arch=x86_64 curl_tar_sum="$CURL_TAR_SHA256_X86_64" curl_sum="$CURL_SHA256_X86_64"
+    deb_arch=amd64 bash_deb_sum="$BASH_DEB_SHA256_AMD64" bash_sum="$BASH_SHA256_AMD64"
+    ubuntu_pool=http://archive.ubuntu.com/ubuntu/pool
     ;;
   aarch64 | arm64)
     sc_arch=aarch64 sc_sum="$SHELLCHECK_SHA256_AARCH64"
     al_arch=arm64 al_sum="$ACTIONLINT_SHA256_ARM64"
     jq_arch=arm64 jq_sum="$JQ_SHA256_ARM64"
+    curl_arch=aarch64 curl_tar_sum="$CURL_TAR_SHA256_AARCH64" curl_sum="$CURL_SHA256_AARCH64"
+    deb_arch=arm64 bash_deb_sum="$BASH_DEB_SHA256_ARM64" bash_sum="$BASH_SHA256_ARM64"
+    ubuntu_pool=http://ports.ubuntu.com/ubuntu-ports/pool
     ;;
-  *) die "no pinned test tools for $(uname -m)" ;;
+  *) die "no pinned test tools for $(uname -m)" "pinned: x86_64 and aarch64 Linux" ;;
 esac
+
+# need TOOL WHY: TOOL is on this host's PATH.
+need() {
+  command -v "$1" > /dev/null || die "$1 is not on PATH, and $2 needs it" "reproduce: command -v $1"
+}
+need curl "every download"
+need sha256sum "every checksum"
+need tar "every archive"
+for t in $tools; do
+  case "$t" in
+    shellcheck | curl) need xz "the $t archive" ;;
+    bash)
+      need zstd "the bash .deb"
+      need dd "the bash .deb"
+      ;;
+  esac
+done
 
 mkdir -p "$dest"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# fetch URL FILE SHA256
-fetch() {
-  local rc=0 got
-  curl -q --fail --location --silent --show-error --connect-timeout 20 --max-time 300 \
-    --retry 3 --retry-connrefused --retry-delay 2 --output "$2" "$1" || rc=$?
-  [ "$rc" -eq 0 ] || die "could not download $1 (curl $rc)" "reproduce: curl -fLO $1"
-  got="$(sha256sum "$2" | cut -d ' ' -f 1)"
-  [ "$got" = "$3" ] || die "$(basename "$2") has sha256 $got, pinned $3" "reproduce: curl -fsSL $1 | sha256sum"
+sum_of() {
+  sha256sum "$1" | cut -d ' ' -f 1
 }
 
-fetch "https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_VERSION/shellcheck-v$SHELLCHECK_VERSION.linux.$sc_arch.tar.xz" \
-  "$work/shellcheck.tar.xz" "$sc_sum"
-tar -xJf "$work/shellcheck.tar.xz" -C "$work"
-install -m 0755 "$work/shellcheck-v$SHELLCHECK_VERSION/shellcheck" "$dest/shellcheck"
+# fetch FILE SHA256 URL [URL ...]: the first URL whose bytes hash to SHA256.
+# A URL that fails or serves other bytes is reported, and the next one is tried.
+fetch() {
+  local file="$1" want="$2" url rc got tried=()
+  shift 2
+  for url in "$@"; do
+    rc=0
+    curl -q --fail --location --silent --show-error --connect-timeout 20 --max-time 300 \
+      --retry 3 --retry-connrefused --retry-delay 2 --output "$file" "$url" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "install-test-tools: could not download $url (curl $rc)" >&2
+      tried+=("curl $rc: $url")
+      continue
+    fi
+    got="$(sum_of "$file")"
+    if [ "$got" = "$want" ]; then
+      return 0
+    fi
+    echo "install-test-tools: $url has sha256 $got, pinned $want" >&2
+    tried+=("sha256 $got: $url")
+    rm -f "$file"
+  done
+  die "no source gave $(basename "$file") with sha256 $want" "${tried[@]}" \
+    "reproduce: curl -fsSL '$1' | sha256sum"
+}
 
-fetch "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/actionlint_${ACTIONLINT_VERSION}_linux_$al_arch.tar.gz" \
-  "$work/actionlint.tar.gz" "$al_sum"
-tar -xzf "$work/actionlint.tar.gz" -C "$work" actionlint
-install -m 0755 "$work/actionlint" "$dest/actionlint"
+# check FILE SHA256 WHAT REPRODUCE: a file taken out of an archive is the
+# one pinned.
+check() {
+  local got
+  got="$(sum_of "$1")"
+  [ "$got" = "$2" ] || die "$3 has sha256 $got, pinned $2" \
+    "the archive matched its own pin, so the member inside it is not the pinned one" \
+    "reproduce: $4"
+}
 
-fetch "https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION/jq-linux-$jq_arch" "$work/jq" "$jq_sum"
-install -m 0755 "$work/jq" "$dest/jq"
+# ar_member ARCHIVE NAME OUT: copy the member NAME of the ar(1) archive
+# ARCHIVE to OUT. The format is an 8-byte magic, then for each member a
+# 60-byte text header (name 0-15, size 48-57) and the data, padded to even.
+ar_member() {
+  local archive="$1" want="$2" out="$3" off=8 total hdr name size
+  total="$(wc -c < "$archive")"
+  [ "$(dd if="$archive" bs=1 count=7 status=none)" = '!<arch>' ] ||
+    die "$archive is not an ar archive" "reproduce: od -c $archive | sed -n 1p"
+  while [ "$((off + 60))" -le "$total" ]; do
+    hdr="$(dd if="$archive" bs=1 skip="$off" count=60 status=none)"
+    name="${hdr:0:16}"
+    name="${name%% *}"
+    name="${name%/}"
+    size="${hdr:48:10}"
+    size="${size%% *}"
+    case "$size" in
+      '' | *[!0-9]*) die "$archive: member header at byte $off has size '$size'" "reproduce: od -c -j $off -N 60 $archive" ;;
+    esac
+    if [ "$name" = "$want" ]; then
+      tail -c +"$((off + 61))" "$archive" > "$out.rest"
+      head -c "$size" "$out.rest" > "$out"
+      rm -f "$out.rest"
+      [ "$(wc -c < "$out")" -eq "$size" ] ||
+        die "$archive: member $want is $size bytes, $(wc -c < "$out") were read" "reproduce: od -c -j $off -N 60 $archive"
+      return 0
+    fi
+    off=$((off + 60 + size + size % 2))
+  done
+  die "$archive has no member $want" "reproduce: bsdtar -tvf $archive"
+}
 
-"$dest/shellcheck" --version | awk '/^version:/ { print "shellcheck " $2 }'
-"$dest/actionlint" -version | awk 'NR == 1 { print "actionlint " $1 }'
-"$dest/jq" --version
+install_shellcheck() {
+  fetch "$work/shellcheck.tar.xz" "$sc_sum" \
+    "https://github.com/koalaman/shellcheck/releases/download/v$SHELLCHECK_VERSION/shellcheck-v$SHELLCHECK_VERSION.linux.$sc_arch.tar.xz"
+  tar -xJf "$work/shellcheck.tar.xz" -C "$work"
+  install -m 0755 "$work/shellcheck-v$SHELLCHECK_VERSION/shellcheck" "$dest/shellcheck"
+  "$dest/shellcheck" --version | awk '/^version:/ { print "shellcheck " $2 }'
+}
+
+install_actionlint() {
+  fetch "$work/actionlint.tar.gz" "$al_sum" \
+    "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/actionlint_${ACTIONLINT_VERSION}_linux_$al_arch.tar.gz"
+  tar -xzf "$work/actionlint.tar.gz" -C "$work" actionlint
+  install -m 0755 "$work/actionlint" "$dest/actionlint"
+  "$dest/actionlint" -version | awk 'NR == 1 { print "actionlint " $1 }'
+}
+
+install_jq() {
+  fetch "$work/jq" "$jq_sum" "https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION/jq-linux-$jq_arch"
+  install -m 0755 "$work/jq" "$dest/jq"
+  "$dest/jq" --version
+}
+
+install_curl() {
+  local url="https://github.com/stunnel/static-curl/releases/download/$CURL_VERSION/curl-linux-$curl_arch-musl-$CURL_VERSION.tar.xz"
+  fetch "$work/curl.tar.xz" "$curl_tar_sum" "$url"
+  mkdir -p "$work/curl"
+  tar -xJf "$work/curl.tar.xz" -C "$work/curl" curl
+  check "$work/curl/curl" "$curl_sum" "curl from curl-linux-$curl_arch-musl-$CURL_VERSION.tar.xz" \
+    "curl -fsSL $url | tar -xJO curl | sha256sum"
+  install -m 0755 "$work/curl/curl" "$dest/curl"
+  "$dest/curl" --version | awk 'NR == 1 { print $1 " " $2 }'
+}
+
+install_bash() {
+  local deb="bash-static_${BASH_DEB_VERSION}_$deb_arch.deb"
+  fetch "$work/bash.deb" "$bash_deb_sum" \
+    "https://launchpad.net/ubuntu/+archive/primary/+files/$deb" \
+    "$ubuntu_pool/universe/b/bash/$deb"
+  ar_member "$work/bash.deb" data.tar.zst "$work/bash-data.tar.zst"
+  zstd -q -d -o "$work/bash-data.tar" "$work/bash-data.tar.zst"
+  mkdir -p "$work/bash"
+  tar -xf "$work/bash-data.tar" -C "$work/bash" ./usr/bin/bash-static
+  check "$work/bash/usr/bin/bash-static" "$bash_sum" "usr/bin/bash-static from $deb" \
+    "curl -fsSLO https://launchpad.net/ubuntu/+archive/primary/+files/$deb && bsdtar -xOf $deb data.tar.zst | zstd -dc | tar -xO ./usr/bin/bash-static | sha256sum"
+  install -m 0755 "$work/bash/usr/bin/bash-static" "$dest/bash"
+  "$dest/bash" --version | awk 'NR == 1 { print "bash " $4 }'
+}
+
+for t in $tools; do
+  "install_$t"
+done

@@ -1,23 +1,39 @@
-# The test suites, on every push and pull request.
+# The test suites, on each push to main and each pull request.
 #
-#   static       shellcheck, actionlint and the policy checks (tests/static)
-#   unit         the wrapper and the scripts, under three shells and three awks:
-#                dash and mawk here, bash and gawk in Arch, busybox in Alpine
-#   integration  the whole mirror against a local registry and upstream, and
-#                pacman installing through the wrapper (tests/integration)
-#   debloat      scripts/debloat-runner on a real runner, so code that a sync
-#                rarely needs is still seen to work
+#   static       shellcheck, actionlint, py_compile and the policy checks
+#                (tests/static)
+#   unit         the wrapper and the scripts under three shells and three
+#                awks, one job each: dash and mawk on the runner, bash and
+#                gawk in Arch, busybox in Alpine (tests/unit)
+#   integration  one job per file in tests/integration, found when the run
+#                starts, so a new file gets its own job with no edit here
+#   worker       the Cloudflare Worker's tests in the node image (tests/worker)
+#   debloat      scripts/debloat-runner on a real runner, measured
+#
+# ⛔ No job installs a package from a distro mirror. scripts/install-test-tools
+# downloads pinned static binaries and checks each sha256. The containers
+# mount that directory read-only, last on PATH: a tool fills a gap, and the
+# image's own tools stay the ones under test.
+#
+# Push runs only on main, so a pull request from a branch here runs once, not
+# twice. The status branch holds a generated site and never runs this.
 name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches-ignore: [status]
+  workflow_dispatch:
 
 permissions: {}
 
+# One group per pull request, or per ref. A newer push to a pull request
+# cancels the run in progress; a run on main always finishes, so each commit
+# on main gets a verdict.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -34,11 +50,138 @@ jobs:
         with:
           persist-credentials: false
       - name: Static suite
+        env:
+          # Here each of these is present, so a test that needs one fails
+          # rather than skips when it is not.
+          TESTS_REQUIRE_TOOLS: shellcheck actionlint jq python3
         run: |
-          scripts/install-test-tools "$RUNNER_TEMP/bin"
+          scripts/install-test-tools "$RUNNER_TEMP/bin" shellcheck actionlint jq
+          python3 --version
+          # The runner's own test first, without the runner: a run.sh that
+          # hides failures would hide this one too.
+          REPO_ROOT="$PWD" bash tests/static/72-test-runner.sh
           PATH="$RUNNER_TEMP/bin:$PATH" tests/run.sh static
 
   unit:
+    name: unit (${{ matrix.leg }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: dash-mawk
+            image: ''
+            require: jq curl python3
+          - leg: bash-gawk
+            # tag: base
+            image: docker.io/library/archlinux:base@sha256:3c64b538588416593f69a1aebd2f2ec0f2541b29159f32556fa7def2167147a0
+            require: jq curl
+          - leg: busybox
+            # tag: 3.22
+            image: docker.io/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+            require: jq curl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test tools
+        run: scripts/install-test-tools "$RUNNER_TEMP/tools" jq curl bash
+      - name: Unit suite
+        env:
+          LEG: ${{ matrix.leg }}
+          IMAGE: ${{ matrix.image }}
+          TESTS_REQUIRE_TOOLS: ${{ matrix.require }}
+        run: |
+          # The shell, the awk and the tools each leg runs, asserted, so a
+          # change in an image shows here and not as a passing run of the
+          # wrong thing.
+          cat > "$RUNNER_TEMP/leg.sh" << 'EOF'
+          set -eu
+          PATH="$PATH:$TOOLS"
+          export PATH
+          sh_is="$(readlink -f /bin/sh)"
+          awk_is="$(readlink -f "$(command -v awk)")"
+          echo "$LEG: sh $sh_is, awk $awk_is, bash $(command -v bash), curl $(command -v curl), jq $(command -v jq)"
+          case "$LEG:$sh_is:$awk_is" in
+            dash-mawk:/usr/bin/dash:/usr/bin/mawk) ;;
+            bash-gawk:/usr/bin/bash:/usr/bin/gawk*) ;;
+            busybox:/bin/busybox:/bin/busybox) ;;
+            *)
+              echo "::error::$LEG runs sh $sh_is and awk $awk_is, which is not what this leg tests"
+              exit 1
+              ;;
+          esac
+          exec bash tests/run.sh unit
+          EOF
+          if [ "$LEG" = dash-mawk ]; then
+            # Ubuntu's awk is gawk once gawk is installed; mawk is still
+            # there, and goes first on PATH here.
+            mkdir -p "$RUNNER_TEMP/mawk"
+            ln -sf /usr/bin/mawk "$RUNNER_TEMP/mawk/awk"
+            PATH="$RUNNER_TEMP/mawk:$PATH" TOOLS="$RUNNER_TEMP/tools" sh "$RUNNER_TEMP/leg.sh"
+          else
+            docker run --rm -v "$PWD:/work:ro" -v "$RUNNER_TEMP/tools:/tools:ro" \
+              -v "$RUNNER_TEMP/leg.sh:/leg.sh:ro" -w /work \
+              -e LEG -e TESTS_REQUIRE_TOOLS -e TOOLS=/tools "$IMAGE" sh /leg.sh
+          fi
+
+  # The matrix of the next job, from tests/run.sh --list.
+  integration-files:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      files: ${{ steps.list.outputs.files }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List the integration test files
+        id: list
+        run: |
+          names="$(tests/run.sh --list integration)"
+          json=""
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::tests/integration/$f: a test file name is letters, digits, '.', '_' and '-' only"
+                exit 1
+                ;;
+            esac
+            json="${json:+$json,}\"$f\""
+          done <<< "$names"
+          if [ -z "$json" ]; then
+            echo "::error::tests/run.sh --list integration found no test file"
+            exit 1
+          fi
+          echo "files=[$json]" | tee -a "$GITHUB_OUTPUT"
+
+  integration:
+    needs: integration-files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        file: ${{ fromJSON(needs.integration-files.outputs.files) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Integration test
+        env:
+          CONTAINER_RUNTIME: docker
+          TEST_FILE: ${{ matrix.file }}
+        run: tests/run.sh integration "$TEST_FILE"
+
+  worker:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -47,47 +190,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Unit suite, dash and mawk
-        run: |
-          # Ubuntu's awk is gawk once gawk is installed; mawk is still there,
-          # and put first here, and both are asserted so an image change shows.
-          mkdir -p "$RUNNER_TEMP/mawk"
-          ln -sf /usr/bin/mawk "$RUNNER_TEMP/mawk/awk"
-          export PATH="$RUNNER_TEMP/mawk:$PATH"
-          if [ "$(readlink -f /bin/sh)" != /usr/bin/dash ]; then
-            echo "::error::/bin/sh is $(readlink -f /bin/sh), not dash"
-            exit 1
-          fi
-          if [ "$(readlink -f "$(command -v awk)")" != /usr/bin/mawk ]; then
-            echo "::error::awk is $(readlink -f "$(command -v awk)"), not mawk"
-            exit 1
-          fi
-          tests/run.sh unit
-      - name: Unit suite, bash and gawk (Arch)
-        run: |
-          # tag: base
-          image=docker.io/library/archlinux:base@sha256:3c64b538588416593f69a1aebd2f2ec0f2541b29159f32556fa7def2167147a0
-          docker run --rm -v "$PWD:/work:ro" -w /work "$image" bash -c 'pacman -Sy --noconfirm --needed jq > /dev/null && bash tests/run.sh unit'
-      - name: Unit suite, busybox (Alpine)
-        run: |
-          # tag: 3.22
-          image=docker.io/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
-          docker run --rm -v "$PWD:/work:ro" -w /work "$image" sh -c 'apk add --no-cache bash curl jq > /dev/null && bash tests/run.sh unit'
-
-  integration:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Integration suite
+      - name: Test tools
+        run: scripts/install-test-tools "$RUNNER_TEMP/tools" jq curl bash
+      - name: Worker suite
         env:
-          CONTAINER_RUNTIME: docker
-        run: tests/run.sh integration
+          # The node image of .github/workflows/worker.yml. Renovate moves
+          # the two in one pull request (group "node image").
+          # tag: 24-alpine
+          IMAGE: docker.io/library/node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
+        run: |
+          docker run --rm -v "$PWD:/work:ro" -v "$RUNNER_TEMP/tools:/tools:ro" -w /work \
+            -e TESTS_REQUIRE_TOOLS='node bash' "$IMAGE" \
+            sh -c 'PATH="$PATH:/tools"; export PATH; node --version; exec bash tests/run.sh worker'
 
+  # Measured, not judged: a runner image that no longer carries these
+  # directories frees less, and that is worth a warning, not a red run.
+  # debloat-runner failing outright still fails the job.
   debloat:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -102,10 +220,9 @@ jobs:
           before="$(df --output=avail -B1 "$RUNNER_TEMP" | awk 'NR == 2 { print $1 }')"
           scripts/debloat-runner --dir "$RUNNER_TEMP"
           after="$(df --output=avail -B1 "$RUNNER_TEMP" | awk 'NR == 2 { print $1 }')"
-          echo "freed $(((after - before) / 1073741824)) GiB"
-          # Seen to work means it freed something: a runner image that no
-          # longer carries any of these directories is worth knowing about.
-          [ "$after" -gt $((before + 1073741824)) ] || {
-            echo "::error::debloat-runner freed less than 1 GiB; the runner image changed under it"
-            exit 1
-          }
+          freed=$((after - before))
+          echo "freed $((freed / 1048576)) MiB on $ImageOS $ImageVersion"
+          echo "debloat-runner freed $((freed / 1048576)) MiB on $ImageOS $ImageVersion" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$freed" -lt 1073741824 ]; then
+            echo "::warning::debloat-runner freed $((freed / 1048576)) MiB, less than 1 GiB, on $ImageOS $ImageVersion. The runner image changed under it: compare its TARGETS with du -sh of each on this image."
+          fi

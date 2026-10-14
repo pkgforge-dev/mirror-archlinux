@@ -88,10 +88,14 @@ trap 'rm -rf "$work"' EXIT
 
 pids=()
 names=()
+absent=()
 for t in "${TARGETS[@]}"; do
   # shellcheck disable=SC2086 # unquoted so a glob such as julia* expands
   for p in $t; do
-    [ -e "$p" ] || continue
+    if [ ! -e "$p" ]; then
+      absent+=("$p")
+      continue
+    fi
     # shellcheck disable=SC2024 # the log is the caller's file; only rm needs root
     sudo rm -rf --one-file-system -- "$p" > "$work/$(printf '%s' "$p" | tr '/' '_').log" 2>&1 &
     pids+=("$!")
@@ -117,6 +121,12 @@ after="$(free_bytes "$dir")"
 printf 'debloat-runner: removed %d of %d directories, %s free %d GiB -> %d GiB (+%d GiB)\n' \
   "$removed" "$((removed + failed))" "$dir" "$((before / 1073741824))" "$((after / 1073741824))" \
   "$(((after - before) / 1073741824))"
+# A path in TARGETS that this image does not have frees nothing. Named here,
+# so a run that frees less than before says which directories went away.
+if [ "${#absent[@]}" -gt 0 ]; then
+  printf 'debloat-runner: not on this image (%s %s): %s\n' \
+    "${ImageOS:-unknown image}" "${ImageVersion:-}" "${absent[*]}"
+fi
 if [ -n "$need_bytes" ] && [ "$after" -lt "$need_bytes" ]; then
   echo "::warning::debloat-runner: $dir still has only $((after / 1073741824)) GiB free, $((need_bytes / 1073741824)) GiB needed"
 fi
