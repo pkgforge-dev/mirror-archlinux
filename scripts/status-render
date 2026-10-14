@@ -26,6 +26,13 @@
 #                                phone
 #   status.json, history.json, bench.json  the data behind the page
 #
+# A figure over part of the targets says which part. A target that a run
+# could not read on both sides has no coverage: the sums, the group badges
+# and the page then name how many targets they count ("77.7% · 3.0 h · 2 of
+# 3 measured"). A group whose registry did not answer is "unknown", never
+# "not mirrored". A bench older than 2 days shows its age in the warning
+# colour.
+#
 # Every SVG has a title, axis labels, a legend and its own style with a dark
 # variant. Colours are the validated colour-blind safe categorical slots, and
 # an architecture keeps its colour in every chart. A state colour always comes
@@ -355,6 +362,47 @@ def not_read(t):
     return "registry not read"
 
 
+def measured(targets):
+    """The targets with a coverage in this run: read on both sides."""
+    return [t for t in targets if t.get("coverage")]
+
+
+def mirror_unread(targets):
+    """The targets whose registry did not answer: mirror state error."""
+    return [t for t in targets if (t.get("mirror") or {}).get("state") == "error"]
+
+
+def scope(targets, lead=", in"):
+    """Empty when every target was measured, else ', in K of N
+    repositories': a sum over part of the targets says so."""
+    k, n = len(measured(targets)), len(targets)
+    return "" if k == n else "%s %d of %d repositories" % (lead, k, n)
+
+
+# bench.json comes from a daily run. Older than this, it is shown with its age.
+BENCH_MAX_AGE = 2 * 86400
+
+
+def bench_age(bench, now):
+    """Seconds from the bench to this measurement, or None when the bench
+    names no date that reads."""
+    t = parse_time((bench or {}).get("date"))
+    if t is None or not now:
+        return None
+    return max(now - t, 0)
+
+
+def bench_old(bench, now):
+    """None for a bench of the last BENCH_MAX_AGE, else the words that say
+    how old it is."""
+    age = bench_age(bench, now)
+    if age is None:
+        return "date unknown"
+    if age <= BENCH_MAX_AGE:
+        return None
+    return "%d d ago" % (age // 86400)
+
+
 #---------------------------------------------------------------------------#
 # SVG
 #---------------------------------------------------------------------------#
@@ -633,10 +681,14 @@ def chart_coverage(ctx, w):
     svg = Svg("Coverage by repository",
               "Share of each repository's upstream files that the mirror serves, "
               "by file name and sha256, grouped by architecture.", w)
-    cap = ("of %s upstream files are in the mirror, by name and sha256. %d of %d "
-           "repositories have a snapshot." % (fmt_int(s.get("upstream_files")),
-                                             s.get("promoted", 0), s.get("targets", 0)))
-    y = header(svg, "Coverage by repository", fmt_pct(s.get("coverage_files")), cap)
+    if not measured(ctx["targets"]):
+        cap = "No repository could be read on both sides in this run, so coverage is not known."
+    else:
+        cap = ("of %s upstream files%s are in the mirror, by name and sha256. %d of %d "
+               "repositories have a snapshot." % (fmt_int(s.get("upstream_files")), scope(ctx["targets"], " in"),
+                                                 s.get("promoted", 0), s.get("targets", 0)))
+    y = header(svg, "Coverage by repository", fmt_pct(s.get("coverage_files")) if measured(ctx["targets"])
+               else "unknown", cap)
     groups = grouped(ctx["targets"], ctx["order"])
     items = [("box", "s%d" % ctx["slots"][a], a) for a, _ in groups]
     y = legend(svg, y, items + [("box", "track", "upstream only")])
@@ -712,9 +764,14 @@ def chart_size(ctx, w):
     svg = Svg("Size by repository",
               "Compressed package bytes per repository: in the mirror, and upstream "
               "only.", w)
-    cap = ("in the mirror, of %s GiB upstream (%s by bytes)."
-           % (fmt_gib(s.get("upstream_bytes")), fmt_pct(s.get("coverage_bytes"))))
-    y = header(svg, "Size by repository", "%s GiB" % fmt_gib(s.get("mirrored_bytes")), cap)
+    if s.get("mirrored_bytes") is None:
+        head = "unknown"
+        cap = "No repository could be read on both sides in this run, so the size is not known."
+    else:
+        head = "%s GiB" % fmt_gib(s.get("mirrored_bytes"))
+        cap = ("in the mirror, of %s GiB upstream (%s by bytes)%s."
+               % (fmt_gib(s.get("upstream_bytes")), fmt_pct(s.get("coverage_bytes")), scope(ctx["targets"])))
+    y = header(svg, "Size by repository", head, cap)
     groups = grouped(ctx["targets"], ctx["order"])
     items = [("box", "s%d" % ctx["slots"][a], a) for a, _ in groups]
     y = legend(svg, y, items + [("box", "track", "upstream only")])
@@ -904,10 +961,16 @@ def chart_history_coverage(ctx, w):
     s = ctx["status"]["summary"]
     svg = Svg("Coverage, last 30 days",
               "Share of upstream files in the mirror per architecture over time. "
-              "With more than 2 days of history, one point per 6 hours, the last "
-              "value of each.", w)
-    y = header(svg, "Coverage, last 30 days", fmt_pct(s.get("coverage_files")),
-               "of upstream files in the mirror now. One line per architecture, %s." % span)
+              "A repository that a run could not read counts with its last "
+              "measured files. With more than 2 days of history, one point per "
+              "6 hours, the last value of each.", w)
+    if measured(ctx["targets"]):
+        y = header(svg, "Coverage, last 30 days", fmt_pct(s.get("coverage_files")),
+                   "of upstream files in the mirror now%s. One line per architecture, %s."
+                   % (scope(ctx["targets"]), span))
+    else:
+        y = header(svg, "Coverage, last 30 days", "unknown",
+                   "now: no repository could be read on both sides. One line per architecture, %s." % span)
     series = []
     for a in ctx["hist_order"]:
         pts = [(t, None if c is None else c * 100) for t, c, _ in ctx["series"][a]]
@@ -1023,9 +1086,11 @@ def chart_speed(ctx, w):
     cases = bench_cases(bench)
     rounds = max([len(c.get("rounds") or []) for c in cases.values()] + [0])
     oci = totals.get("oci")
+    old = bench_old(bench, ctx["now"])
     cap = ("for -Sy and -Sw through the oci wrapper, median of %d rounds. Official "
-           "mirror: %s. Measured %s on %s." % (rounds, fmt_secs(totals.get("official")),
-                                             str(bench.get("date", "?"))[:10], bench.get("host", "?")))
+           "mirror: %s. Measured %s%s on %s." % (rounds, fmt_secs(totals.get("official")),
+                                                str(bench.get("date", "?"))[:10],
+                                                " (%s)" % old if old else "", bench.get("host", "?")))
     y = header(svg, "pacman speed by path", fmt_secs(oci) if oci is not None else "failed", cap)
     y = legend(svg, y, items)
     vals = [c["seconds"] for c in cases.values() if num(c.get("seconds"))]
@@ -1094,30 +1159,44 @@ def target_badge(t, interval, tolerance):
 
 
 def group_badge(label, targets, interval, tolerance, count=False):
+    """Coverage and age over a group of targets. The ratio is over the
+    targets measured in this run. When that is not all of them, the badge
+    says how many were, so a part never reads as the whole."""
     promoted = [t for t in targets if (t.get("mirror") or {}).get("state") == "promoted"]
     if not promoted:
+        if mirror_unread(targets):
+            # The registry did not answer: nothing says the group is not mirrored.
+            return badge(label, "unknown", "unknown")
         return badge(label, "not mirrored", "none")
-    n = sum(((t.get("coverage") or {}).get("of_files") or 0) for t in targets)
-    m = sum(((t.get("coverage") or {}).get("files") or 0) for t in targets)
+    done = measured(targets)
+    n = sum((t["coverage"].get("of_files") or 0) for t in done)
+    m = sum((t["coverage"].get("files") or 0) for t in done)
     worst = max((target_level(t, interval, tolerance) for t in targets), key=lambda lv: LEVEL_RANK[lv])
     if worst in ("none", "unknown"):
         worst = "warning"
     ages = [t["age_seconds"] for t in promoted if num(t.get("age_seconds"))]
+    parts = [fmt_pct(m / n) if n else "coverage unknown"]
     if count:
-        msg = "%s · %d/%d repos" % (fmt_pct(m / n if n else None), len(promoted), len(targets))
+        parts.append("%d/%d repos" % (len(promoted), len(targets)))
     else:
-        msg = "%s · %s" % (fmt_pct(m / n if n else None), fmt_age(max(ages) if ages else None))
-    return badge(label, msg, worst)
+        parts.append(fmt_age(max(ages) if ages else None))
+    if len(done) < len(targets):
+        parts.append("%d of %d measured" % (len(done), len(targets)))
+    return badge(label, " · ".join(parts), worst)
 
 
-def speed_badge(bench):
+def speed_badge(bench, now):
     if not bench:
         return badge("pacman speed", "no data", "none")
     tot = bench_totals(bench)
     if tot.get("oci") is None:
         return badge("pacman speed", "oci failed", "critical")
-    return badge("pacman speed", "oci %s · official %s" % (fmt_secs(tot["oci"]), fmt_secs(tot.get("official"))),
-                 "info")
+    msg = "oci %s · official %s" % (fmt_secs(tot["oci"]), fmt_secs(tot.get("official")))
+    old = bench_old(bench, now)
+    if old:
+        # The daily bench has not run since: the time is not current.
+        return badge("pacman speed", "%s · %s" % (msg, old), "warning")
+    return badge("pacman speed", msg, "info")
 
 
 #---------------------------------------------------------------------------#
@@ -1234,17 +1313,58 @@ def page(ctx, charts, badges):
         wsub = "%d run(s) in a row; median %s" % (wk["failed_runs"], fmt_secs(wk.get("median_seconds")))
     totals = bench_totals(bench) if bench else {}
     if totals.get("oci") is not None:
-        last = tile("pacman, oci wrapper", fmt_secs(totals["oci"]),
-                    "official mirror %s" % fmt_secs(totals.get("official")))
+        old = bench_old(bench, ctx["now"])
+        when = "measured %s" % str(bench.get("date", "?"))[:10]
+        sub = "official mirror %s; %s" % (fmt_secs(totals.get("official")), when)
+        if old:
+            last = tile("pacman, oci wrapper", state_cell("warning", fmt_secs(totals["oci"])),
+                        "%s, %s" % (sub, old), raw=True)
+        else:
+            last = tile("pacman, oci wrapper", fmt_secs(totals["oci"]), sub)
     else:
         last = tile("GHCR manifest", ghcr_ms, "median, read with no credential")
+
+    # A count or a sum over part of the targets says which part.
+    n_all = s.get("targets", 0)
+    n_err = len(mirror_unread(targets))
+    n_done = len(measured(targets))
+    if n_err == 0:
+        snap = tile("Repositories with a snapshot", "%d of %d" % (s.get("promoted", 0), n_all),
+                    "%d match upstream now" % s.get("current", 0))
+    elif n_err == n_all:
+        snap = tile("Repositories with a snapshot", "unknown",
+                    "the registry did not answer for any of the %d" % n_all)
+    else:
+        snap = tile("Repositories with a snapshot", "%d of %d read" % (s.get("promoted", 0), n_all - n_err),
+                    "%d not read from the registry; %d match upstream now" % (n_err, s.get("current", 0)))
+    if n_done == 0:
+        files = tile("Files in the mirror", "unknown", "no repository read on both sides")
+        size = tile("Size in the mirror", "unknown", "no repository read on both sides")
+    else:
+        files = tile("Files in the mirror", fmt_int(s.get("mirrored_files")),
+                     "of %s upstream%s" % (fmt_int(s.get("upstream_files")), scope(targets)))
+        size = tile("Size in the mirror", "%s GiB" % fmt_gib(s.get("mirrored_bytes")),
+                    "of %s GiB, %s%s" % (fmt_gib(s.get("upstream_bytes")), fmt_pct(s.get("coverage_bytes")),
+                                         scope(targets)))
+    if n_done == 0:
+        hero_big = "unknown"
+        hero_cap = ("Coverage is not known: no repository could be read on both sides in this run. "
+                    "The table of repositories names what failed.")
+    elif n_done == n_all:
+        hero_big = fmt_pct(s.get("coverage_files"))
+        hero_cap = ("of upstream files are in the mirror, counted by file name and sha256 over %d "
+                    "repositories." % n_all)
+    else:
+        hero_big = fmt_pct(s.get("coverage_files"))
+        hero_cap = ("of upstream files are in the mirror, counted by file name and sha256 over the %d of %d "
+                    "repositories measured in this run. %d could not be read." % (n_done, n_all, n_all - n_done))
+    down = wk.get("down_after") or {}
+    down_text = ("Failed probes in %d runs in a row, over %d minutes or more, open the <code>worker-down</code> issue."
+                 % (down.get("runs") or 2, (down.get("seconds") or 3000) // 60))
     tiles = "".join([
-        tile("Repositories with a snapshot", "%d of %d" % (s.get("promoted", 0), s.get("targets", 0)),
-             "%d match upstream now" % s.get("current", 0)),
-        tile("Files in the mirror", fmt_int(s.get("mirrored_files")),
-             "of %s upstream" % fmt_int(s.get("upstream_files"))),
-        tile("Size in the mirror", "%s GiB" % fmt_gib(s.get("mirrored_bytes")),
-             "of %s GiB, %s" % (fmt_gib(s.get("upstream_bytes")), fmt_pct(s.get("coverage_bytes")))),
+        snap,
+        files,
+        size,
         tile("Oldest snapshot", fmt_age(oldest) if num(oldest) else "none",
              "sync runs every %s" % fmt_interval(interval)),
         tile("Worker", state_cell(wl, wv), wsub, raw=True),
@@ -1293,15 +1413,17 @@ def page(ctx, charts, badges):
                                    esc(fmt_int(c.get("files"))),
                                    esc("%.1f" % ((c.get("bytes") or 0) / 1048576))])
     figs = "".join([
-        fig("coverage", "Coverage by repository: %s of upstream files are in the mirror."
-            % fmt_pct(s.get("coverage_files")),
+        fig("coverage", ("Coverage by repository: %s of upstream files%s are in the mirror."
+                         % (fmt_pct(s.get("coverage_files")), scope(targets, " in"))) if n_done
+            else "Coverage by repository: not known in this run.",
             table(["repository", "in the mirror", "upstream", "share", "missing"], cov_rows, (1, 2, 3, 4))),
         fig("freshness", "Snapshot age per repository, against the sync interval.",
             table(["repository", "state", "fetched, UTC", "age", "lag"], fresh_rows, (3, 4))),
         fig("history-coverage", "Coverage per architecture over the last 30 days.", hist_table),
         fig("history-age", "Oldest snapshot age per architecture over the last 30 days.", hist_table),
-        fig("size", "Size by repository: %s GiB of %s GiB are in the mirror."
-            % (fmt_gib(s.get("mirrored_bytes")), fmt_gib(s.get("upstream_bytes"))),
+        fig("size", ("Size by repository: %s GiB of %s GiB%s are in the mirror."
+                     % (fmt_gib(s.get("mirrored_bytes")), fmt_gib(s.get("upstream_bytes")), scope(targets, " in")))
+            if n_done else "Size by repository: not known in this run.",
             table(["repository", "GiB in the mirror", "GiB upstream", "share"], size_rows, (1, 2, 3))),
         fig("speed", "pacman speed through each path, from the daily benchmark.",
             table(["operation", "path", "median", "rounds", "files", "MiB"], speed_rows, (2, 4, 5))
@@ -1395,7 +1517,7 @@ def page(ctx, charts, badges):
 <section class="hero" aria-label="Summary">
 <div>
 <p class="big">%(cov)s</p>
-<p class="big-cap">of upstream files are in the mirror, counted by file name and sha256 over %(n)d repositories.</p>
+<p class="big-cap">%(cap)s</p>
 </div>
 <div class="tiles">%(tiles)s</div>
 </section>
@@ -1405,7 +1527,7 @@ def page(ctx, charts, badges):
 <h2>Repositories</h2>
 <div class="scroll">%(repos)s</div>
 <h2>Worker probes</h2>
-<p>Each probe is one GET with no redirect followed. A repository with a snapshot must answer 302 to <code>https://*.githubusercontent.com</code>. A repository with no snapshot must answer 404. Two failed runs in a row open the <code>worker-down</code> issue.</p>
+<p>Each probe is one GET with no redirect followed. A repository with a snapshot must answer 302 to <code>https://*.githubusercontent.com</code>. A repository with no snapshot must answer 404. %(down)s</p>
 <div class="scroll">%(probes)s</div>
 <h2>Badges</h2>
 <div class="scroll">%(badges)s</div>
@@ -1419,8 +1541,8 @@ def page(ctx, charts, badges):
 """ % {
         "css": PAGE_CSS, "gen": esc(fmt_time(status.get("generated")) + " UTC"),
         "source": esc(source), "source_text": esc(source.replace("https://", "")),
-        "narch": len(ctx["order"]), "cov": esc(fmt_pct(s.get("coverage_files"))),
-        "n": s.get("targets", 0), "tiles": tiles, "use": use, "figs": figs, "repos": repos,
+        "narch": len(ctx["order"]), "cov": esc(hero_big), "cap": esc(hero_cap), "down": down_text,
+        "tiles": tiles, "use": use, "figs": figs, "repos": repos,
         "probes": probes_html, "badges": table(["badge", "URL"], badge_rows),
     }
 
@@ -1535,7 +1657,7 @@ def main(argv):
     write(os.path.join(site, "badges", "all.svg"),
           group_badge("mirror", ctx["targets"], interval, tolerance, count=True))
     badges.append("all")
-    write(os.path.join(site, "badges", "speed.svg"), speed_badge(bench))
+    write(os.path.join(site, "badges", "speed.svg"), speed_badge(bench, now))
     badges.append("speed")
 
     write(os.path.join(site, "index.html"), page(ctx, charts, badges))

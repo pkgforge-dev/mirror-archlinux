@@ -13,16 +13,23 @@ if ! command -v actionlint > /dev/null 2>&1; then
   exit 1
 fi
 
+# ⚠ actionlint 1.7.12, the newest release, does not know the concurrency key
+# queue. GitHub documents it for github.com ("Control the concurrency of
+# workflows and jobs"; changelog 2026-05-07), and sync.yml uses queue: max.
+# Only that one message is ignored. tests/static/50-workflow-policy.sh checks
+# the key's value instead. Remove the ignore when actionlint knows the key.
+IGNORE_QUEUE='unexpected key "queue" for "concurrency" section'
+
 cd "$REPO_ROOT"
 found=0
 for f in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -e "$f" ] || continue
   found=$((found + 1))
-  out="$(actionlint -no-color "$f" 2>&1)" && rc=0 || rc=$?
+  out="$(actionlint -no-color -ignore "$IGNORE_QUEUE" "$f" 2>&1)" && rc=0 || rc=$?
   if [ "$rc" -eq 0 ]; then
     ok "actionlint $f"
   else
-    fail "actionlint $f" "$(printf '%s\n' "$out" | sed -n 1,30p)" "reproduce: actionlint $f"
+    fail "actionlint $f" "$(printf '%s\n' "$out" | sed -n 1,30p)" "reproduce: actionlint -ignore '$IGNORE_QUEUE' $f"
   fi
 done
 if [ "$found" -eq 0 ]; then

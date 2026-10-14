@@ -12,11 +12,11 @@
 | file | checks |
 | --- | --- |
 | `static/10-shellcheck.sh` | every shell file outside `tests/fixtures/` passes shellcheck in the dialect of its first line |
-| `static/20-actionlint.sh` | every workflow passes actionlint |
+| `static/20-actionlint.sh` | every workflow passes actionlint; only the message on the concurrency key `queue`, which actionlint 1.7.12 does not know, is ignored |
 | `static/30-failures-stay-visible.sh` | no shipped script or workflow hides a failure; every curl call has a deadline, and so does every oras call in `scripts/` |
 | `static/35-pipeline-traps.sh` | no pipeline in a shipped bash script ends in a reader that stops early; `client/pacman-oci` runs with no `pipefail` and is left out |
 | `static/40-executable-bits.sh` | a shipped file with a `#!` line is 100755 in the git index; one without is 100644 |
-| `static/50-workflow-policy.sh` | the shape of every workflow: permissions, timeouts, pins, no untrusted value in `run:` |
+| `static/50-workflow-policy.sh` | the shape of every workflow: permissions, timeouts, pins, no untrusted value in `run:`; artifact names that survive a re-run; each step that calls `gh workflow run`, run against a stub `gh`; the concurrency group of each kind of `ci.yml` run, evaluated; the concurrency queues |
 | `static/60-targets.sh` | every target file parses and pins its images; one verify image; a plan slot for each target |
 | `static/70-python.sh` | every python file compiles; every file in `client/` and `scripts/` is shell or python |
 | `static/72-test-runner.sh` | `tests/run.sh` finds the files, runs one file, gates a live test, and fails a failed run |
@@ -28,7 +28,7 @@
 | `unit/32-prefetch-plan.sh` | the argument rewrite, the print lines, the signatures written from `%g` |
 | `unit/40-lib.sh` | the decisions of the sync on fixed inputs |
 | `unit/45-dispatch-overdue.sh` | `scripts/dispatch-overdue` starts a workflow only when it is active and overdue |
-| `unit/60-status.sh` | `status-collect` and `status-render` on fixtures |
+| `unit/60-status.sh` | `status-collect`, `status-render` and `check-staleness` on fixtures, also with one registry read that fails and with no registry read at all |
 | `integration/10-pipeline.sh` | the whole mirror against its own registry and upstream |
 | `integration/20-client.sh` | the wrapper against its own registry, through faulty proxies |
 | `worker/10-node.sh` | `node --test 'worker/test/*.test.js'` |
@@ -228,6 +228,13 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/60-status | the grace limit 30 days, not the tolerance | not ok: `check-staleness: no latest, added 13 days ago, tolerance 3: stale`, with the exit status and the added date |
 | unit/60-status | the shallow-clone check never true | not ok: `check-staleness: in a shallow clone the age is unknown, so stale, never new`, `check-staleness: says that the clone is shallow` |
 | unit/60-status | `read_json` returns a stub status | not ok: `status-render with no status.json exits 1`, `and names the file it looked for` |
+| unit/60-status | `status-render` of before the partial-measurement rule | 52 not ok, among them `site5: badge x86_64 carries its text: x86_64 \| 100% \| 4.0 h \| 1 of 3 measured` (it said `100% · 4.0 h`), `site6: badge x86_64 does not say not mirrored` and `site7: badge speed carries its text: ... 73 d ago` |
+| unit/60-status | `status-collect` of before `measured`, `worker.down` and the carried history | 10 not ok, among them `summary: no registry read: 0 promoted, 5 not read, 0 measured, every sum unknown` (got `0 null null 0 0 0 0 null`) and `history: x86_64-extra keeps its last measured files, marked carried` |
+| unit/60-status | `WORKER_DOWN_SECONDS=0` | not ok: `worker: two failed runs 7 minutes apart are not down; down needs 50 minutes` |
+| unit/60-status | no history carried for a target that a run did not read | not ok: `history: x86_64-extra keeps its last measured files, marked carried`, `site5: index.html says: x86_64 2026-10-14 03:00 77.7% 77.7%` |
+| unit/60-status | `BENCH_MAX_AGE` 100 days | 4 not ok, among them `site7: a bench older than 2 days gives the speed badge the warning colour` |
+| unit/60-status | a group with no snapshot is `not mirrored` also when its registry did not answer | 6 not ok, among them `site6: badge all does not say not mirrored` |
+| unit/60-status | `check-staleness` of before the enabled date | not ok: `check-staleness: no latest, added disabled 43 days ago, enabled 1 day ago: new` |
 
 ### worker
 
@@ -277,6 +284,13 @@ The tree itself is never changed. An integration fault runs with its own registr
 | static/50-workflow-policy | a call to the packages DELETE API | not ok: `no script or workflow deletes a package or a version` |
 | static/50-workflow-policy | `pages: write` in `ci.yml` job `static`; `contents: write` in `sync.yml` job `plan`; `id-token: write` in `watchdog.yml` job `staleness` | not ok: `pages, id-token and contents write only where the status site needs them`, once for each workflow |
 | static/50-workflow-policy | `keep-schedules-enabled` skips `watchdog.yml` | not ok: `.github/workflows/watchdog.yml has a schedule, and keep-schedules-enabled enables it` |
+| static/50-workflow-policy | `status.yml` of before the per-attempt Pages artifact; then the output of `build` renamed `pages-...` | not ok: `.github/workflows/status.yml: a re-run does not stop on an artifact of the same name`, each time |
+| static/50-workflow-policy | `overwrite: true` removed from one `upload-artifact` of `sync-target.yml` | not ok: `.github/workflows/sync-target.yml: a re-run does not stop on an artifact of the same name` |
+| static/50-workflow-policy | `sync.yml` of before the state check in `report` | not ok: `.github/workflows/sync.yml, the run: block at line 323: skips a workflow that is not active, and names its state` (exit 1 on the stub's HTTP 422) |
+| static/50-workflow-policy | `exit 0` where the state does not read | not ok: `... fails when the workflow's state does not read` |
+| static/50-workflow-policy | `ci.yml` of before the run-id group | not ok: `.github/workflows/ci.yml: two pushes to main and a dispatch get three concurrency groups, so none cancels another's pending run` (all three `ci-refs/heads/main`) |
+| static/50-workflow-policy | `sync.yml` with no `queue: max`; then with `cancel-in-progress: true` | not ok: `.github/workflows/sync.yml: the group sync queues every pending run, so a dispatch waits its turn`; then also `every concurrency queue is single or max, and max never cancels in progress` |
+| static/20-actionlint | the `queue` ignore removed | not ok: `actionlint .github/workflows/sync.yml` (`unexpected key "queue" for "concurrency" section`) |
 | static/60-targets | a verify image pinned without a tag | not ok: `targets/x86_64-core.conf pins its verify_image as name:tag@sha256` |
 | static/70-python | a `#!python3` file with a syntax error | not ok: `python3 -I -m py_compile scripts/status-render` |
 | static/70-python | a data file `scripts/notes.txt` | not ok: `scripts/notes.txt is a shell or a python script` |

@@ -155,6 +155,12 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+    # One Pages artifact name per run attempt. A re-run that runs build again
+    # uploads a second artifact into the same run, and deploy-pages refuses a
+    # name that two artifacts share. deploy reads the name from here, so a
+    # re-run of deploy alone takes the name that build used.
+    outputs:
+      pages_artifact: github-pages-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -242,6 +248,7 @@ jobs:
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         if: ${{ github.ref == 'refs/heads/main' }}
         with:
+          name: github-pages-${{ github.run_attempt }}
           path: ${{ runner.temp }}/site
 
   # Each of these names its needs' results: with no status function an if gets
@@ -289,6 +296,8 @@ jobs:
         id: deploy
         if: ${{ steps.pages.outputs.deploy == 'true' }}
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        with:
+          artifact_name: ${{ needs.build.outputs.pages_artifact }}
 
   # The Worker check reads the record build has just pushed to the status
   # branch. Here, not in watchdog.yml: an hourly cron there would cancel a
@@ -305,13 +314,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Raise worker-down after 2 failed status runs in a row
+      - name: Raise worker-down after failed probes in 2 runs in a row, over 50 minutes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # status.yml probes the Worker each hour and counts the runs in a
-          # row with a failed probe (scripts/status-collect). This reads its
-          # last record from the status branch.
+          # status.yml probes the Worker each hour, and once more after each
+          # sync, so two runs can be minutes apart. scripts/status-collect
+          # counts the runs in a row with a failed probe and the time since
+          # the first; it sets worker.down when both reach its limits. This
+          # reads its last record from the status branch.
           rc=0
           git ls-remote --exit-code --heads origin status > "$RUNNER_TEMP/heads.txt" || rc=$?
           case "$rc" in
@@ -328,8 +339,8 @@ jobs:
           git fetch --quiet --depth 1 origin status
           git show FETCH_HEAD:status.json > "$RUNNER_TEMP/status.json"
           git show FETCH_HEAD:worker.md > "$RUNNER_TEMP/worker.md"
-          read -r generated age failed ok <<< "$(jq -r '[.generated, (now - .generated_epoch | floor), .worker.failed_runs, .worker.ok] | map(tostring) | join(" ")' "$RUNNER_TEMP/status.json")"
-          echo "status.json from $generated, $age s ago: Worker ok $ok, failed $failed run(s) in a row"
+          read -r generated age failed ok down span <<< "$(jq -r '[.generated, (now - .generated_epoch | floor), .worker.failed_runs, .worker.ok, .worker.down, .worker.failing_seconds] | map(tostring) | join(" ")' "$RUNNER_TEMP/status.json")"
+          echo "status.json from $generated, $age s ago: Worker ok $ok, failed $failed run(s) in a row over $span s, down $down"
           # Three status runs missed: the record says nothing about now.
           if [ "$age" -gt 10800 ]; then
             echo "::error::the last Worker probe is from $generated, $age s ago; status.yml has stopped recording"
@@ -338,8 +349,8 @@ jobs:
           fi
           if [ "$ok" = true ]; then
             scripts/track-issue clear worker-down "The Worker passes its probes again, measured $generated: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/status/worker.md"
-          elif [ "$ok" = false ] && [ "$failed" -ge 2 ]; then
+          elif [ "$down" = true ]; then
             scripts/track-issue raise worker-down "The Worker fails its probe" "$RUNNER_TEMP/worker.md"
           else
-            echo "nothing to raise or clear: worker-down opens at 2 failed runs in a row"
+            echo "nothing to raise or clear: worker-down opens at failed probes in 2 runs in a row over 50 minutes or more (status.json .worker.down_after)"
           fi

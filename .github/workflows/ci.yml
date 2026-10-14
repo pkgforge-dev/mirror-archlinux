@@ -28,11 +28,13 @@ on:
 
 permissions: {}
 
-# One group per pull request, or per ref. A newer push to a pull request
-# cancels the run in progress; a run on main always finishes, so each commit
-# on main gets a verdict.
+# One group per pull request: a newer push to it cancels the run in progress.
+# Any other run has a group of its own (its run id). A group holds one pending
+# run, and a newer run cancels it, so a shared group for main would leave a
+# commit between two quick pushes with no verdict. No job writes shared state,
+# so runs on main need not wait for each other.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
