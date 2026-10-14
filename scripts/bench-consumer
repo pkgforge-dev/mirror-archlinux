@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+#
+# Measure how fast a consumer reads the mirror: pacman's own downloader on an
+# official mirror and on the Worker, against client/pacman-oci with its
+# prefetch and without it.
+#
+#   scripts/bench-consumer OUT.json
+#
+# Runs on this host when pacman is here and this runs as root. Otherwise it
+# runs itself again inside the pinned archlinux:base container, through
+# CONTAINER_RUNTIME (docker or podman; docker by default), with the network on.
+#
+# Cases, each with a throwaway root, database path, cache and config:
+#   official    https://geo.mirror.pkgbuild.com, pacman's downloader
+#   worker      https://ghcr.mirror.archlinux.pkgforge.dev, pacman's downloader
+#   oci         oci://ghcr.io/pkgforge-dev/mirror-archlinux, client/pacman-oci
+#               of this checkout, prefetch on
+#   oci-serial  the same with PACMAN_OCI_PREFETCH=0
+# Operations, timed one by one, every case in turn in each round:
+#   sy          pacman -Sy into an empty database path
+#   sw-small    pacman -Swdd of the BENCH_SMALL smallest core packages
+#   sw-large    pacman -Swdd of the BENCH_LARGE largest core packages
+# The packages are those whose file name is in both the mirror's core database
+# and upstream's, so every case downloads the same files. They are chosen by
+# size and passed to pacman by name.
+#
+# Settings every case shares: ParallelDownloads = 5; SigLevel = Required
+# DatabaseNever (Arch publishes no database signature; with an XferCommand
+# pacman pauses 2 s after each missing one, which is pacman's cost, not the
+# download's); package signatures checked against a throwaway keyring, first
+# refreshed from the current archlinux-keyring package. The two oci cases set
+# DownloadUser = alpm, as stock Arch does. The two native cases set none:
+# pacman's own sandbox for its downloader needs Landlock, which a container
+# without CAP_SYS_ADMIN refuses (measured: podman on WSL2, pacman 7.1).
+#
+# Environment:
+#   BENCH_ARCH          pacman's $arch (default x86_64)
+#   BENCH_SMALL         number of small packages (default 40)
+#   BENCH_LARGE         number of large packages (default 3)
+#   BENCH_ROUNDS        rounds; seconds is their median (default 3)
+#   CONTAINER_RUNTIME   docker or podman, when this host is not Arch
+#   BENCH_HOST          the "host" value; set by the outer run for the inner
+#
+# OUT.json:
+#   {"schema":1,"date":"<ISO 8601>","host":"...","pacman":"<version>",
+#    "cases":[{"path":"official|worker|oci|oci-serial","op":"sy|sw-small|sw-large",
+#              "seconds":<median>,"rounds":[...],"files":<n>,"bytes":<n>,"ok":true}]}
+# files and bytes are what the last round downloaded; ok is false when any
+# round failed or downloaded a different number of files.
+#
+# Exit status: 0 measured (a failed case has "ok":false), 1 could not run,
+# 2 usage.
+set -euo pipefail
+# No exit is silent: a command that ends the script under set -e is named.
+trap 'printf "bench-consumer: line %s: \"%s\" ended %s\n" "$LINENO" "$BASH_COMMAND" "$?" >&2' ERR
+# Sorting and join must agree on one order.
+export LC_ALL=C
+
+# tag: base
+ARCH_IMAGE=docker.io/library/archlinux:base@sha256:3c64b538588416593f69a1aebd2f2ec0f2541b29159f32556fa7def2167147a0
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ARCH="${BENCH_ARCH:-x86_64}"
+SMALL="${BENCH_SMALL:-40}"
+LARGE="${BENCH_LARGE:-3}"
+ROUNDS="${BENCH_ROUNDS:-3}"
+OP_TIMEOUT=1800
+
+say() {
+  printf 'bench-consumer: %s\n' "$1" >&2
+}
+
+die() {
+  say "$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    printf '  %s\n' "$1" >&2
+    shift
+  done
+  exit 1
+}
+
+out="${1:-}"
+if [ -z "$out" ] || [ "$#" -ne 1 ]; then
+  printf 'usage: scripts/bench-consumer OUT.json\n' >&2
+  exit 2
+fi
+for n in "$SMALL" "$LARGE" "$ROUNDS"; do
+  case "$n" in
+    '' | *[!0-9]* | 0) die "BENCH_SMALL, BENCH_LARGE and BENCH_ROUNDS are counts above 0, not '$n'" ;;
+  esac
+done
+# shellcheck disable=SC2016 # $arch and $repo are pacman's, not the shell's
+case "$ARCH" in
+  x86_64) OFFICIAL='https://geo.mirror.pkgbuild.com/$repo/os/$arch' ;;
+  aarch64 | armv7h) OFFICIAL='http://fl.us.mirror.archlinuxarm.org/$arch/$repo' ;;
+  *) die "no official mirror is known for BENCH_ARCH=$ARCH" ;;
+esac
+# shellcheck disable=SC2016 # $arch and $repo are pacman's, not the shell's
+WORKER='https://ghcr.mirror.archlinux.pkgforge.dev/$arch/$repo'
+# shellcheck disable=SC2016 # $arch and $repo are pacman's, not the shell's
+OCI='oci://ghcr.io/pkgforge-dev/mirror-archlinux/$arch/$repo'
+
+#---------------------------------------------------------------------------#
+# Not Arch, or not root: the same script inside the pinned container
+#---------------------------------------------------------------------------#
+if ! command -v pacman > /dev/null || [ "$(id -u)" -ne 0 ]; then
+  RUNTIME="${CONTAINER_RUNTIME:-docker}"
+  command -v "$RUNTIME" > /dev/null || die "no pacman here, and no $RUNTIME to run $ARCH_IMAGE" \
+    "reproduce: CONTAINER_RUNTIME=podman scripts/bench-consumer OUT.json"
+  out_dir="$(cd "$(dirname "$out")" && pwd)"
+  rc=0
+  timeout --kill-after=60 21600 "$RUNTIME" run --rm \
+    -e BENCH_ARCH="$ARCH" -e BENCH_SMALL="$SMALL" -e BENCH_LARGE="$LARGE" -e BENCH_ROUNDS="$ROUNDS" \
+    -e BENCH_HOST="$(uname -n) ($(uname -sm)), in archlinux:base through $(basename "$RUNTIME")" \
+    -v "$REPO_ROOT:/src:ro" -v "$out_dir:/out" \
+    "$ARCH_IMAGE" bash /src/scripts/bench-consumer "/out/$(basename "$out")" || rc=$?
+  [ "$rc" -eq 0 ] || die "the run in $ARCH_IMAGE ended $rc" "reproduce: CONTAINER_RUNTIME=$RUNTIME scripts/bench-consumer $out"
+  exit 0
+fi
+
+for tool in curl bsdtar sha256sum awk timeout pacman-key; do
+  command -v "$tool" > /dev/null || die "$tool is missing"
+done
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+# The download user runs the wrapper and pacman's print run from here.
+chmod 0755 "$work"
+install -m 0755 "$REPO_ROOT/client/pacman-oci" "$work/pacman-oci"
+
+now_ns() {
+  date +%s%N
+}
+
+#---------------------------------------------------------------------------#
+# Configs, keyring, package list
+#---------------------------------------------------------------------------#
+# conf CASE: the config file of one case
+conf() {
+  local f="$work/$1.conf"
+  {
+    printf '[options]\nArchitecture = %s\nSigLevel = Required DatabaseNever\n' "$ARCH"
+    printf 'LocalFileSigLevel = Optional\nParallelDownloads = 5\nGPGDir = %s/gnupg\n' "$work"
+    printf 'HookDir = %s/hooks\nLogFile = %s/%s.log\n' "$work" "$work" "$1"
+    case "$1" in
+      oci | oci-serial) printf 'DownloadUser = alpm\nXferCommand = %s/pacman-oci %%o %%u\n' "$work" ;;
+    esac
+    printf '\n[core]\n'
+    case "$1" in
+      official | keyring) printf 'Server = %s\n' "$OFFICIAL" ;;
+      worker) printf 'Server = %s\n' "$WORKER" ;;
+      oci | oci-serial) printf 'Server = %s\n' "$OCI" ;;
+    esac
+  } > "$f"
+  printf '%s\n' "$f"
+}
+mkdir -p "$work/hooks"
+
+# pac CASE ROOT ARGS...: pacman for one case, with its own root, database path
+# and cache under ROOT
+pac() {
+  local c="$1" r="$2"
+  shift 2
+  if [ "$c" = oci-serial ]; then
+    PACMAN_OCI_PREFETCH=0 timeout --kill-after=30 "$OP_TIMEOUT" pacman --config "$work/$c.conf" \
+      --root "$r/root" --dbpath "$r/db" --noconfirm "$@"
+  else
+    timeout --kill-after=30 "$OP_TIMEOUT" pacman --config "$work/$c.conf" \
+      --root "$r/root" --dbpath "$r/db" --noconfirm "$@"
+  fi
+}
+
+for c in keyring official worker oci oci-serial; do
+  conf "$c" > /dev/null
+done
+
+say "keyring: the image's, then the current archlinux-keyring from $OFFICIAL"
+pacman-key --gpgdir "$work/gnupg" --init > "$work/keyring.log" 2>&1
+pacman-key --gpgdir "$work/gnupg" --populate >> "$work/keyring.log" 2>&1
+mkdir -p "$work/k/root" "$work/k/db" "$work/k/cache"
+rc=0
+{
+  pac keyring "$work/k" -Sy &&
+    pac keyring "$work/k" --cachedir "$work/k/cache" -Swdd archlinux-keyring
+} >> "$work/keyring.log" 2>&1 || rc=$?
+if [ "$rc" -eq 0 ]; then
+  mkdir -p "$work/keyrings"
+  bsdtar -xf "$work"/k/cache/archlinux-keyring-*.pkg.tar.zst -C "$work/keyrings" usr/share/pacman/keyrings
+  pacman-key --gpgdir "$work/gnupg" --populate-from "$work/keyrings/usr/share/pacman/keyrings" --populate \
+    >> "$work/keyring.log" 2>&1 || rc=$?
+fi
+if [ "$rc" -ne 0 ]; then
+  say "could not refresh the keyring (exit $rc); the image's keyring is used: $(tail -n 2 "$work/keyring.log" | tr '\n' ' ')"
+fi
+
+# names_by_size DB: FILENAME<TAB>NAME<TAB>CSIZE of every package in DB. Each
+# package's desc starts with %FILENAME%; a blank line ends one field.
+names_by_size() {
+  bsdtar -xOf "$1" | awk '
+    function emit() { if (f != "" && n != "" && c != "") print f "\t" n "\t" c; f = n = c = "" }
+    /^%FILENAME%$/ { emit(); k = "f"; next }
+    /^%NAME%$/ { k = "n"; next }
+    /^%CSIZE%$/ { k = "c"; next }
+    /^%/ || /^$/ { k = ""; next }
+    k == "f" { f = $0 }
+    k == "n" { n = $0 }
+    k == "c" { c = $0 }
+    END { emit() }
+  ' | sort -u
+}
+
+say "package list: core files present in the mirror and upstream"
+upstream_db_url="${OFFICIAL//\$repo/core}"
+upstream_db_url="${upstream_db_url//\$arch/$ARCH}/core.db"
+rc=0
+curl -q -fsS --connect-timeout 20 --max-time 300 -o "$work/upstream.db" "$upstream_db_url" || rc=$?
+[ "$rc" -eq 0 ] || die "could not read $upstream_db_url (curl $rc)" "reproduce: curl -fsSO $upstream_db_url"
+mirror_db_url="oci://ghcr.io/pkgforge-dev/mirror-archlinux/$ARCH/core/core.db"
+rc=0
+"$work/pacman-oci" "$work/mirror.db" "$mirror_db_url" || rc=$?
+[ "$rc" -eq 0 ] || die "could not read $mirror_db_url (pacman-oci $rc)" \
+  "reproduce: PACMAN_OCI_DEBUG=1 client/pacman-oci core.db $mirror_db_url"
+names_by_size "$work/upstream.db" > "$work/upstream.tsv"
+names_by_size "$work/mirror.db" > "$work/mirror.tsv"
+# Both lists are sorted whole; join keeps the file names in both. Then by size:
+# the SMALL first and the LARGE last, chosen by position, every line read.
+join -t "$(printf '\t')" "$work/upstream.tsv" "$work/mirror.tsv" | sort -t "$(printf '\t')" -k3,3n -k1,1 > "$work/both.tsv"
+total="$(awk 'END { print NR + 0 }' "$work/both.tsv")"
+[ "$total" -ge $((SMALL + LARGE)) ] || die "only $total core files are in both the mirror and upstream; $((SMALL + LARGE)) are needed"
+awk -F '\t' -v n="$SMALL" 'NR <= n { print $2 }' "$work/both.tsv" > "$work/small.txt"
+awk -F '\t' -v n="$LARGE" -v t="$total" 'NR > t - n { print $2 }' "$work/both.tsv" > "$work/large.txt"
+small_bytes="$(awk -F '\t' -v n="$SMALL" 'NR <= n { s += $3 } END { print s + 0 }' "$work/both.tsv")"
+large_bytes="$(awk -F '\t' -v n="$LARGE" -v t="$total" 'NR > t - n { s += $3 } END { print s + 0 }' "$work/both.tsv")"
+say "$SMALL small packages ($small_bytes bytes), $LARGE large ($large_bytes bytes), of $total in both"
+
+#---------------------------------------------------------------------------#
+# The rounds
+#---------------------------------------------------------------------------#
+CASES="official worker oci oci-serial"
+OPS="sy sw-small sw-large"
+: > "$work/results.tsv"
+
+# measure CASE OP ROUND: one timed operation; a line CASE OP ROUND SECONDS
+# FILES BYTES OK into results.tsv
+measure() {
+  local c="$1" op="$2" r="$3" dir="$work/run/$1/$3" t0 t1 rc=0 files bytes ok=true want
+  mkdir -p "$dir/root" "$dir/db"
+  case "$op" in
+    sy)
+      t0="$(now_ns)"
+      pac "$c" "$dir" -Sy > "$dir/sy.log" 2>&1 || rc=$?
+      t1="$(now_ns)"
+      files=0
+      bytes=0
+      if [ -f "$dir/db/sync/core.db" ]; then
+        files=1
+        bytes="$(wc -c < "$dir/db/sync/core.db" | tr -d ' ')"
+      fi
+      want=1
+      ;;
+    sw-small | sw-large)
+      mkdir -p "$dir/$op"
+      local names=()
+      mapfile -t names < "$work/${op#sw-}.txt"
+      t0="$(now_ns)"
+      pac "$c" "$dir" --cachedir "$dir/$op" -Swdd "${names[@]}" > "$dir/$op.log" 2>&1 || rc=$?
+      t1="$(now_ns)"
+      files="$(find "$dir/$op" -maxdepth 1 -type f -name '*.pkg.tar*' | wc -l | tr -d ' ')"
+      bytes="$(find "$dir/$op" -maxdepth 1 -type f -name '*.pkg.tar*' -printf '%s\n' | awk '{ s += $1 } END { print s + 0 }')"
+      # A package and its signature each
+      want=$((2 * $(awk 'END { print NR + 0 }' "$work/${op#sw-}.txt")))
+      rm -rf "${dir:?}/$op"
+      ;;
+  esac
+  if [ "$rc" -ne 0 ] || [ "$files" -ne "$want" ]; then
+    ok=false
+    say "$c $op round $r: exit $rc, $files of $want files; log: $(tail -n 2 "$dir/$op.log" | tr '\n' ' ')"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$c" "$op" "$r" \
+    "$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.3f", (b - a) / 1e9 }')" "$files" "$bytes" "$ok" >> "$work/results.tsv"
+}
+
+for r in $(seq 1 "$ROUNDS"); do
+  for c in $CASES; do
+    for op in $OPS; do
+      measure "$c" "$op" "$r"
+      say "round $r $c $op: $(awk -F '\t' 'END { print $4 " s, " $5 " files, " $6 " bytes, ok " $7 }' "$work/results.tsv")"
+    done
+  done
+done
+
+#---------------------------------------------------------------------------#
+# OUT.json
+#---------------------------------------------------------------------------#
+# No quote and no backslash may reach the JSON string.
+host="${BENCH_HOST:-$(uname -n) ($(uname -sm))}"
+host="${host//\"/}"
+host="${host//\\/}"
+# From the local database: pacman -Q would warn about the image's own sync
+# databases, which this never reads.
+version=unknown
+for d in /var/lib/pacman/local/pacman-[0-9]*; do
+  [ -d "$d" ] && version="${d##*/pacman-}"
+done
+{
+  printf '{"schema":1,"date":"%s","host":"%s","pacman":"%s","cases":[' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$host" "$version"
+  first=1
+  for c in $CASES; do
+    for op in $OPS; do
+      [ "$first" = 1 ] || printf ','
+      first=0
+      # rounds in the order they ran; seconds is their median
+      awk -F '\t' -v c="$c" -v op="$op" '
+        $1 == c && $2 == op {
+          n++; r[n] = $4; s[n] = $4; files = $5; bytes = $6
+          if ($7 != "true" || (n > 1 && $5 != prev)) bad = 1
+          prev = $5
+        }
+        END {
+          for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (s[j] + 0 < s[i] + 0) { x = s[i]; s[i] = s[j]; s[j] = x }
+          med = (n % 2) ? s[(n + 1) / 2] : (s[n / 2] + s[n / 2 + 1]) / 2
+          printf "{\"path\":\"%s\",\"op\":\"%s\",\"seconds\":%.3f,\"rounds\":[", c, op, med
+          for (i = 1; i <= n; i++) printf "%s%s", (i > 1 ? "," : ""), r[i]
+          printf "],\"files\":%d,\"bytes\":%d,\"ok\":%s}", files, bytes, (bad ? "false" : "true")
+        }
+      ' "$work/results.tsv"
+    done
+  done
+  printf ']}\n'
+} > "$work/out.json"
+mv -f "$work/out.json" "$out"
+say "wrote $out"
