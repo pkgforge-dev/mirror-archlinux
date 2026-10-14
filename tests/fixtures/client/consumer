@@ -79,10 +79,14 @@ leftovers() {
 
 # sync LABEL ARGS...: one pacman call with the wrapper's debug output
 sync() {
-  local label="$1" rc=0
+  local label="$1" rc=0 t0 t1
   shift
+  t0="$(date +%s%N)"
   PACMAN_OCI_DEBUG=1 pac "$@" > "/tmp/$label.out" 2> "/tmp/$label.err" || rc=$?
+  t1="$(date +%s%N)"
   result "${label}_rc" "$rc"
+  result "${label}_ms" "$(((t1 - t0) / 1000000))"
+  result "${label}_empty_sig" "$(count 'OUTPUT is empty, and pacman removes it' "/tmp/$label.err")"
   result "${label}_get" "$(count 'pacman-oci: GET ' "/tmp/$label.err")"
   result "${label}_prefetch_get" "$(count 'pacman-oci: prefetch GET ' "/tmp/$label.err")"
   result "${label}_served" "$(count ' from the prefetch' "/tmp/$label.err")"
@@ -103,6 +107,7 @@ case "$case_name" in
     fi
     conf "$du" 'Required DatabaseOptional'
     sync sy -Sy
+    result sy_db_sigs "$(find /var/lib/pacman/sync -maxdepth 1 -name '*.sig' | wc -l)"
     sync s -S alpha beta gamma
     installed alpha
     installed beta

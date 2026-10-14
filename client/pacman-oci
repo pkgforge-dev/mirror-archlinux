@@ -608,6 +608,58 @@ store_open() {
   return 0
 }
 
+# sig_absent MESSAGE: a database signature that the registry does not hold.
+# pacman sleeps 2 s after every download that fails, also for an optional
+# signature, so each repository costs 2 s on every -Sy. Under the sandbox
+# (OUTPUT in a download-XXXXXX directory), pacman 7.0 and 7.1 unlink a
+# zero-byte file there and then read the signature as missing (libalpm
+# dload.c finalize_download_file): an empty OUTPUT and exit 0 cost no pause.
+# With no sandbox the empty file would stay as the signature, so this is a
+# miss there, and for every pacman version not known to work this way.
+# PACMAN_OCI_EMPTY_SIG=0 turns it off.
+sig_absent() {
+  if [ "${PACMAN_OCI_EMPTY_SIG:-1}" != 0 ] && [ "$kind" = dbsig ] && sandboxed && pacman_unlinks_empty; then
+    if : > "$out"; then
+      debug "$1; OUTPUT is empty, and pacman removes it"
+      exit 0
+    fi
+  fi
+  miss "$1"
+}
+
+sandboxed() {
+  case ${out_dir##*/} in
+    download-?*) return 0 ;;
+  esac
+  return 1
+}
+
+# pacman_unlinks_empty: the parent pacman is a version whose sandbox removes a
+# zero-byte download. Asked once per run; the answer is kept in the store.
+pacman_unlinks_empty() {
+  [ -n "$key" ] || return 1
+  if entry_ok ,pacver; then
+    IFS= read -r _pv < "$store,pacver" || _pv=''
+  else
+    _pv=''
+    argv_scan || debug "pacman's arguments: $scan_why"
+    if find_exe; then
+      need_work
+      _rc=0
+      "$exe" --version > "$work/pacver" 2>&1 || _rc=$?
+      if [ "$_rc" = 0 ]; then
+        _pv=$(sed -n 's/.*Pacman v\([0-9][0-9.]*\).*/\1/p' "$work/pacver")
+      fi
+    fi
+    _t=$(mktemp "${store}tmp.XXXXXX") && printf '%s\n' "${_pv:-unknown}" > "$_t" && put ,pacver "$_t"
+  fi
+  case $_pv in
+    7.0 | 7.0.* | 7.1 | 7.1.*) return 0 ;;
+  esac
+  debug "pacman ${_pv:-of unknown version}: a missing database signature is a miss"
+  return 1
+}
+
 # serve NAME: a ready entry becomes OUTPUT, and the call ends
 serve() {
   entry_ok "$1" || return 1
@@ -1629,7 +1681,7 @@ if [ "$store_ok" = 1 ]; then
       if [ "$ours" = 1 ]; then
         serve "$file"
         if entry_ok ",absent.$file"; then
-          miss "no layer $file in the database manifest of this run"
+          sig_absent "no layer $file in the database manifest of this run"
         fi
       fi
       ;;
@@ -1879,7 +1931,7 @@ case $idx in
     if [ "$kind" = pkgsig ]; then
       broken "$file: no signature layer in $host/$repo:$manifest_ref; pacman tries no other server for a .sig"
     fi
-    miss "$host/$repo:$manifest_ref has no layer named $file"
+    sig_absent "$host/$repo:$manifest_ref has no layer named $file"
     ;;
 esac
 digest=$(flat_get "$work_flat" "/layers/$idx/digest")

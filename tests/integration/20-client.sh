@@ -186,6 +186,7 @@ for c in main-du main-root; do
   want "$c" sy_prefetch_get 4 "the first database request reads both manifests and both databases in one prefetch"
   want "$c" sy_get 0 "no single request: the second database and both missing .db.sig come from the run store"
   want "$c" sy_served 2 "both databases are handed over from the run store"
+  want "$c" sy_db_sigs 0 "no database signature is stored in the sync directory"
   want "$c" s_rc 0 "pacman -S of three packages from two repositories succeeds"
   want "$c" s_prefetch_get 3 "the prefetch reads the three packages; the signatures come from %PGPSIG%"
   want "$c" s_get 0 "the serial pass makes no network request"
@@ -198,6 +199,13 @@ for c in main-du main-root; do
   want "$c" main_store_files 0 "no store file is left once pacman has ended"
   want "$c" main_download_dirs 0 "no download directory is left behind"
 done
+# The 2 s pause pacman takes after each failed download: under the sandbox the
+# two absent database signatures are empty files, which pacman removes, so -Sy
+# pauses never. With no sandbox they stay misses, so -Sy pauses twice.
+want main-du sy_empty_sig 2 "both absent database signatures are answered with an empty file"
+want_cmp main-du sy_ms lt 1900 "-Sy of two repositories takes less than one 2 s pause"
+want main-root sy_empty_sig 0 "with no sandbox, an absent database signature stays a miss"
+want_cmp main-root sy_ms ge 4000 "with no sandbox, pacman pauses 2 s after each absent signature"
 
 consumer noprefetch "$SERVER"
 want noprefetch s_rc 0 "PACMAN_OCI_PREFETCH=0: pacman -S succeeds"
