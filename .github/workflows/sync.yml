@@ -12,6 +12,12 @@
 # writes only write-once package tags and its own staging-<branch> tag, and
 # never moves latest. Runs from every branch share one concurrency group, so
 # two runs never write the same tags at once.
+#
+# A re-run: "Re-run failed jobs" keeps the plan and its artifacts. "Re-run all
+# jobs" plans again under a new plan id; a download by name or pattern still
+# returns the earlier attempt's artifact for every name not uploaded again.
+# So each artifact a chain makes carries the plan id, and scripts/stage and
+# scripts/report read none of another plan (docs/operations.md).
 name: Sync
 
 on:
@@ -99,7 +105,8 @@ jobs:
           done
           scripts/plan "$RUNNER_TEMP/plan" "${args[@]}"
           mkdir -p "$RUNNER_TEMP/plan-summary"
-          cp "$RUNNER_TEMP/plan/summary.tsv" "$RUNNER_TEMP/plan/targets.json" "$RUNNER_TEMP/plan/pending.json" "$RUNNER_TEMP/plan-summary/"
+          cp "$RUNNER_TEMP/plan/summary.tsv" "$RUNNER_TEMP/plan/targets.json" "$RUNNER_TEMP/plan/pending.json" \
+            "$RUNNER_TEMP/plan/plan-id" "$RUNNER_TEMP/plan-summary/"
       - name: Upload the plan's summary, for the report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -15,15 +15,25 @@
 # did not run. OUT gets:
 #   state.tsv     target state why: promote's word wins over verify's, over
 #                 stage's
-#   verify.tsv    every verdict line of the target
-#   refused.tsv   file reason: every upstream-refused package of the target
+#   plan-id       the plan the stage came from (STAGE/TARGET/plan-id)
+#   verify.tsv    every verdict line of the target about the staged digest
+#   refused.tsv   file reason: every upstream-refused package of those verdicts
 #   failing.tsv, replaced.tsv, settings-url  as stage left them
+# A verdict about another digest, and a promotion of another digest, are
+# left over from an earlier attempt of the run: they are not read.
 #
 # The second form writes one table for the run: every target of the plan
 # (PLAN/summary.tsv), with the state each chain collected into
 # SUMMARIES/<target>/state.tsv, and under it the files that hold a target and
 # the upstream-refused packages, per target. To $GITHUB_STEP_SUMMARY when set,
 # otherwise to stdout.
+#
+# ⛔ A chain's summary counts only when its plan-id is PLAN/plan-id, and only
+# for a target this plan marks pending. "Re-run all jobs" plans again, and the
+# download of summary-* still returns the earlier attempt's summary for every
+# target that has no chain now. Read, it could show a state that is no longer
+# true, and raise an issue again. A summary left out is named in the log.
+# "Re-run failed jobs" keeps the plan, and every summary of that plan counts.
 #
 # Issues (scripts/track-issue), only when TRACK_ISSUES=1:
 #   visibility-<target>  raised when the package reads only with the workflow's
@@ -58,17 +68,18 @@ if [ "${1:-}" = collect ]; then
     '' | *[!a-z0-9_.-]*) usage ;;
   esac
   mkdir -p "$sout"
+  work_c="$(mktemp -d)"
+  trap 'rm -rf "$work_c"' EXIT
+  : > "$work_c/verify.tsv"
+  : > "$work_c/refused.tsv"
   : > "$sout/verify.tsv"
   : > "$sout/refused.tsv"
-  if [ -d "$verify" ]; then
-    find "$verify" -name "verify-$target-*.tsv" -type f -exec cat {} + | sort -t $'\t' -k2,2n >> "$sout/verify.tsv"
-    find "$verify" -name "refused-$target-*.tsv" -type f -exec cat {} + | awk -F '\t' '!seen[$1]++' >> "$sout/refused.tsv"
-  fi
-  state="" why=""
+  : > "$sout/plan-id"
+  state="" why="" digest=""
   if [ -f "$stage/$target/state" ]; then
     state="$(cat "$stage/$target/state")"
     why="$(cat "$stage/$target/why")"
-    for f in failing.tsv replaced.tsv settings-url; do
+    for f in failing.tsv replaced.tsv settings-url plan-id; do
       if [ -f "$stage/$target/$f" ]; then
         cp "$stage/$target/$f" "$sout/$f"
       fi
@@ -79,7 +90,26 @@ if [ "${1:-}" = collect ]; then
   fi
   if [ "$state" = staged ]; then
     digest="$(sed -n 's/^DIGEST=//p' "$stage/$target/staged.env")"
-    failed_line="$(awk -F '\t' -v d="$digest" '$3 != "passed" || $5 != d { print "batch " $2 ": " $3 ": " $4; exit }' "$sout/verify.tsv")"
+  fi
+  # The verdicts about the staged digest, and the refusals beside them
+  if [ -d "$verify" ] && [ -n "$digest" ]; then
+    find "$verify" -name "verify-$target-*.tsv" -type f > "$work_c/verdicts.txt"
+    while IFS= read -r v; do
+      if [ "$(cut -f 5 "$v")" != "$digest" ]; then
+        log "$target: $v is about $(cut -f 5 "$v"), not the staged $digest; it is not read"
+        continue
+      fi
+      cat "$v" >> "$work_c/verify.tsv"
+      r="$(dirname "$v")/refused-${v##*/verify-}"
+      if [ -f "$r" ]; then
+        cat "$r" >> "$work_c/refused.tsv"
+      fi
+    done < "$work_c/verdicts.txt"
+    sort -t $'\t' -k2,2n "$work_c/verify.tsv" > "$sout/verify.tsv"
+    awk -F '\t' '!seen[$1]++' "$work_c/refused.tsv" > "$sout/refused.tsv"
+  fi
+  if [ "$state" = staged ]; then
+    failed_line="$(awk -F '\t' '$3 != "passed" && f == "" { f = "batch " $2 ": " $3 ": " $4 } END { print f }' "$sout/verify.tsv")"
     if [ -n "$failed_line" ]; then
       state=failed
       why="$failed_line"
@@ -88,10 +118,18 @@ if [ "${1:-}" = collect ]; then
       why="$(awk 'END { print NR + 0 }' "$sout/verify.tsv") verdict(s) for $(find "$stage/$target/batches" -name '*.txt' | awk 'END { print NR + 0 }') batch(es)"
     fi
   fi
-  if [ -f "$promoted" ] && [ -s "$promoted" ]; then
+  # promote runs only after a stage of this attempt that succeeded, and its
+  # "promoted" names the digest it tagged.
+  if [ -f "$promoted" ] && [ -s "$promoted" ] && [ -n "$digest" ]; then
     line="$(awk -F '\t' -v t="$target" '$1 == t { l = $2 "\t" $3 } END { print l }' "$promoted")"
     if [ -n "$line" ]; then
-      IFS=$'\t' read -r state why <<< "$line"
+      IFS=$'\t' read -r p_state p_why <<< "$line"
+      if [ "$p_state" = promoted ] && [ "${p_why%% *}" != "$digest" ]; then
+        log "$target: the promotion in $promoted is of ${p_why%% *}, not the staged $digest; it is not read"
+      else
+        state="$p_state"
+        why="$p_why"
+      fi
     fi
   fi
   refused_n="$(awk 'END { print NR + 0 }' "$sout/refused.tsv")"
@@ -120,25 +158,48 @@ fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# target -> final state and why: the chain's word wins over the plan's
-tail -n +2 "$plan/summary.tsv" | cut -f 1,2,5 > "$work/states.tsv"
+# The summaries of this plan's chains: target, then the directory
+plan_id=""
+if [ -f "$plan/plan-id" ]; then
+  plan_id="$(cat "$plan/plan-id")"
+else
+  warn "$plan/plan-id does not exist: this plan names no plan id, so only summaries that name none are read"
+fi
+: > "$work/dirs.tsv"
 : > "$work/chains.tsv"
 if [ -d "$summaries" ]; then
-  find "$summaries" -name state.tsv -type f -exec cat {} + > "$work/chains.tsv"
+  find "$summaries" -name state.tsv -type f > "$work/state-files.txt"
+  while IFS= read -r f; do
+    d="${f%/state.tsv}"
+    got=""
+    if [ -f "$d/plan-id" ]; then
+      got="$(cat "$d/plan-id")"
+    fi
+    if [ "$got" != "$plan_id" ]; then
+      log "$d is the summary of plan '$got', not of this plan '$plan_id'; it is not read"
+      continue
+    fi
+    cat "$f" >> "$work/chains.tsv"
+    awk -F '\t' -v d="$d" '{ print $1 "\t" d }' "$f" >> "$work/dirs.tsv"
+  done < "$work/state-files.txt"
 fi
-# Every pending target has a chain; one that is still pending here left no
-# summary, and nothing says what became of it.
+
+# target -> final state and why. The chain's word wins over the plan's, for a
+# target this plan marks pending only. Every pending target has a chain; one
+# that is still pending here left no summary, and nothing says what became of
+# it.
+tail -n +2 "$plan/summary.tsv" | cut -f 1,2,5 > "$work/states.tsv"
 awk -F '\t' -v OFS='\t' '
   FILENAME == ARGV[1] { s[$1] = $2; w[$1] = $3; next }
-  ($1 in s) { $2 = s[$1]; $3 = w[$1] }
-  $2 == "pending" { $2 = "failed"; $3 = "its chain left no summary; read the run: " $3 }
+  ($1 in s) && $2 == "pending" { $2 = s[$1]; $3 = w[$1] }
+  $2 == "pending" { $2 = "failed"; $3 = "its chain left no summary of this plan; read the run: " $3 }
   { print }
 ' "$work/chains.tsv" "$work/states.tsv" > "$work/merged.tsv"
 mv -f "$work/merged.tsv" "$work/states.tsv"
 
 # dir_of TARGET -> the directory its chain collected, or nothing
 dir_of() {
-  find "$summaries" -name state.tsv -type f -exec awk -F '\t' -v t="$1" '$1 == t { print FILENAME }' {} + | sed -n 's|/state.tsv$||p' | sed -n 1p
+  awk -F '\t' -v t="$1" '$1 == t && d == "" { d = $2 } END { print d }' "$work/dirs.tsv"
 }
 
 {

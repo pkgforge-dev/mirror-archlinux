@@ -23,17 +23,37 @@
 #      while a db_server still serves the promoted one. ALLOW_OLDER (target
 #      names, comma separated) skips the promoted comparison for a deliberate
 #      upstream downgrade.
-#   4. The same bytes as the promoted database: the target is current.
-#   5. Otherwise every file is skip, when the promoted database names it with
+#   4. The files the promoted snapshot holds with no signature (its
+#      dev.pkgforge.mirror.unsigned annotation, scripts/stage): each one's
+#      .sig is asked for again. One that upstream signs now is planned again,
+#      so mirror-file adds its signature layer.
+#   5. The same bytes as the promoted database, and no file signed since: the
+#      target is current.
+#   6. Otherwise every file is skip, when the promoted database names it with
 #      the same sha256 and the same %PGPSIG% (no request made), or todo.
 #      scripts/mirror-file reads each todo file's tag before writing it: it
 #      never overwrites a package layer, and it repairs a signature layer that
 #      upstream signed again.
-#   6. The todo files of the target go into its own shards: k = the larger of
+#   7. The todo files of the target go into its own shards: k = the larger of
 #      ceil(bytes / SHARD_BYTES) and ceil(files / SHARD_FILES), at least 1, at
 #      most MAX_SHARDS and the file count; largest file first onto the lightest
 #      shard. A target never waits for another target's shards.
 #
+# ⛔ The plan ends within PLAN_BUDGET seconds of upstream reads (default 1200),
+# below the plan job's timeout-minutes (30). Each target gets a share: what is
+# left of the budget, divided by the targets not yet read. A fast target
+# leaves its unused share to the targets after it; a slow one cannot take
+# theirs. Each upstream read ends within its own deadline, or within a part of
+# what is left of the share when that is less: a db_server gets 1/(n + 1) of
+# it, with n the db_servers not yet read, so a slow first db_server leaves
+# time for the next one and for the files database. A target whose reads do
+# not fit is in error for this run, and its why names PLAN_BUDGET.
+#
+# OUT/plan-id               this plan's id: the run, its attempt and a random
+#                           number, also in OUT/<target>/plan-id. Every
+#                           artifact a chain makes from this plan carries it
+#                           (scripts/mirror-shard, stage, report), and stage
+#                           and report read nothing of another plan.
 # OUT/<target>/state        current pending behind held error
 # OUT/<target>/why          one line saying what was measured
 # OUT/<target>/upstream.db  the chosen database, byte for byte, and .files and
@@ -41,6 +61,9 @@
 # OUT/<target>/records.tsv  its records (lib.sh db_records)
 # OUT/<target>/nul.txt      its package directories whose desc is NUL bytes only
 # OUT/<target>/todo.tsv     the files this run mirrors
+# OUT/<target>/unsigned.txt the files promoted with no signature that are not
+#                           planned again: upstream still has no .sig for them,
+#                           or did not answer. scripts/stage lists them again.
 # OUT/<target>/shards/<n>.tsv  the work lines of shard n, for scripts/mirror-shard
 # OUT/<target>/meta.env     KEY=VALUE facts stage writes into the manifest
 # OUT/targets.json          {"include":[{"target":T,"shards":[0,1,..]},..]}: the
@@ -58,8 +81,9 @@
 # workflow's upload steps read to upload OUT/<target> as plan-<target>.
 #
 # Environment: SHARD_BYTES (default 536870912), SHARD_FILES (400), MAX_SHARDS
-# (32, per target), ALLOW_OLDER, MIRROR_NAMESPACE, REGISTRY_USER and
-# REGISTRY_TOKEN (used only to tell a private package from an absent one).
+# (32, per target), PLAN_BUDGET (1200 s), ALLOW_OLDER, MIRROR_NAMESPACE,
+# REGISTRY_USER and REGISTRY_TOKEN (used only to tell a private package from an
+# absent one).
 #
 # Exit status: 0 planned, whatever state each target is in; 1 no plan could be
 # made at all.
@@ -68,7 +92,7 @@ SCRIPT_NAME=plan
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-need curl jq awk tar sha256sum
+need curl jq awk tar sha256sum timeout
 
 out="${1:-}"
 [ -n "$out" ] || die "usage: scripts/plan OUT [TARGET.conf ...]"
@@ -78,7 +102,8 @@ shift
 SHARD_BYTES="${SHARD_BYTES:-536870912}"
 SHARD_FILES="${SHARD_FILES:-400}"
 MAX_SHARDS="${MAX_SHARDS:-32}"
-for v in SHARD_BYTES SHARD_FILES MAX_SHARDS; do
+PLAN_BUDGET="${PLAN_BUDGET:-1200}"
+for v in SHARD_BYTES SHARD_FILES MAX_SHARDS PLAN_BUDGET; do
   case "${!v}" in
     '' | *[!0-9]* | 0) die "$v must be a positive integer, not '${!v}'" ;;
   esac
@@ -88,6 +113,13 @@ done
 DB_MAX_TIME=300
 FILES_MAX_TIME=900
 SIG_MAX_TIME=60
+run_deadline=$((SECONDS + PLAN_BUDGET))
+
+if [ -n "${GITHUB_RUN_ID:-}" ]; then
+  plan_id="$GITHUB_RUN_ID.${GITHUB_RUN_ATTEMPT:-1}.$RANDOM"
+else
+  plan_id="local.$(date -u +%s).$$.$RANDOM"
+fi
 
 if [ "$#" -eq 0 ]; then
   for conf in "$TARGETS_DIR"/*.conf; do
@@ -101,12 +133,57 @@ fi
 
 mkdir -p "$out"
 fetched="$(iso_now)"
+printf '%s\n' "$plan_id" > "$out/plan-id"
+log "plan $plan_id: $# target(s), PLAN_BUDGET=${PLAN_BUDGET}s"
 
 # set_state DIR STATE WHY
 set_state() {
   printf '%s\n' "$2" > "$1/state"
   printf '%s\n' "$3" > "$1/why"
   log "$(basename "$1"): $2: $3"
+}
+
+#---------------------------------------------------------------------------#
+# The budget
+#---------------------------------------------------------------------------#
+# share_start TARGETS_LEFT: this target's share of what is left of PLAN_BUDGET
+share_start() {
+  local left=$((run_deadline - SECONDS))
+  if [ "$left" -lt 0 ]; then
+    left=0
+  fi
+  share=$((left / $1))
+  share_deadline=$((SECONDS + share))
+  budget_cut=0
+}
+
+# fetch_within URL OUT MAX PARTS -> fetch_upstream's status. The deadline is
+# MAX, or what is left of the share divided by PARTS when that is less; with
+# nothing left, status 1 and no request. Sets fetch_max to the deadline used,
+# and budget_cut when a read failed with less time than MAX, or was not made.
+fetch_within() {
+  local url="$1" outfile="$2" own="$3" parts="$4" rc=0
+  fetch_max=$(((share_deadline - SECONDS) / parts))
+  if [ "$fetch_max" -gt "$own" ]; then
+    fetch_max="$own"
+  fi
+  if [ "$fetch_max" -lt 1 ]; then
+    fetch_max=0
+    budget_cut=1
+    log "$url: not read, nothing is left of the target's share of PLAN_BUDGET (${share}s)"
+    return 1
+  fi
+  fetch_upstream "$url" "$outfile" "$fetch_max" || rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 4 ] && [ "$fetch_max" -lt "$own" ]; then
+    budget_cut=1
+  fi
+  return "$rc"
+}
+
+# budget_note -> "; ..." when a read of this target failed for want of time
+budget_note() {
+  [ "$budget_cut" -eq 1 ] || return 0
+  printf '; a read had less time than its own deadline, to fit the target'\''s share (%ss) of PLAN_BUDGET=%ss' "$share" "$PLAN_BUDGET"
 }
 
 allowed_older() {
@@ -157,11 +234,12 @@ prune() {
     esac
   done
   rm -f -- "$dir/promoted.db" "$dir/promoted.db.part" "$dir/promoted.tsv" "$dir/pairs.tsv" \
-    "$dir/files.tsv" "$dir"/files.tsv.* "$dir/latest.json"
+    "$dir/files.tsv" "$dir"/files.tsv.* "$dir/latest.json" "$dir/listed.txt" "$dir/recheck.txt" \
+    "$dir/recheck.sig" "$dir/signed-now.txt"
 }
 
 plan_target() {
-  local conf="$1" arch repo name dir repo_path server rc why i
+  local conf="$1" arch repo name dir repo_path server rc why i dbs=()
   target_check "$conf"
   arch="$(target_get "$conf" arch)"
   repo="$(target_get "$conf" repo)"
@@ -173,19 +251,23 @@ plan_target() {
   : > "$dir/todo.tsv"
   : > "$dir/meta.env"
   : > "$dir/nul.txt"
+  : > "$dir/unsigned.txt"
+  : > "$dir/signed-now.txt"
+  printf '%s\n' "$plan_id" > "$dir/plan-id"
 
   #-------------------------------------------------------------------------#
   # 1. Candidates, from the distribution's own servers only
   #-------------------------------------------------------------------------#
   i=0
   : > "$dir/cand/list.tsv"
-  while IFS= read -r server; do
+  mapfile -t dbs < <(target_all "$conf" db_server)
+  for server in "${dbs[@]}"; do
     [ -n "$server" ] || continue
     i=$((i + 1))
     rc=0
-    fetch_upstream "$server/$repo.db" "$dir/cand/$i.db" "$DB_MAX_TIME" || rc=$?
+    fetch_within "$server/$repo.db" "$dir/cand/$i.db" "$DB_MAX_TIME" "$((${#dbs[@]} - i + 2))" || rc=$?
     if [ "$rc" -ne 0 ]; then
-      log "$name: $server/$repo.db did not answer within ${DB_MAX_TIME}s (status $rc); the next db_server is tried"
+      log "$name: $server/$repo.db did not answer within ${fetch_max}s (status $rc); the next db_server is tried"
       continue
     fi
     rc=0
@@ -199,10 +281,10 @@ plan_target() {
       log "$name: $server/$repo.db: $(awk 'END { print NR + 0 }' "$dir/cand/$i.tsv.nul") package directory(ies) whose desc holds only NUL bytes: $(tr '\n' ' ' < "$dir/cand/$i.tsv.nul")"
     fi
     printf '%s\t%s\t%s\n' "$i" "$server" "$(sha256sum "$dir/cand/$i.db" | cut -d ' ' -f 1)" >> "$dir/cand/list.tsv"
-  done <<< "$(target_all "$conf" db_server)"
+  done
 
   if [ ! -s "$dir/cand/list.tsv" ]; then
-    set_state "$dir" error "no db_server answered with a whole, well-formed database"
+    set_state "$dir" error "no db_server answered with a whole, well-formed database$(budget_note)"
     return 0
   fi
 
@@ -318,9 +400,59 @@ plan_target() {
   cp "$dir/cand/$best.tsv.nul" "$dir/nul.txt"
 
   #-------------------------------------------------------------------------#
-  # 4. Current?
+  # 4. The files promoted with no signature: does upstream sign them now? Only
+  #    a name of a file the plan would skip counts (same sha256, no %PGPSIG%);
+  #    any other is planned anyway, and mirror-file reads its .sig afresh.
   #-------------------------------------------------------------------------#
-  local packages bytes newest
+  local f src probe_rc answer srcs=()
+  if [ -n "$promoted_sha" ]; then
+    jq -r '.annotations["dev.pkgforge.mirror.unsigned"] // empty' "$dir/latest.json" | tr ' ' '\n' > "$dir/listed.txt"
+    awk -F '\t' '
+      FILENAME == ARGV[1] { if ($0 != "") want[$0] = 1; next }
+      FILENAME == ARGV[2] { if ($8 == "") p[$1] = $5; next }
+      ($1 in want) && ($1 in p) && p[$1] == $5 && $8 == "" { print $1 }
+    ' "$dir/listed.txt" "$dir/promoted.tsv" "$dir/records.tsv" > "$dir/recheck.txt"
+    mapfile -t srcs < <(target_sources "$conf")
+    while IFS= read -r f; do
+      answer=404
+      for src in "${srcs[@]}"; do
+        probe_rc=0
+        fetch_within "$src/$f.sig" "$dir/recheck.sig" "$SIG_MAX_TIME" 4 || probe_rc=$?
+        case "$probe_rc" in
+          0)
+            if sig_packet "$dir/recheck.sig"; then
+              answer=200
+            else
+              answer="$src answered 200 with no OpenPGP signature packet"
+            fi
+            break
+            ;;
+          4) ;;
+          *)
+            answer="error from $src (status $probe_rc)"
+            break
+            ;;
+        esac
+      done
+      rm -f "$dir/recheck.sig"
+      case "$answer" in
+        200)
+          log "$name: $f was promoted with no signature, and upstream has a .sig for it now; it is planned again"
+          printf '%s\n' "$f" >> "$dir/signed-now.txt"
+          ;;
+        404) printf '%s\n' "$f" >> "$dir/unsigned.txt" ;;
+        *)
+          log "$name: $f was promoted with no signature, and its .sig is not known this run: $answer"
+          printf '%s\n' "$f" >> "$dir/unsigned.txt"
+          ;;
+      esac
+    done < "$dir/recheck.txt"
+  fi
+
+  #-------------------------------------------------------------------------#
+  # 5. Current?
+  #-------------------------------------------------------------------------#
+  local packages bytes newest signed_now
   packages="$(awk 'END { print NR + 0 }' "$dir/records.tsv")"
   bytes="$(awk -F '\t' '{ s += $6 } END { printf "%.0f\n", s }' "$dir/records.tsv")"
   newest="$(awk -F '\t' '$7 + 0 > m { m = $7 + 0 } END { print m + 0 }' "$dir/records.tsv")"
@@ -331,7 +463,8 @@ plan_target() {
     printf 'NUL_MEMBERS=%s\n' "$(awk 'END { print NR + 0 }' "$dir/nul.txt")"
   } > "$dir/meta.env"
 
-  if [ "$chosen_sha" = "$promoted_sha" ]; then
+  signed_now="$(awk 'END { print NR + 0 }' "$dir/signed-now.txt")"
+  if [ "$chosen_sha" = "$promoted_sha" ] && [ "$signed_now" -eq 0 ]; then
     set_state "$dir" current "the promoted $repo.db is upstream's ($chosen_sha)$(nul_note "$dir")"
     return 0
   fi
@@ -342,13 +475,15 @@ plan_target() {
   # the same sha256, or pacman -F would describe other packages. A server that
   # fails gives way to the next one with the same bytes.
   #-------------------------------------------------------------------------#
-  local files_ok=0 s sig_rc sig_done
+  local files_ok=0 s sig_rc sig_done cands tried=0
+  cands="$(awk -F '\t' -v c="$chosen_sha" '$3 == c { n++ } END { print n + 0 }' "$dir/cand/list.tsv")"
   while IFS=$'\t' read -r idx srv sha; do
     [ "$sha" = "$chosen_sha" ] || continue
+    tried=$((tried + 1))
     rc=0
-    fetch_upstream "$srv/$repo.files" "$dir/upstream.files" "$FILES_MAX_TIME" || rc=$?
+    fetch_within "$srv/$repo.files" "$dir/upstream.files" "$FILES_MAX_TIME" "$((cands - tried + 2))" || rc=$?
     if [ "$rc" -ne 0 ]; then
-      log "$name: $srv/$repo.files did not answer within ${FILES_MAX_TIME}s (status $rc)"
+      log "$name: $srv/$repo.files did not answer within ${fetch_max}s (status $rc)"
       continue
     fi
     if ! db_records "$dir/upstream.files" "$dir/files.tsv"; then
@@ -377,7 +512,7 @@ plan_target() {
     for s in db files; do
       rm -f "$dir/upstream.$s.sig"
       sig_rc=0
-      fetch_upstream "$srv/$repo.$s.sig" "$dir/upstream.$s.sig" "$SIG_MAX_TIME" || sig_rc=$?
+      fetch_within "$srv/$repo.$s.sig" "$dir/upstream.$s.sig" "$SIG_MAX_TIME" "$((cands - tried + 1))" || sig_rc=$?
       case "$sig_rc" in
         0) log "$name: upstream signs $repo.$s" ;;
         4) ;;
@@ -392,7 +527,7 @@ plan_target() {
     break
   done < "$dir/cand/list.tsv"
   if [ "$files_ok" -ne 1 ]; then
-    set_state "$dir" error "no db_server that served $repo.db $chosen_sha also served a $repo.files that matches it, and an answer for its signatures"
+    set_state "$dir" error "no db_server that served $repo.db $chosen_sha also served a $repo.files that matches it, and an answer for its signatures$(budget_note)"
     return 0
   fi
   if [ "$(target_get "$conf" db_signed)" = yes ]; then
@@ -405,34 +540,43 @@ plan_target() {
   fi
 
   #-------------------------------------------------------------------------#
-  # 5. Skip or todo
+  # 6. Skip or todo. A file promoted with no signature that upstream signs now
+  #    is todo, whatever its record says.
   #-------------------------------------------------------------------------#
   cut -f 1 "$dir/records.tsv" | "$WRAPPER" --tags > "$dir/pairs.tsv"
   awk -F '\t' -v OFS='\t' -v target="$name" '
-    FILENAME == ARGV[1] { promoted[$1] = $5; psig[$1] = $8; next }
-    FILENAME == ARGV[2] { tag[$1] = $2; next }
-    ($1 in promoted) && promoted[$1] == $5 && psig[$1] == $8 { next }
+    FILENAME == ARGV[1] { again[$1] = 1; next }
+    FILENAME == ARGV[2] { promoted[$1] = $5; psig[$1] = $8; next }
+    FILENAME == ARGV[3] { tag[$1] = $2; next }
+    !($1 in again) && ($1 in promoted) && promoted[$1] == $5 && psig[$1] == $8 { next }
     { print target, $1, tag[$1], $5, $6, $2, "todo", $7, $8 }
-  ' "$dir/promoted.tsv" "$dir/pairs.tsv" "$dir/records.tsv" > "$dir/todo.tsv"
+  ' "$dir/signed-now.txt" "$dir/promoted.tsv" "$dir/pairs.tsv" "$dir/records.tsv" > "$dir/todo.tsv"
   local resigned
   resigned="$(awk -F '\t' 'FILENAME == ARGV[1] { p[$1] = $5; s[$1] = $8; next } ($2 in p) && p[$2] == $4 && s[$2] != $9 { n++ } END { print n + 0 }' \
     "$dir/promoted.tsv" "$dir/todo.tsv")"
   if [ "$resigned" -gt 0 ]; then
     log "$name: $resigned file(s) keep their bytes and carry a new %PGPSIG%; mirror-file repairs their signature layers"
   fi
+  if [ "$signed_now" -gt 0 ]; then
+    log "$name: $signed_now file(s) promoted with no signature have a .sig upstream now; mirror-file adds their signature layers"
+  fi
 
   #-------------------------------------------------------------------------#
-  # 6. This target's shards
+  # 7. This target's shards
   #-------------------------------------------------------------------------#
   shard_target "$dir" "$name"
 
   set_state "$dir" pending "$(awk 'END { print NR + 0 }' "$dir/todo.tsv") file(s) to mirror, $(awk -F '\t' '{ s += $5 } END { printf "%.0f", s / 1048576 }' "$dir/todo.tsv") MiB, in $(find "$dir/shards" -name '*.tsv' | awk 'END { print NR + 0 }') shard(s), database from $chosen_server$(nul_note "$dir")"
 }
 
+left="$#"
 for conf in "$@"; do
+  share_start "$left"
   plan_target "$conf"
   prune "$out/$(target_get "$conf" arch)-$(target_get "$conf" repo)"
+  left=$((left - 1))
 done
+log "the upstream reads took $((SECONDS + PLAN_BUDGET - run_deadline))s of PLAN_BUDGET=${PLAN_BUDGET}s"
 
 #---------------------------------------------------------------------------#
 # The matrices: one entry per pending target, with its shards

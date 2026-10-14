@@ -108,6 +108,21 @@ gh workflow run sync.yml --ref main
 gh workflow run sync.yml --ref main -f targets='x86_64-core x86_64-extra' -f max_targets=2
 ```
 
+### Re-run a sync
+
+A sync run can be run again from its page. The two choices do not do the same thing.
+
+| choice | does |
+| --- | --- |
+| Re-run failed jobs | keeps the plan and every artifact of the jobs that passed. The failed jobs run again with the same plan id. Use this when a job failed for a reason outside the mirror, for example a runner that stopped. |
+| Re-run all jobs | plans again, under a new plan id. A download by name or pattern still returns the earlier attempt's artifact for each name that this attempt does not upload again. So stage reads only the shard results of the new plan, and the report reads only the summaries of the new plan. A target whose chain left nothing of the new plan shows `failed`, and its row names the plan. |
+
+⚠ A new run reads upstream again and leaves nothing of an earlier run behind. Prefer `gh workflow run sync.yml --ref main` to "Re-run all jobs".
+
+### The plan's budget
+
+The plan job reads every target's databases from upstream, one target after another, in one job of 30 minutes. `scripts/plan` ends its upstream reads within `PLAN_BUDGET` seconds (1200). Each target gets what is left of the budget, divided by the targets not yet read. A target whose upstream does not answer in time is in error for that run, and its row in the run's table names `PLAN_BUDGET`. The next run reads it again. A target that stays in error raises `stale-<target>` after the tolerance.
+
 ## Renovate
 
 `.github/renovate.json` sets the update policy.

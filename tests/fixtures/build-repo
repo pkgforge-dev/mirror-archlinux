@@ -32,6 +32,14 @@
 #              desc is a GNU sparse member of NUL bytes only, as aarch64 extra
 #              findnewest-0.3-4 is upstream
 #   port-junk  as port, with junk-1-1/desc holding bytes that are no record
+#   port-files-missing  as port, with expired-1-1 left out of port.files only,
+#              as Arch Linux ARM aarch64 aur.files left out localepurge-0.7.3.4-1
+#              and alarm.files dkms-mt7601 (2026-10-14)
+#   port-files-extra  as port, with port.files naming one more package,
+#              stray 1-1, that port.db does not
+#   port-signed  the unsigned package of DIR (aarch64/port) signed now, beside
+#              it: the database and every other file stay as they are, as when
+#              upstream uploads a .sig late for a database that embeds none
 #
 # Every database carries %PGPSIG% for every signed package, as Arch's own core
 # and extra do, except nopgpsig. pacman 7's repo-add embeds a signature only
@@ -94,9 +102,6 @@ if [ ! -d "$GNUPGHOME" ]; then
   mkdir -p /out/sigcache
 fi
 
-rm -rf "$repo"
-mkdir -p "$repo"
-
 # sign FILE HOME [fresh]: FILE.sig, made once per distinct file and key
 sign() {
   local file="$1" home="$2" sum cached faked=()
@@ -111,6 +116,17 @@ sign() {
   fi
   cp "$cached" "$file.sig"
 }
+
+if [ "$state" = port-signed ]; then
+  [ -f "$repo/unsigned-1-1-any.pkg.tar.zst" ]
+  [ ! -e "$repo/unsigned-1-1-any.pkg.tar.zst.sig" ]
+  sign "$repo/unsigned-1-1-any.pkg.tar.zst" "$GNUPGHOME"
+  ls -l "$repo"
+  exit 0
+fi
+
+rm -rf "$repo"
+mkdir -p "$repo"
 
 # mkpkg NAME VERSION ARCH BUILDDATE CONTENT [GNUPGHOME|none] [fresh]
 mkpkg() {
@@ -164,6 +180,19 @@ add_member() {
   rm -rf "$t"
 }
 
+# drop_member DB.tar.gz DIR: the archive without the package directory DIR
+drop_member() {
+  local t
+  t="$(mktemp -d)"
+  mkdir -p "$t/m"
+  tar -xzf "$1" -C "$t/m"
+  [ -d "$t/m/$2" ]
+  rm -rf "${t:?}/m/$2"
+  (cd "$t/m" && bsdtar -czf "$t/db.tar.gz" -- *)
+  mv -f "$t/db.tar.gz" "$1"
+  rm -rf "$t"
+}
+
 case "$state" in
   keyring)
     mkpkg test-keyring 1-1 any 1700000050 "the keyring of the test keys"
@@ -171,11 +200,24 @@ case "$state" in
     ls -l "$repo"
     exit 0
     ;;
-  port | port-junk)
+  port | port-junk | port-files-missing | port-files-extra)
     mkpkg port 1-1 aarch64 1700000000 "an aarch64 package"
     mkpkg unsigned 1-1 any 1700000010 "upstream signs this nowhere" none
     mkpkg expired 1-1 any 1700000020 "signed by a key that has since expired" /out/gnupg-expired
     repo-add --quiet --include-sigs "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
+    case "$state" in
+      port-files-missing) drop_member "$repo/$db.files.tar.gz" expired-1-1 ;;
+      port-files-extra)
+        # The files database of a repository with stray in it, and stray
+        # itself nowhere else.
+        mkdir -p "$repo/.stray"
+        mkpkg stray 1-1 any 1700000030 "named by the files database only"
+        mv "$repo"/stray-1-1-any.pkg.tar.zst* "$repo/.stray/"
+        repo-add --quiet --include-sigs "$repo/.stray/x.db.tar.gz" "$repo"/*.pkg.tar.zst "$repo/.stray/stray-1-1-any.pkg.tar.zst"
+        cp "$repo/.stray/x.files.tar.gz" "$repo/$db.files.tar.gz"
+        rm -rf "$repo/.stray"
+        ;;
+    esac
     for f in "$db.db.tar.gz" "$db.files.tar.gz"; do
       add_member "$repo/$f" ghost-1-1 nul
       if [ "$state" = port-junk ]; then

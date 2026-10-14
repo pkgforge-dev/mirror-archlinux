@@ -4,7 +4,9 @@
 #
 # ⛔ The chain reads only its own target's artifacts, and every artifact it
 # writes carries the target's name: chains of different targets never share a
-# file, and one target's failure never holds another.
+# file, and one target's failure never holds another. The results, the stage
+# and the summary also carry the plan id (scripts/plan): after "Re-run all
+# jobs", scripts/stage and scripts/report read nothing of the earlier plan.
 name: Sync one target
 
 on:

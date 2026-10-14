@@ -3,7 +3,9 @@
 # The whole mirror, end to end, against a registry and an upstream of its own.
 #
 # A local registry (registry:3) stands in for GHCR and a local web server for
-# the upstream mirrors. Three targets are built, each a signed repository:
+# the upstream mirrors. A second web server stands in for an upstream host
+# that never answers, or answers 503. Three targets are built, each a signed
+# repository:
 #   x86_64-test   filenames that stress the tag mapping; its keyring package
 #                 comes from x86_64-kr (keyring_from)
 #   x86_64-kr     the keyring package of the test keys
@@ -41,9 +43,10 @@ work="$(work_dir)"
 suffix="$$-$RANDOM"
 reg_name="mirror-it-registry-$suffix"
 up_name="mirror-it-upstream-$suffix"
+broken_name="mirror-it-broken-$suffix"
 kimage_local="mirror-it-keyring-$suffix"
 cleanup() {
-  "$RUNTIME" rm -f "$reg_name" "$up_name" > "$work/cleanup.log" 2>&1 || echo "# cleanup: $(cat "$work/cleanup.log")" >&2
+  "$RUNTIME" rm -f "$reg_name" "$up_name" "$broken_name" > "$work/cleanup.log" 2>&1 || echo "# cleanup: $(cat "$work/cleanup.log")" >&2
   if [ "${IT_KEEP:-0}" = 1 ]; then
     echo "# kept $work" >&2
   else
@@ -63,7 +66,21 @@ case "$(basename "$RUNTIME")" in
     ;;
 esac
 
-mkdir -p "$work/upstream" "$work/targets" "$work/out"
+mkdir -p "$work/upstream" "$work/targets" "$work/out" "$work/broken/cgi-bin" "$work/broken-log"
+
+# A second upstream host that fails, on a port of its own: each request is
+# logged in broken-log/hits, then a path under /stall/ gets no answer for
+# 300 s, and a path under /fail/ gets 503 at once.
+cat > "$work/broken/cgi-bin/b" << 'EOF'
+#!/bin/sh
+printf '%s\n' "$PATH_INFO" >> /log/hits
+case "$PATH_INFO" in
+  /stall/*) sleep 300 ;;
+esac
+printf 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\n\r\nbusy\n'
+EOF
+chmod 0755 "$work/broken/cgi-bin/b"
+: > "$work/broken-log/hits"
 
 #---------------------------------------------------------------------------#
 # The registry and the upstream, on ports the runtime picks
@@ -75,13 +92,17 @@ port_of() {
 "$RUNTIME" run -d --rm --name "$reg_name" -p 127.0.0.1::5000 "$REGISTRY_IMAGE" > /dev/null
 "$RUNTIME" run -d --rm --name "$up_name" -p 127.0.0.1::8000 -v "$work/upstream:/srv:ro" \
   "$HTTPD_IMAGE" httpd -f -p 8000 -h /srv > /dev/null
+"$RUNTIME" run -d --rm --name "$broken_name" "${as_me[@]}" -p 127.0.0.1::8000 -v "$work/broken:/srv:ro" \
+  -v "$work/broken-log:/log" "$HTTPD_IMAGE" httpd -f -p 8000 -h /srv > /dev/null
 REG_PORT="$(port_of "$reg_name" 5000)"
 UP_PORT="$(port_of "$up_name" 8000)"
+BROKEN_PORT="$(port_of "$broken_name" 8000)"
 ready=0
-if [ -n "$REG_PORT" ] && [ -n "$UP_PORT" ]; then
+if [ -n "$REG_PORT" ] && [ -n "$UP_PORT" ] && [ -n "$BROKEN_PORT" ]; then
   for _ in $(seq 1 30); do
     if curl -q -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:$REG_PORT/v2/" > /dev/null &&
-      curl -q -sS --connect-timeout 2 --max-time 5 -o /dev/null "http://127.0.0.1:$UP_PORT/"; then
+      curl -q -sS --connect-timeout 2 --max-time 5 -o /dev/null "http://127.0.0.1:$UP_PORT/" &&
+      curl -q -sS --connect-timeout 2 --max-time 5 -o /dev/null "http://127.0.0.1:$BROKEN_PORT/"; then
       ready=1
       break
     fi
@@ -89,12 +110,12 @@ if [ -n "$REG_PORT" ] && [ -n "$UP_PORT" ]; then
   done
 fi
 if [ "$ready" -ne 1 ]; then
-  fail "the local registry and upstream answer" "registry port '$REG_PORT', upstream port '$UP_PORT', after 30 s" \
-    "reproduce: $RUNTIME logs $reg_name; $RUNTIME logs $up_name"
+  fail "the local registry and upstream answer" "registry port '$REG_PORT', upstream ports '$UP_PORT' and '$BROKEN_PORT', after 30 s" \
+    "reproduce: $RUNTIME logs $reg_name; $RUNTIME logs $up_name; $RUNTIME logs $broken_name"
   summary
   exit 1
 fi
-echo "# registry on 127.0.0.1:$REG_PORT, upstream on 127.0.0.1:$UP_PORT"
+echo "# registry on 127.0.0.1:$REG_PORT, upstream on 127.0.0.1:$UP_PORT, failing upstream on 127.0.0.1:$BROKEN_PORT"
 
 # podman reads a registry over plain http only when its configuration says
 # so; docker does for any registry on the loopback.
@@ -124,6 +145,7 @@ export ORAS_CACHE="${IT_ORAS_CACHE:-$work/oras-cache}"
 REPO="it/mirror/x86_64/test"
 BASE="http://127.0.0.1:$REG_PORT/v2/$REPO"
 UP="http://127.0.0.1:$UP_PORT"
+BROKEN="http://127.0.0.1:$BROKEN_PORT/cgi-bin/b"
 
 #---------------------------------------------------------------------------#
 # The upstream repositories, and the suite's keyring image
@@ -477,6 +499,79 @@ else
 fi
 
 #---------------------------------------------------------------------------#
+# 1f. A file promoted with no signature, because upstream had none, gets its
+#     signature once upstream publishes a .sig, while the database stays the
+#     same: the snapshot names the file, plan asks for its .sig on each run,
+#     and plans it again when one answers.
+#---------------------------------------------------------------------------#
+unsigned_f='unsigned-1-1-any.pkg.tar.zst'
+port_repo=it/mirror/aarch64/port
+check "the snapshot names the file it holds with no signature" "$unsigned_f" \
+  "$(manifest latest "$port_repo" | jq -r '.annotations["dev.pkgforge.mirror.unsigned"] // "none"')" \
+  "curl http://127.0.0.1:$REG_PORT/v2/$port_repo/manifests/latest | jq .annotations; read out/1/stage-aarch64-port.log"
+port_db_before="$(sha256sum "$work/upstream/aarch64/port/port.db.tar.gz" | cut -d ' ' -f 1)"
+port_latest_before="$(digest_of latest "$port_repo")"
+build port-signed aarch64/port port
+sync 1f
+check "upstream signs it later, and its database stays the same" "$port_db_before" \
+  "$(sha256sum "$work/upstream/aarch64/port/port.db.tar.gz" | cut -d ' ' -f 1)" "read $work/build-port-signed.log"
+check "a file promoted with no signature that upstream signs now is planned again, alone" "pending $unsigned_f" \
+  "$(state_of 1f plan aarch64-port) $(cut -f 2 "$work/out/1f/plan/aarch64-port/todo.tsv" 2> /dev/null | tr '\n' ' ' | sed 's/ $//')" \
+  "read out/1f/plan.log"
+check "its tag gets upstream's new .sig as its signature layer" \
+  "sha256:$(sha256sum "$work/upstream/aarch64/port/$unsigned_f.sig" | cut -d ' ' -f 1)" \
+  "$(manifest "$("$REPO_ROOT/client/pacman-oci" --tag "$unsigned_f")" "$port_repo" | jq -r --arg t "$unsigned_f.sig" '[.layers[] | select(.annotations["org.opencontainers.image.title"] == $t) | .digest] | first // "none"')" \
+  "read out/1f/mirror-aarch64-port-0.log"
+port_latest_after="$(digest_of latest "$port_repo")"
+check "the snapshot is verified and promoted, and names no file with no signature" "passed moved none" \
+  "$(verdict_of 1f aarch64-port | cut -f 1) $([ -n "$port_latest_after" ] && [ "$port_latest_after" != "$port_latest_before" ] && echo moved || echo stayed) $(manifest latest "$port_repo" | jq -r '.annotations["dev.pkgforge.mirror.unsigned"] // "none"')" \
+  "read out/1f/verify/verify-aarch64-port-0.log out/1f/promote-aarch64-port.log"
+
+#---------------------------------------------------------------------------#
+# 1g. A files database that leaves out a package of the database is upstream's
+#     own defect: planned, the package named, and verify runs pacman -Fl only
+#     over the names the files database holds. One that names a package the
+#     database does not is refused. Each in a namespace of its own.
+#---------------------------------------------------------------------------#
+build port-files-missing aarch64/port-fmiss port
+mkdir -p "$work/targets-fmiss"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/port-fmiss|; s|/\$arch/\./\$repo$|/$arch/./port-fmiss|' "$work/targets/aarch64-port.conf" > "$work/targets-fmiss/aarch64-port.conf"
+TARGETS_DIR="$work/targets-fmiss" MIRROR_NAMESPACE=it/fmiss sync fmiss aarch64-port
+check "a files database that leaves out a package of the database is planned" pending "$(state_of fmiss plan aarch64-port)" \
+  "read out/fmiss/plan.log"
+if grep -q 'port.files leaves out 1 package(s) of port.db, as upstream serves it: expired-1-1-any.pkg.tar.zst' "$work/out/fmiss/plan.log"; then
+  ok "the plan names the package the files database leaves out"
+else
+  fail "the plan names the package the files database leaves out" "read out/fmiss/plan.log"
+fi
+if grep -q 'the files database holds no entry for 1 package(s) of the batch, as upstream serves it: expired' "$work/out/fmiss/verify/verify-aarch64-port-0.log"; then
+  ok "verify names the package the files database has no entry for"
+else
+  fail "verify names the package the files database has no entry for" "read out/fmiss/verify/verify-aarch64-port-0.log"
+fi
+check "verify runs pacman -Fl over the other names, passes, and the snapshot is promoted" "passed promoted" \
+  "$(verdict_of fmiss aarch64-port | cut -f 1) $(cut -f 2 "$work/out/fmiss/promote-aarch64-port.tsv" 2> /dev/null)" \
+  "read out/fmiss/verify/verify-aarch64-port-0.log out/fmiss/promote-aarch64-port.log"
+
+build port-files-extra aarch64/port-fextra port
+mkdir -p "$work/targets-fextra"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/port-fextra|; s|/\$arch/\./\$repo$|/$arch/./port-fextra|' "$work/targets/aarch64-port.conf" > "$work/targets-fextra/aarch64-port.conf"
+rc=0
+TARGETS_DIR="$work/targets-fextra" MIRROR_NAMESPACE=it/fextra "$REPO_ROOT/scripts/plan" "$work/out/fextra" > "$work/out/fextra.log" 2>&1 || rc=$?
+case "$(cat "$work/out/fextra/aarch64-port/state" 2> /dev/null):$(cat "$work/out/fextra/aarch64-port/why" 2> /dev/null)" in
+  "error:no db_server that served port.db "*" also served a port.files that matches it"*) ok "a files database that names a package the database does not is refused" ;;
+  *) fail "a files database that names a package the database does not is refused" "plan exit $rc: $(cat "$work/out/fextra/aarch64-port/why" 2> /dev/null)" \
+    "read out/fextra.log" ;;
+esac
+if grep -q 'port.files names 1 package file(s) that port.db does not, e.g. stray-1-1-any.pkg.tar.zst' "$work/out/fextra.log"; then
+  ok "the refusal names the package"
+else
+  fail "the refusal names the package" "read out/fextra.log"
+fi
+
+#---------------------------------------------------------------------------#
 # 2. Consumers: pacman through the wrapper, nothing else
 #---------------------------------------------------------------------------#
 consumer() {
@@ -541,6 +636,37 @@ check "every target is current, and the report says so" "current current current
   "cat out/2/plan/summary.tsv out/2/report.md"
 
 #---------------------------------------------------------------------------#
+# 3b. A db_server that accepts and never answers, listed first. Each read of
+#     it ends within its part of the target's share of PLAN_BUDGET, the next
+#     db_server is read, and the plan ends within PLAN_BUDGET. A target whose
+#     only db_server never answers is in error, and its why names the budget.
+#     With no deadline over the retries, each read of it took 184 s.
+#---------------------------------------------------------------------------#
+mkdir -p "$work/targets-slow"
+for t in x86_64-kr x86_64-test; do
+  # shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+  { printf 'db_server = %s/stall/$arch/$repo\n' "$BROKEN"; cat "$work/targets/$t.conf"; } > "$work/targets-slow/$t.conf"
+done
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+printf 'arch = x86_64\nrepo = stalled\ndb_server = %s/stall/$arch/$repo\n' "$BROKEN" > "$work/targets-slow/x86_64-stalled.conf"
+started_at=$SECONDS
+rc=0
+TARGETS_DIR="$work/targets-slow" PLAN_BUDGET=40 "$REPO_ROOT/scripts/plan" "$work/out/slow" > "$work/out/slow.log" 2>&1 || rc=$?
+took=$((SECONDS - started_at))
+check "a db_server that never answers gives way to the next one, and the targets are current" "0 current current" \
+  "$rc $(cat "$work/out/slow/x86_64-kr/state" 2> /dev/null || echo none) $(cat "$work/out/slow/x86_64-test/state" 2> /dev/null || echo none)" \
+  "read out/slow.log"
+check "the plan ends within PLAN_BUDGET=40 s, with 15 s for its registry reads" "within 55 s" \
+  "$([ "$took" -le 55 ] && echo 'within 55 s' || echo "after $took s")" "read out/slow.log"
+check "each read of the stalled db_server ends within its part of the share, not DB_MAX_TIME (300 s)" 3 \
+  "$(grep -cE "/stall/x86_64/(kr|test|stalled)/(kr|test|stalled)\.db did not answer within [0-9]{1,2}s" "$work/out/slow.log")" "read out/slow.log"
+case "$(cat "$work/out/slow/x86_64-stalled/state" 2> /dev/null):$(cat "$work/out/slow/x86_64-stalled/why" 2> /dev/null)" in
+  error:*PLAN_BUDGET=40s*) ok "a target whose only db_server never answers is in error, and its why names the budget" ;;
+  *) fail "a target whose only db_server never answers is in error, and its why names the budget" \
+    "$(cat "$work/out/slow/x86_64-stalled/why" 2> /dev/null)" "read out/slow.log" ;;
+esac
+
+#---------------------------------------------------------------------------#
 # 4. Two packages new, one of them signed by a key only the keyring package
 #    of x86_64-kr holds: only they are mirrored, verify installs that keyring
 #    package from kr's latest, latest moves, the day's tag keeps the first
@@ -585,6 +711,37 @@ else
   fail "promoting an older run's snapshot again is refused" "exit $rc" "$(tail -n 3 "$work/out/promote-again.log")"
 fi
 check "latest stays on the newer snapshot" "$latest3" "$(digest_of latest)" "curl -I $BASE/manifests/latest"
+
+#---------------------------------------------------------------------------#
+# 4a. "Re-run all jobs" plans again, and the download of results-<target>-*
+#     still returns an earlier attempt's results beside this plan's. stage
+#     reads only this plan's: a stale "failed" for a file this plan's shard
+#     pushed holds nothing. The layout is the workflow's, one directory per
+#     artifact, and the stale line comes last, as it would win.
+#---------------------------------------------------------------------------#
+rr="$work/out/rerun-results"
+rm -rf "$rr"
+for d in "$work/out/3/results/x86_64-test"/*/; do
+  n="$(basename "$d")"
+  mkdir -p "$rr/results-x86_64-test-$n/$n"
+  cp "$d/results.tsv" "$d/plan-id" "$rr/results-x86_64-test-$n/$n/"
+done
+stale_f="$(cut -f 2 "$work/out/3/plan/x86_64-test/todo.tsv" | sed -n 1p)"
+mkdir -p "$rr/results-x86_64-test-7/7/lines"
+printf 'earlier-attempt\n' > "$rr/results-x86_64-test-7/7/plan-id"
+printf 'x86_64-test\t%s\tfailed\t600\tpush timed out\n' "$stale_f" > "$rr/results-x86_64-test-7/7/lines/1.tsv"
+rc=0
+STAGING_TAG=staging-rerun "$REPO_ROOT/scripts/stage" "$work/out/3/plan" "$rr" "$work/out/rerun-stage" x86_64-test \
+  > "$work/out/rerun-stage.log" 2>&1 || rc=$?
+check "a re-run's stage reads no result of an earlier plan" "0 staged" \
+  "$rc $(cat "$work/out/rerun-stage/x86_64-test/state" 2> /dev/null || echo 'no state')" "read out/rerun-stage.log"
+if grep -q "results-x86_64-test-7/7 holds the results of plan 'earlier-attempt'" "$work/out/rerun-stage.log"; then
+  ok "the stage log names the results it left out"
+else
+  fail "the stage log names the results it left out" "read out/rerun-stage.log"
+fi
+check "the stage carries its plan id, for the report" "$(cat "$work/out/3/plan/plan-id")" \
+  "$(cat "$work/out/rerun-stage/x86_64-test/plan-id" 2> /dev/null || echo none)" "ls out/rerun-stage/x86_64-test"
 
 #---------------------------------------------------------------------------#
 # 4b. Upstream signs a file again, its bytes unchanged: the file is planned,
@@ -753,6 +910,69 @@ case "$(verdict_of 11)" in
 esac
 check "it is never promoted" "$latest10" "$(digest_of latest)" "curl -I $BASE/manifests/latest"
 put_manifest "$canary_tag" "$work/canary-good.json" || diag "the canary manifest could not be written back"
+
+#---------------------------------------------------------------------------#
+# 9e. With no %PGPSIG%, the signature layer is the .sig of the target's
+#     servers in their own order, the db_servers first, as verify reads it.
+#     A shard whose package reads start at a plain server that serves other
+#     .sig bytes still pushes the db_server's. Each in a namespace of its own.
+#---------------------------------------------------------------------------#
+rm -rf "$work/upstream/x86_64/test-plain"
+cp -r "$work/upstream/x86_64/test" "$work/upstream/x86_64/test-plain"
+mapfile -t plain_sigs < <(cd "$work/upstream/x86_64/test-plain" && ls -- *.pkg.tar.zst.sig)
+for ((i = 0; i < ${#plain_sigs[@]}; i++)); do
+  cp "$work/upstream/x86_64/test/${plain_sigs[$(((i + 1) % ${#plain_sigs[@]}))]}" "$work/upstream/x86_64/test-plain/${plain_sigs[$i]}"
+done
+mkdir -p "$work/targets-sigsrc"
+cp "$work/targets/x86_64-kr.conf" "$work/targets-sigsrc/"
+# shellcheck disable=SC2016 # $arch is the target file's, not the shell's
+sed 's|^server = .*$|server = '"$UP"'/$arch/test-plain|' "$work/targets/x86_64-test.conf" > "$work/targets-sigsrc/x86_64-test.conf"
+rc=0
+TARGETS_DIR="$work/targets-sigsrc" MIRROR_NAMESPACE=it/sigsrc MAX_SHARDS=1 "$REPO_ROOT/scripts/plan" "$work/out/sigsrc" \
+  "$work/targets-sigsrc/x86_64-test.conf" > "$work/out/sigsrc.log" 2>&1 || rc=$?
+# Shard index 1 of two servers: the shard reads packages from test-plain first.
+TARGETS_DIR="$work/targets-sigsrc" MIRROR_NAMESPACE=it/sigsrc SHARD_INDEX=1 "$REPO_ROOT/scripts/mirror-shard" \
+  "$work/out/sigsrc/x86_64-test/shards/0.tsv" "$work/out/sigsrc-results" >> "$work/out/sigsrc.log" 2>&1 || rc=$?
+same=0
+differ=""
+while IFS=$'\t' read -r _ f tag _; do
+  if [ "$(manifest "$tag" it/sigsrc/x86_64/test | jq -r --arg t "$f.sig" '[.layers[] | select(.annotations["org.opencontainers.image.title"] == $t) | .digest] | first // "none"')" = \
+    "sha256:$(sha256sum "$work/upstream/x86_64/test/$f.sig" | cut -d ' ' -f 1)" ]; then
+    same=$((same + 1))
+  else
+    differ="$differ $f"
+  fi
+done < "$work/out/sigsrc/x86_64-test/shards/0.tsv"
+check "a shard that reads packages from a plain server first takes each .sig from the db_server" \
+  "${#plain_sigs[@]} of ${#plain_sigs[@]}" "$same of $(awk 'END { print NR + 0 }' "$work/out/sigsrc/x86_64-test/shards/0.tsv")" \
+  "status $rc; layers not the db_server's .sig:$differ; read out/sigsrc.log"
+
+#---------------------------------------------------------------------------#
+# 9f. A server that fails, first in a shard's order: after it fails for one
+#     file, every file of the shard asks it last. It gets one file's requests
+#     (curl's three tries of a 503), not every file's.
+#---------------------------------------------------------------------------#
+mkdir -p "$work/targets-down"
+cp "$work/targets/x86_64-kr.conf" "$work/targets-down/"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|^server = .*$|server = '"$BROKEN"'/fail/$arch/$repo|' "$work/targets/x86_64-test.conf" > "$work/targets-down/x86_64-test.conf"
+rc=0
+TARGETS_DIR="$work/targets-down" MIRROR_NAMESPACE=it/down MAX_SHARDS=1 "$REPO_ROOT/scripts/plan" "$work/out/down" \
+  "$work/targets-down/x86_64-test.conf" > "$work/out/down.log" 2>&1 || rc=$?
+: > "$work/broken-log/hits"
+TARGETS_DIR="$work/targets-down" MIRROR_NAMESPACE=it/down SHARD_INDEX=1 PARALLEL=1 "$REPO_ROOT/scripts/mirror-shard" \
+  "$work/out/down/x86_64-test/shards/0.tsv" "$work/out/down-results" >> "$work/out/down.log" 2>&1 || rc=$?
+down_files="$(awk 'END { print NR + 0 }' "$work/out/down/x86_64-test/shards/0.tsv")"
+check "every file of the shard is pushed from the next server" "$down_files pushed" \
+  "$(awk -F '\t' '$3 == "pushed" { n++ } END { print n + 0 }' "$work/out/down-results/results.tsv" 2> /dev/null) pushed" \
+  "status $rc; read out/down.log"
+check "the failing server gets the requests of one file only, for $down_files files" 3 \
+  "$(awk '/^\/fail\// { n++ } END { print n + 0 }' "$work/broken-log/hits")" "cat $work/broken-log/hits; read out/down.log"
+if grep -q 'every file of this shard asks it last from now on' "$work/out/down.log"; then
+  ok "the shard log names the server it asks last"
+else
+  fail "the shard log names the server it asks last" "read out/down.log"
+fi
 
 #---------------------------------------------------------------------------#
 # 10. What the wrapper must refuse, served by a plain web server standing in

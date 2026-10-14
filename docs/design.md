@@ -22,6 +22,13 @@ Each rule below keeps this invariant true for one way it could fail.
 | ⛔ A package tag is written once. A tag that holds other bytes under a name is never written again. The target's state is `replaced`, and on `main` the `replaced-<target>` issue opens. | The promoted or an older snapshot names those bytes. pacman refuses a file whose sha256 it does not expect, and tries no other Server. | `scripts/lib.sh` `decide_push`, `scripts/mirror-file` |
 | A signature layer that is missing or wrong beside the right package bytes is repaired: the file is pushed again with the same package blob. plan skips a file only when its sha256 and its `%PGPSIG%` equal the promoted record. | A file that upstream signs again keeps a stale signature layer for ever. | `scripts/plan`, `scripts/mirror-file` |
 | A package never lacks its signature when the database has one. The layer is the decoded `%PGPSIG%`. With no `%PGPSIG%`, it is the detached `.sig`, which must be one OpenPGP signature packet under 64 KiB. Any other answer is an error, not an absence. A file is pushed unsigned only when every server answers 404 for its `.sig`. | pacman asks for a `.sig` only from the server that served the package. A missing `.sig` ends the install. | `scripts/mirror-file` |
+| With no `%PGPSIG%`, mirror-file reads the `.sig` from the target's servers in their own order, the `db_server` hosts first. verify compares with the same order. Only package files are read in an order rotated by shard. | A plain mirror that serves other `.sig` bytes gives the layer, verify refuses it, and the target fails on every run. | `scripts/mirror-file` |
+| A file pushed unsigned is named in the staged manifest, in `dev.pkgforge.mirror.unsigned`. plan asks for its `.sig` again on each run. When a server answers, plan puts the file in todo, also when the database did not change, and mirror-file adds the layer. | A `.sig` that upstream publishes later never reaches the mirror. A detached-signature database does not change when a `.sig` is added. | `scripts/stage`, `scripts/plan` |
+| Every upstream read has a stall deadline. A database or a signature read has a whole-call deadline that also bounds its retries: `--retry-max-time`, and `timeout` 5 s after it. A package download gets 120 s plus the time at 64 KiB/s. | curl gives each retry a new `--max-time`: a call took 3 x the deadline + 4 s. | `scripts/lib.sh` `fetch_upstream` |
+| The upstream reads of plan end within `PLAN_BUDGET` (1200 s), below the job's 30 minutes. Each target gets what is left, divided by the targets not yet read. A `db_server` read gets 1/(n + 1) of the target's share, with n the `db_server` hosts not yet read. A target whose reads do not fit is in error for the run, and its why names `PLAN_BUDGET`. | One slow upstream server makes the plan job time out, and no target is mirrored or promoted. | `scripts/plan` |
+| A server that fails for one file of a shard is asked last by every file of the shard after it: a timeout, a failed connection, or a status other than 200, 404 and 410. A `.sig` read ends within 30 s. | A server that stalls costs each file of the shard 184 s, also a file the registry holds. The shard never ends inside its step. | `scripts/mirror-file`, `scripts/lib.sh` `down_mark` |
+| The token cache keeps only a token got with `REGISTRY_TOKEN`. A read with `REGISTRY_TOKEN` empty never uses the cache. | On a registry other than GHCR, stage's anonymous read sends the workflow's token. A private package reads as public and is promoted. | `scripts/lib.sh` `registry_token_file` |
+| Every artifact that a chain makes carries the plan id (`scripts/plan`). stage reads only the shard results of its plan. The report reads only the summaries of its plan, and only for a target the plan marks pending. collect reads only the verdicts and the promotion of the staged digest. | "Re-run all jobs" plans again, and a download by name or pattern still returns the earlier attempt's artifacts. A stale result holds a target, or a stale summary raises an issue again. | `scripts/stage`, `scripts/report`, `scripts/mirror-shard` |
 | Verify compares every `.sig` pacman stored with the decoded `%PGPSIG%`. | pacman checks against `%PGPSIG%` and stores the served `.sig` unread. A wrong layer passes verify and breaks a later `pacman -U` from the cache. | `scripts/verify-batch` |
 | Package manifests are the same bytes whoever pushes them. `org.opencontainers.image.created` is the package's `%BUILDDATE%`, and no annotation names the source server. | Two writers replace each other's tag with a manifest of another digest. | `scripts/mirror-file` |
 | Absent means the registry says so: only a 404 with `NAME_UNKNOWN` or `MANIFEST_UNKNOWN`. On GHCR, with a token set, a read tries `Bearer QQ==` first, and only its 200 counts. Any other answer is read again with the real token. | GHCR answers `QQ==` with 404 for a repository it does not show. A private package reads as absent, and its tags are pushed over. | `scripts/lib.sh` `registry_manifest` |
@@ -77,6 +84,7 @@ A database manifest:
 - layers `<repo>.db` (`application/vnd.pkgforge.archlinux.db.v1`) and `<repo>.files` (`application/vnd.pkgforge.archlinux.files.v1`), byte for byte as upstream serves them
 - a `<repo>.db.sig` and a `<repo>.files.sig` layer, only when upstream publishes them
 - annotations: `dev.pkgforge.mirror.arch`, `.repo`, `.upstream` (the server), `.db-sha256`, `.files-sha256`, `.packages`, `.bytes`, `.newest-builddate`, `.fetched` (ISO 8601 UTC), `.run`, and the OCI `source`, `title` and `revision`
+- `dev.pkgforge.mirror.unsigned`, only when a file has no signature because upstream publishes none: the filenames, space separated, at most 16 KiB
 
 ## Jobs
 
@@ -84,7 +92,7 @@ A database manifest:
 
 | job | permissions | timeout (min) | does |
 | --- | --- | --- | --- |
-| `plan` | contents read, packages read | 30 | `scripts/plan` for every enabled target, or for the targets of the `targets` input; uploads `plan-<target>` for each pending target |
+| `plan` | contents read, packages read | 30 | `scripts/plan` for every enabled target, or for the targets of the `targets` input, within `PLAN_BUDGET` (1200 s) of upstream reads; uploads `plan-<target>` for each pending target |
 | `target` | contents read, packages write | (each called job has its own) | one call of `sync-target.yml` per pending target, at most `max_targets` (4) at once |
 | `report` | actions write, contents read, issues write | 10 | `scripts/report`; on `main` it starts `status.yml` |
 | `keepalive` | actions write, contents read | 10 | `keep-schedules-enabled`, `check-schedules-fired`, and `dispatch-overdue status.yml 120` on `main` |
@@ -107,7 +115,7 @@ A dispatch input reaches an expression as a string. `max-parallel` and a number 
 
 ### Shards
 
-plan gives each target shards of its own. The count is k = the larger of ceil(bytes / `SHARD_BYTES`) and ceil(files / `SHARD_FILES`). k is at least 1, at most `MAX_SHARDS`, and at most the file count. Files go largest first onto the lightest shard. plan logs when `MAX_SHARDS` binds, with the GiB and files per shard. Each shard reads the servers in an order that starts at its own index, so the shards spread across the mirrors.
+plan gives each target shards of its own. The count is k = the larger of ceil(bytes / `SHARD_BYTES`) and ceil(files / `SHARD_FILES`). k is at least 1, at most `MAX_SHARDS`, and at most the file count. Files go largest first onto the lightest shard. plan logs when `MAX_SHARDS` binds, with the GiB and files per shard. Each shard reads package files from the servers in an order that starts at its own index, so the shards spread across the mirrors. A `.sig` comes from the servers in the target's order. In both orders, a server that failed earlier in the shard comes last.
 
 | variable | default |
 | --- | --- |

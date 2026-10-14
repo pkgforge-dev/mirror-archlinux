@@ -11,9 +11,18 @@
 # read, and every lines/*.tsv, which a shard killed before its results.tsv
 # leaves behind.
 #
+# ⛔ Only the results of this plan are read: a shard's directory must hold a
+# plan-id that is PLAN/TARGET/plan-id (scripts/mirror-shard). A "Re-run all
+# jobs" plans again, and the download of results-<target>-* still returns the
+# earlier attempt's artifacts for every name this attempt did not upload
+# again. Their lines are about another plan; read, a stale "failed" could
+# hold the target, or a stale "pushed" could count a file that is not there.
+# Each directory left out is named in a warning.
+#
 # OUT/TARGET/state   staged held replaced private error, or the plan's own
 #                    state for a target that was not pending
 # OUT/TARGET/why     what was measured
+# OUT/TARGET/plan-id the plan this stage comes from, for scripts/report
 # OUT/TARGET/staged.env  DIGEST, DB_SHA256, FILES_SHA256, TAG of the staged manifest
 # OUT/TARGET/batches/<n>.txt  package names, one per line
 # OUT/TARGET/canaries.txt     the names verify reads first, through the
@@ -29,6 +38,14 @@
 # that moment, so a file upstream superseded while this run went clears by
 # itself. A file whose tag holds other bytes (replaced) holds the target until
 # a person decides, and stage says so at once.
+#
+# The staged manifest names the files whose tag holds no signature, because
+# upstream publishes none for them, in its dev.pkgforge.mirror.unsigned
+# annotation, space separated: those plan carried over (PLAN/TARGET/
+# unsigned.txt), and those mirror-file left unsigned in this run (a result
+# detail that starts "unsigned: "). scripts/plan asks upstream for their .sig
+# on every run, and plans a file again once upstream signs it. The list stops
+# at 16 KiB, so the manifest stays far below the 64 KiB the wrapper reads.
 #
 # Verification batches: every file new since the promoted database, plus the
 # canaries, which are always present: the smallest package and every keyring
@@ -87,14 +104,39 @@ ORAS="$("$REPO_ROOT/scripts/install-oras" "$work/bin")"
 ORAS_CONFIG="$work/oras-auth.json"
 oras_login "$ORAS" "$ORAS_CONFIG"
 
-# Every result line from every shard: target filename status seconds detail. No
-# results at all is ordinary: a database that changed by dropping packages
-# names no new file. A results.tsv and the lines/ beside it say the same.
-: > "$work/results.tsv"
-if [ -d "$results" ]; then
-  find "$results" -name results.tsv -type f -exec cat {} + >> "$work/results.tsv"
-  find "$results" -path '*/lines/*' -name '[0-9]*.tsv' -type f -exec cat {} + >> "$work/results.tsv"
+# Every result line from every shard of this plan: target filename status
+# seconds detail. No results at all is ordinary: a database that changed by
+# dropping packages names no new file. A results.tsv and the lines/ beside it
+# say the same.
+plan_id=""
+if [ -f "$plan/$target/plan-id" ]; then
+  plan_id="$(cat "$plan/$target/plan-id")"
+else
+  warn "$plan/$target/plan-id does not exist: this plan names no plan id, so only results that name none are read"
 fi
+: > "$work/results.tsv"
+: > "$work/result-dirs.txt"
+if [ -d "$results" ]; then
+  find "$results" \( -name results.tsv -type f \) -o \( -name lines -type d \) > "$work/result-paths.txt"
+  sed 's|/[^/]*$||' "$work/result-paths.txt" | sort -u > "$work/result-dirs.txt"
+fi
+while IFS= read -r d; do
+  got=""
+  if [ -f "$d/plan-id" ]; then
+    got="$(cat "$d/plan-id")"
+  fi
+  if [ "$got" != "$plan_id" ]; then
+    warn "$d holds the results of plan '$got', not of this plan '$plan_id'; they are not read" \
+      "an earlier attempt of the run left them: Re-run all jobs plans again, and the artifacts of the earlier attempt stay"
+    continue
+  fi
+  if [ -f "$d/results.tsv" ]; then
+    cat "$d/results.tsv" >> "$work/results.tsv"
+  fi
+  if [ -d "$d/lines" ]; then
+    find "$d/lines" -maxdepth 1 -name '[0-9]*.tsv' -type f -exec cat {} + >> "$work/results.tsv"
+  fi
+done < "$work/result-dirs.txt"
 
 set_state() {
   printf '%s\n' "$2" > "$1/state"
@@ -163,6 +205,27 @@ stage_target() {
   : "${PRIVATE:=0}" "${ARCH:?}" "${REPO:?}" "${UPSTREAM:?}" "${PACKAGES:?}" "${BYTES:?}" "${NEWEST_BUILDDATE:?}" "${FETCHED:?}"
   local source_url
   source_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}"
+
+  # The files whose tag holds no signature, as far as the database names them
+  local unsigned_list="" unsigned_n unsigned_cut
+  {
+    if [ -f "$pdir/unsigned.txt" ]; then
+      cat "$pdir/unsigned.txt"
+    fi
+    awk -F '\t' -v t="$name" '$1 == t && ($3 == "pushed" || $3 == "present") && index($5, "unsigned: ") == 1 { print $2 }' "$work/results.tsv"
+  } | sort -u > "$work/unsigned-all.txt"
+  awk -F '\t' 'FILENAME == ARGV[1] { r[$1] = 1; next } ($0 in r)' "$pdir/records.tsv" "$work/unsigned-all.txt" > "$work/unsigned-named.txt"
+  awk -v max=16384 '{ n += length($0) + 1; if (n <= max) print }' "$work/unsigned-named.txt" > "$work/unsigned.txt"
+  unsigned_n="$(awk 'END { print NR + 0 }' "$work/unsigned.txt")"
+  unsigned_cut=$(($(awk 'END { print NR + 0 }' "$work/unsigned-named.txt") - unsigned_n))
+  if [ "$unsigned_n" -gt 0 ]; then
+    unsigned_list="$(tr '\n' ' ' < "$work/unsigned.txt" | sed 's/ $//')"
+    log "$name: $unsigned_n file(s) have no signature, as upstream ships them; the manifest names them, and plan asks for their .sig again on each run"
+  fi
+  if [ "$unsigned_cut" -gt 0 ]; then
+    warn "$name: $unsigned_cut more file(s) have no signature and are not named: the list stops at 16 KiB" \
+      "plan does not ask for their .sig again until upstream changes their database record"
+  fi
   local oargs=()
   mapfile -t oargs < <(oras_args)
   local args=(
@@ -182,9 +245,11 @@ stage_target() {
     --annotation "dev.pkgforge.mirror.newest-builddate=$NEWEST_BUILDDATE"
     --annotation "dev.pkgforge.mirror.fetched=$FETCHED"
     --annotation "dev.pkgforge.mirror.run=${GITHUB_RUN_ID:-local}"
-    "$MIRROR_REGISTRY/$repo_path:$STAGING_TAG"
-    "${layers[@]}"
   )
+  if [ -n "$unsigned_list" ]; then
+    args+=(--annotation "dev.pkgforge.mirror.unsigned=$unsigned_list")
+  fi
+  args+=("$MIRROR_REGISTRY/$repo_path:$STAGING_TAG" "${layers[@]}")
   local rc=0 attempt
   for attempt in 1 2 3; do
     rc=0
@@ -279,6 +344,7 @@ stage_target() {
 }
 
 stage_target "$plan/$target"
+printf '%s\n' "$plan_id" > "$out/$target/plan-id"
 
 #---------------------------------------------------------------------------#
 # The verify matrix

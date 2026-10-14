@@ -576,7 +576,9 @@ reconcile_results() {
 # REGISTRY_TOKEN_CACHE, when set, is a directory that keeps each scoped token
 # in a file of its own. Every process that reads it uses the same token, so a
 # shard asks the token endpoint once, not once per read. A 401 or a 403 drops
-# the file and asks again, once.
+# the file and asks again, once. ⛔ Only a token got with REGISTRY_TOKEN is
+# kept. A read with REGISTRY_TOKEN empty is a consumer's read: it never uses
+# the cache, or it would send the workflow's token and read a private package.
 #
 # On GHCR a manifest read tries the dummy token Bearer QQ== first, which every
 # public package accepts. Only its 200 is taken as the answer: GHCR answers QQ==
@@ -589,8 +591,9 @@ REG_STATUS_ERROR=1
 REG_STATUS_ABSENT=4
 
 # registry_token_file REPO SCOPE -> the cache file for that token, or nothing
+# when there is no cache, or when the read is anonymous
 registry_token_file() {
-  [ -n "${REGISTRY_TOKEN_CACHE:-}" ] || return 0
+  [ -n "${REGISTRY_TOKEN_CACHE:-}" ] && [ -n "${REGISTRY_TOKEN:-}" ] || return 0
   printf '%s/%s\n' "$REGISTRY_TOKEN_CACHE" "$(printf '%s %s %s' "$MIRROR_REGISTRY" "$1" "$2" | sha256sum | cut -d ' ' -f 1)"
 }
 
@@ -754,16 +757,22 @@ manifest_layer() {
 }
 
 # fetch_upstream URL OUT [MAX_SECONDS] -> 0 fetched, 4 the server says it has
-# no such file, 1 anything else. Every fetch has a stall deadline; a database
-# or a signature also has a whole-transfer one (MAX_SECONDS), so a server that
-# trickles moves the caller on to the next server. A package file has no fixed
-# deadline: its size makes any fixed one wrong.
+# no such file, 1 anything else. Every fetch has a stall deadline (60 s below
+# 4096 B/s). With MAX_SECONDS the whole call also ends within MAX_SECONDS, its
+# retries included, so a server that trickles moves the caller on to the next
+# server. The caller sets MAX_SECONDS: a fixed one for a database or a
+# signature, one from the size for a package file.
+#
+# curl gives each retry a new --max-time. --retry-max-time starts no retry
+# after MAX_SECONDS, and timeout(1) ends a retry that started just before it.
+# Without them a call took 3 x MAX_SECONDS + 4 s (measured with curl 8.22).
 fetch_upstream() {
-  local url="$1" outfile="$2" code rc=0 max=()
+  local url="$1" outfile="$2" code rc=0 max=() limit=()
   if [ -n "${3:-}" ]; then
-    max=(--max-time "$3")
+    max=(--max-time "$3" --retry-max-time "$3")
+    limit=(timeout -k 5 "$(($3 + 5))")
   fi
-  code="$(curl -q --location --silent --show-error --max-redirs 5 \
+  code="$("${limit[@]}" curl -q --location --silent --show-error --max-redirs 5 \
     --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \
     --connect-timeout 20 --speed-limit 4096 --speed-time 60 "${max[@]}" \
     --retry 2 --retry-connrefused --retry-delay 2 \
@@ -784,6 +793,51 @@ fetch_upstream() {
       return 1
       ;;
   esac
+}
+
+# sig_packet FILE -> 0 when FILE can be a detached signature: 1 to 65535
+# bytes, starting with an OpenPGP signature packet tag (0x88, 0x89 or 0xc2)
+sig_packet() {
+  local size first_byte
+  size="$(wc -c < "$1" | tr -d ' ')"
+  first_byte="$(od -An -tx1 -N1 "$1" | tr -d ' \n')"
+  [ "$size" -gt 0 ] && [ "$size" -lt 65536 ] && [[ "$first_byte" =~ ^(88|89|c2)$ ]]
+}
+
+#---------------------------------------------------------------------------#
+# Servers that failed
+#
+# A directory holds one empty file per host that failed: no answer in time, a
+# connection that failed, or an HTTP status other than 200, 404 and 410. The
+# processes that share the directory then ask that host last. A host that
+# stalls costs one deadline per directory, not one per file. It is still asked
+# when every other server fails.
+#
+# down_mark DIR URL: remember that the host of URL failed
+# down_last DIR URL... -> the URLs, one per line, in the order given, except
+#   that those whose host failed come last
+#---------------------------------------------------------------------------#
+# down_key URL -> the file name for the host and port of URL
+down_key() {
+  local h="${1#*://}"
+  h="${h%%/*}"
+  printf 'h-%s\n' "$(printf '%s' "$h" | tr -c 'A-Za-z0-9.:_-' '_')"
+}
+
+down_mark() {
+  mkdir -p -- "$1"
+  : > "$1/$(down_key "$2")"
+}
+
+down_last() {
+  local dir="$1" u
+  shift
+  for u in "$@"; do
+    [ -e "$dir/$(down_key "$u")" ] || printf '%s\n' "$u"
+  done
+  for u in "$@"; do
+    [ ! -e "$dir/$(down_key "$u")" ] || printf '%s\n' "$u"
+  done
 }
 
 # Seconds since the epoch, from the environment when a test pins the clock.

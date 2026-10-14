@@ -3,7 +3,9 @@
 # The decisions the sync makes, each on fixed inputs: which target files are
 # valid, which database fields are refused, which database is behind another,
 # when a package tag may be written, when a target is stale, which snapshot is
-# newer, and how a shard accounts for every file.
+# newer, how a shard accounts for every file, which token a registry read
+# sends, which server is asked last, how long an upstream read may take, and
+# which artifacts of a re-run the report reads.
 set -euo pipefail
 # shellcheck source=../lib/harness.sh
 . "$REPO_ROOT/tests/lib/harness.sh"
@@ -372,14 +374,17 @@ fake="$work/fake"
 mkdir -p "$fake/bin"
 cat > "$fake/bin/curl" << 'EOF'
 #!/usr/bin/env bash
-# Logs "URL<TAB>AUTH" to $FAKE/calls.log; answers a token request with
-# $FAKE/next-token, and a manifest request from $FAKE/answers.tsv:
-# AUTH<TAB>CODE<TAB>BODY-FILE, the first line whose AUTH matches.
-out="" auth="" url=""
+# Logs "URL<TAB>AUTH" to $FAKE/calls.log; answers a token request that
+# carries a credential (a user line on stdin, --config -) with
+# $FAKE/next-token, one with none with "anon", and a manifest request from
+# $FAKE/answers.tsv: AUTH<TAB>CODE<TAB>BODY-FILE, the first line whose AUTH
+# matches.
+out="" auth="" url="" cred=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) out="$2"; shift 2 ;;
     --header) case "$2" in Authorization:*) auth="${2#Authorization: }" ;; esac; shift 2 ;;
+    --config) if [ "$2" = - ]; then cred="$(cat)"; fi; shift 2 ;;
     --write-out | --user | --data-urlencode | --connect-timeout | --max-time | --retry | --retry-delay | \
       --max-filesize | --proto | --proto-redir | --max-redirs | --speed-limit | --speed-time | --user-agent) shift 2 ;;
     -*) shift ;;
@@ -388,7 +393,12 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\t%s\n' "$url" "$auth" >> "$FAKE/calls.log"
 case "$url" in
-  */token) printf '{"token":"%s"}' "$(cat "$FAKE/next-token")" > "$out" ;;
+  */token)
+    case "$cred" in
+      *'user = '*) printf '{"token":"%s"}' "$(cat "$FAKE/next-token")" > "$out" ;;
+      *) printf '{"token":"anon"}' > "$out" ;;
+    esac
+    ;;
   */manifests/*)
     line="$(awk -F '\t' -v a="$auth" '$1 == a && !f { print $2 "\t" $3; f = 1 }' "$FAKE/answers.tsv")"
     [ -n "$line" ] || { printf '000'; exit 7; }
@@ -406,7 +416,7 @@ reg() {
   local rc=0
   printf '%b' "$2" > "$fake/answers.tsv"
   : > "$fake/calls.log"
-  FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY=ghcr.io MIRROR_REGISTRY_AUTH=token MIRROR_REGISTRY_SCHEME=https \
+  FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY="${REG_REGISTRY:-ghcr.io}" MIRROR_REGISTRY_AUTH=token MIRROR_REGISTRY_SCHEME=https \
     REGISTRY_TOKEN="${REG_TOKEN-secret}" REGISTRY_TOKEN_CACHE="${3:-}" \
     in_lib registry_manifest it/repo latest "$fake/out.json" > /dev/null 2> "$fake/err" || rc=$?
   printf '%s %s %s\n' "$rc" "$(awk 'END { print NR + 0 }' "$fake/calls.log")" "$(awk -F '\t' '$1 ~ /\/token$/ { n++ } END { print n + 0 }' "$fake/calls.log")"
@@ -430,5 +440,155 @@ check "registry: a cached token the registry refuses is asked for again, once" "
   "$(reg refresh 'Bearer QQ==\t404\tunknown.json\nBearer tok1\t401\tdenied.json\nBearer tok2\t200\tmanifest.json\n' "$fake/cache")" \
   "lib.sh registry_manifest, REGISTRY_TOKEN_CACHE"
 check "registry: the cache then holds the new token" tok2 "$(cat "$fake"/cache/* 2> /dev/null)" "ls $fake/cache"
+
+# On a token registry other than GHCR there is no dummy token: an anonymous
+# read asks the token endpoint with no credential. It must never send the
+# token an authenticated read cached, or a private package reads as public.
+mkdir -m 0700 "$fake/cache-other"
+echo tok1 > "$fake/next-token"
+answers='Bearer tok1\t200\tmanifest.json\nBearer anon\t401\tdenied.json\n'
+check "registry, another registry: an authenticated read caches its token and reads the private package" "0 2 1" \
+  "$(REG_REGISTRY=registry.example reg auth "$answers" "$fake/cache-other")" "lib.sh registry_manifest, REGISTRY_TOKEN_CACHE"
+check "registry, another registry: the anonymous read after it asks for a token of its own, and is refused" "1 2 1" \
+  "$(REG_REGISTRY=registry.example REG_TOKEN='' reg anon "$answers" "$fake/cache-other")" \
+  "lib.sh registry_token_file must give no cache file when REGISTRY_TOKEN is empty; cat $fake/calls.log"
+check "registry, another registry: the anonymous read sent no cached token" "Bearer anon" \
+  "$(awk -F '\t' '$1 ~ /manifests/ { print $2 }' "$fake/calls.log")" "cat $fake/calls.log"
+check "registry, another registry: the cache holds only the authenticated token" tok1 "$(cat "$fake"/cache-other/*)" "ls $fake/cache-other"
+
+#---------------------------------------------------------------------------#
+# Servers that failed: asked last, the rest in their own order
+#---------------------------------------------------------------------------#
+down="$work/down"
+order_of() {
+  in_lib down_last "$down" https://a.example/r https://b.example/r/x https://c.example:8443/r https://c.example/r | tr '\n' ' ' | sed 's/ $//'
+}
+check "down: with no host marked, the order is kept" \
+  "https://a.example/r https://b.example/r/x https://c.example:8443/r https://c.example/r" "$(order_of)" "lib.sh down_last"
+in_lib down_mark "$down" https://b.example/other/path
+in_lib down_mark "$down" https://c.example:8443/z
+check "down: a host that failed comes last, by its host and port, and the rest keep their order" \
+  "https://a.example/r https://c.example/r https://b.example/r/x https://c.example:8443/r" "$(order_of)" "lib.sh down_mark, down_last"
+
+#---------------------------------------------------------------------------#
+# "Re-run all jobs" plans again, and a download by name or pattern still
+# returns the earlier attempt's artifacts. The report reads only the summaries
+# of its own plan, for targets its plan marks pending; collect reads only the
+# verdicts and the promotion of the staged digest.
+#---------------------------------------------------------------------------#
+rr="$work/rerun"
+mkdir -p "$rr/plan" "$rr/sum/x86_64-core" "$rr/sum/x86_64-extra" "$rr/sum/x86_64-multilib"
+printf 'plan-2\n' > "$rr/plan/plan-id"
+{
+  printf 'target\tstate\tfiles\tMiB\twhy\n'
+  printf 'x86_64-core\tpending\t1\t1\t1 file(s) to mirror\n'
+  printf 'x86_64-extra\tcurrent\t0\t0\tthe promoted extra.db is upstream'\''s\n'
+  printf 'x86_64-multilib\tpending\t1\t1\t1 file(s) to mirror\n'
+} > "$rr/plan/summary.tsv"
+printf 'x86_64-core\tpromoted\tsha256:new 2026.10.14 latest\n' > "$rr/sum/x86_64-core/state.tsv"
+printf 'plan-2\n' > "$rr/sum/x86_64-core/plan-id"
+# Left by attempt 1: extra was replaced then, and the issue was resolved since.
+printf 'x86_64-extra\treplaced\t1 file(s) have a tag holding other bytes\n' > "$rr/sum/x86_64-extra/state.tsv"
+printf 'plan-1\n' > "$rr/sum/x86_64-extra/plan-id"
+# Left by attempt 1 too: this attempt's chain of multilib left no summary.
+printf 'x86_64-multilib\tpromoted\tsha256:old latest\n' > "$rr/sum/x86_64-multilib/state.tsv"
+printf 'plan-1\n' > "$rr/sum/x86_64-multilib/plan-id"
+rc=0
+env -u GITHUB_STEP_SUMMARY TRACK_ISSUES=0 bash "$REPO_ROOT/scripts/report" "$rr/plan" "$rr/sum" > "$rr/table.md" 2> "$rr/report.err" || rc=$?
+check "re-run: a summary of an earlier plan is not read for a target this plan finds current" "| x86_64-extra | current |" \
+  "$(grep -o '^| x86_64-extra | [a-z]* |' "$rr/table.md")" "scripts/report PLAN SUMMARIES; cat $rr/table.md $rr/report.err"
+check "re-run: a pending target whose chain left only an earlier plan's summary failed" "| x86_64-multilib | failed |" \
+  "$(grep -o '^| x86_64-multilib | [a-z]* |' "$rr/table.md")" "scripts/report PLAN SUMMARIES; cat $rr/table.md"
+check "re-run: the summary of this plan is read" "| x86_64-core | promoted |" \
+  "$(grep -o '^| x86_64-core | [a-z]* |' "$rr/table.md")" "scripts/report PLAN SUMMARIES; cat $rr/table.md"
+check "re-run: the report fails the run for the target with no summary of this plan, and only for it" "1 0" \
+  "$rc $(awk '/replaced/ { n++ } END { print n + 0 }' "$rr/table.md")" "scripts/report PLAN SUMMARIES; cat $rr/table.md"
+# A summary of this very plan counts only for a target the plan marks pending.
+printf 'plan-2\n' > "$rr/sum/x86_64-extra/plan-id"
+rc=0
+env -u GITHUB_STEP_SUMMARY TRACK_ISSUES=0 bash "$REPO_ROOT/scripts/report" "$rr/plan" "$rr/sum" > "$rr/table.md" 2> "$rr/report.err" || rc=$?
+check "re-run: a chain's word applies only to a target the plan marks pending" "| x86_64-extra | current |" \
+  "$(grep -o '^| x86_64-extra | [a-z]* |' "$rr/table.md")" "scripts/report PLAN SUMMARIES; cat $rr/table.md"
+
+# collect: this attempt staged sha256:new in one batch, and it passed. Attempt
+# 1 left a failed verdict of a batch 5, its refusal, and a promotion, all of
+# sha256:old.
+mkdir -p "$rr/stage/x86_64-core/batches" "$rr/verify/verify-x86_64-core-0" "$rr/verify/verify-x86_64-core-5"
+printf 'staged\n' > "$rr/stage/x86_64-core/state"
+printf 'it/x86_64/core@sha256:new\n' > "$rr/stage/x86_64-core/why"
+printf 'DIGEST=sha256:new\n' > "$rr/stage/x86_64-core/staged.env"
+printf 'a\n' > "$rr/stage/x86_64-core/batches/0.txt"
+printf 'plan-2\n' > "$rr/stage/x86_64-core/plan-id"
+printf 'x86_64-core\t0\tpassed\t1 package(s)\tsha256:new\n' > "$rr/verify/verify-x86_64-core-0/verify-x86_64-core-0.tsv"
+printf 'x86_64-core\t5\tfailed\tbatch 5 failed\tsha256:old\n' > "$rr/verify/verify-x86_64-core-5/verify-x86_64-core-5.tsv"
+printf 'stale-1-1-any.pkg.tar.zst\tsig-missing: x\n' > "$rr/verify/verify-x86_64-core-5/refused-x86_64-core-5.tsv"
+printf 'x86_64-core\tpromoted\tsha256:old 2026.10.13 latest\n' > "$rr/promote-old.tsv"
+rc=0
+bash "$REPO_ROOT/scripts/report" collect x86_64-core "$rr/stage" "$rr/verify" "$rr/promote-old.tsv" "$rr/out/x86_64-core" 2> "$rr/collect.err" || rc=$?
+check "re-run: collect reads no verdict, refusal or promotion of another digest" "0 staged 0 plan-2" \
+  "$rc $(cut -f 2 "$rr/out/x86_64-core/state.tsv") $(awk 'END { print NR + 0 }' "$rr/out/x86_64-core/refused.tsv") $(cat "$rr/out/x86_64-core/plan-id")" \
+  "scripts/report collect x86_64-core STAGE VERIFY PROMOTED OUT; cat $rr/collect.err"
+printf 'x86_64-core\tpromoted\tsha256:new 2026.10.14 latest\n' > "$rr/promote-new.tsv"
+rc=0
+bash "$REPO_ROOT/scripts/report" collect x86_64-core "$rr/stage" "$rr/verify" "$rr/promote-new.tsv" "$rr/out2/x86_64-core" 2> "$rr/collect.err" || rc=$?
+check "re-run: collect takes the promotion of the staged digest" "0 promoted" \
+  "$rc $(cut -f 2 "$rr/out2/x86_64-core/state.tsv")" "scripts/report collect x86_64-core STAGE VERIFY PROMOTED OUT; cat $rr/collect.err"
+
+#---------------------------------------------------------------------------#
+# fetch_upstream with MAX_SECONDS ends within it, its retries included: a
+# server that sends 16 KiB/s, above the 4096 B/s stall floor, is asked once.
+# curl gives each retry a new --max-time; without --retry-max-time the call
+# took 3 x MAX + 4 s.
+#---------------------------------------------------------------------------#
+if need_tool python3 "fetch_upstream: a server that trickles is given up within MAX_SECONDS, with one request"; then
+  cat > "$work/trickle.py" << 'EOF'
+import socket, sys, threading, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(16)
+print(s.getsockname()[1], flush=True)
+def serve(c):
+    try:
+        c.recv(65536)
+        with open(sys.argv[1], "a") as f:
+            f.write("hit\n")
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\n\r\n")
+        while True:
+            c.sendall(b"\0" * 8192)
+            time.sleep(0.5)
+    except OSError:
+        pass
+    finally:
+        c.close()
+while True:
+    conn, _ = s.accept()
+    threading.Thread(target=serve, args=(conn,), daemon=True).start()
+EOF
+  : > "$work/trickle.hits"
+  python3 -I "$work/trickle.py" "$work/trickle.hits" > "$work/trickle.port" 2> "$work/trickle.err" &
+  trickle_pid=$!
+  trap 'kill "$trickle_pid"; rm -rf "$work"' EXIT
+  port=""
+  for _ in $(seq 1 50); do
+    port="$(sed -n 1p "$work/trickle.port")"
+    [ -z "$port" ] || break
+    sleep 0.1
+  done
+  started=$SECONDS
+  rc=0
+  UPSTREAM_PROTO='=http,https' in_lib fetch_upstream "http://127.0.0.1:$port/big.db" "$work/trickle.out" 3 > /dev/null 2>&1 || rc=$?
+  took=$((SECONDS - started))
+  kill "$trickle_pid"
+  trap 'rm -rf "$work"' EXIT
+  # The server ends by the signal (status 143), as it should.
+  wait_rc=0
+  wait "$trickle_pid" || wait_rc=$?
+  [ "$wait_rc" -ne 0 ] || diag "the trickle server ended with status 0 before it was stopped: $(cat "$work/trickle.err")"
+  check "fetch_upstream: a server that trickles is given up within MAX_SECONDS, with one request" \
+    "status 1, 1 request(s), within 8 s" \
+    "status $rc, $(awk 'END { print NR + 0 }' "$work/trickle.hits") request(s), $([ "$took" -lt 8 ] && echo 'within 8 s' || echo "after $took s")" \
+    "bash -c '. scripts/lib.sh; UPSTREAM_PROTO==http fetch_upstream http://127.0.0.1:$port/big.db /tmp/out 3' against $work/trickle.py ($(cat "$work/trickle.err"))"
+fi
 
 summary

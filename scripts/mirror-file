@@ -19,6 +19,10 @@
 #   present   the tag already held them; nothing written
 #   replaced  the tag holds other bytes under this name; never overwritten
 #   failed    anything else
+# A file that the tag now holds with no signature, because upstream publishes
+# none for it, is pushed or present with a detail that starts "unsigned: ".
+# scripts/stage lists these files in the staged manifest, and scripts/plan
+# asks upstream for their .sig again on each run.
 #
 # ⛔ A package tag is written once (lib.sh decide_push). The promoted database
 # or an older snapshot may name the bytes a tag holds, and a consumer handed new
@@ -29,9 +33,16 @@
 # ⭐ The signature layer is the database's own %PGPSIG%, decoded, whenever the
 # database carries one: pacman checks against that copy, and asks for the .sig
 # of the server that served the package and of no other. Without %PGPSIG% the
-# detached .sig is downloaded, from the server that served the file first; it
-# is absent only when every server answers 404 for it, and then the file is
-# mirrored unsigned, as upstream ships it, and counts as present from then on.
+# detached .sig is downloaded from the target's servers in their own order,
+# the db_servers first, as scripts/verify-batch reads it: the layer is the
+# signature verify compares it with. It is absent only when every server
+# answers 404 for it, and then the file is mirrored unsigned, as upstream
+# ships it.
+#
+# The package file comes from the servers in an order rotated by shard, so
+# shards spread across mirrors. A server that fails (lib.sh down_mark) is
+# asked last by every file of the shard after it. A .sig read ends within
+# 30 s, and a package download within 120 s plus the time at 64 KiB/s.
 #
 # ⭐ The manifest is the same bytes whoever pushes it: its created annotation is
 # the package's %BUILDDATE%, and no annotation names the server the bytes came
@@ -96,8 +107,8 @@ rm -rf -- "$dir"
 mkdir -p -- "$dir"
 
 #---------------------------------------------------------------------------#
-# The servers, the db_servers first, in an order rotated by shard so shards
-# spread across mirrors.
+# The servers: the db_servers first. Package files are read in an order
+# rotated by shard; in both orders a server that failed comes last.
 #---------------------------------------------------------------------------#
 mapfile -t servers < <(target_sources "$conf")
 n="${#servers[@]}"
@@ -107,30 +118,44 @@ order=()
 for ((i = 0; i < n; i++)); do
   order+=("${servers[$(((start + i) % n))]}")
 done
+down_dir="$WORK/down"
+SIG_MAX_TIME=30
 
-# fetch_sig [FIRST]: the detached signature, from FIRST and then every server.
+# failed SERVER RC: the server answered with an error, not with the file or a
+# 404. Every file of the shard asks it last from now on.
+failed() {
+  if [ ! -e "$down_dir/$(down_key "$1")" ]; then
+    log "$1 failed for $file (status $2); every file of this shard asks it last from now on"
+  fi
+  down_mark "$down_dir" "$1"
+}
+
+# fetch_sig: the detached signature, from every server in the target's order.
 # Sets sig_sha, or unsigned=1 when every one answers 404; returns 1 when a
 # server failed some other way, because an error is not an absence.
 unsigned=0
 fetch_sig() {
-  local first="${1:-}" server size rc missing=0 errors=0
-  for server in ${first:+"$first"} "${order[@]}"; do
+  local server size rc missing=0 errors=0 sig_order=()
+  mapfile -t sig_order < <(down_last "$down_dir" "${servers[@]}")
+  for server in "${sig_order[@]}"; do
     rc=0
-    fetch_upstream "$server/$file.sig" "$dir/$file.sig" || rc=$?
+    fetch_upstream "$server/$file.sig" "$dir/$file.sig" "$SIG_MAX_TIME" || rc=$?
     case "$rc" in
       0)
-        size="$(wc -c < "$dir/$file.sig" | tr -d ' ')"
-        first_byte="$(od -An -tx1 -N1 "$dir/$file.sig" | tr -d ' \n')"
-        if [ "$size" -gt 0 ] && [ "$size" -lt 65536 ] && [[ "$first_byte" =~ ^(88|89|c2)$ ]]; then
+        if sig_packet "$dir/$file.sig"; then
           sig_sha="$(sha256sum -- "$dir/$file.sig" | cut -d ' ' -f 1)"
           return 0
         fi
+        size="$(wc -c < "$dir/$file.sig" | tr -d ' ')"
         warn "$file.sig from $server is not an OpenPGP signature packet ($size bytes)"
         rm -f -- "$dir/$file.sig"
         errors=$((errors + 1))
         ;;
       4) missing=$((missing + 1)) ;;
-      *) errors=$((errors + 1)) ;;
+      *)
+        failed "$server" "$rc"
+        errors=$((errors + 1))
+        ;;
     esac
   done
   if [ "$errors" -gt 0 ]; then
@@ -160,7 +185,7 @@ fi
 #---------------------------------------------------------------------------#
 if [ -z "$sig_sha" ]; then
   sig_error=""
-  if ! fetch_sig ""; then
+  if ! fetch_sig; then
     result failed "its .sig could not be read ($sig_error)"
     exit 1
   fi
@@ -191,21 +216,29 @@ case "$decision" in
     ;;
   needsig)
     # Only reached with no signature known: upstream publishes none for it.
-    result present "$ref holds it unsigned, and upstream publishes no signature for it"
+    result present "unsigned: $ref holds it with no signature, and upstream publishes none for it"
     exit 0
     ;;
 esac
 
 #---------------------------------------------------------------------------#
-# Download, from the db_servers and then the other servers, in the order set
-# above.
+# Download, in the shard's order, a server that failed last. A server that
+# answers 200 with other bytes is behind, not down: it is not marked.
 #---------------------------------------------------------------------------#
-
 got_from=""
-for server in "${order[@]}"; do
+dl_order=()
+mapfile -t dl_order < <(down_last "$down_dir" "${order[@]}")
+for server in "${dl_order[@]}"; do
   rc=0
-  fetch_upstream "$server/$file" "$dir/$file" || rc=$?
-  [ "$rc" -eq 0 ] || continue
+  fetch_upstream "$server/$file" "$dir/$file" "$((120 + csize / 65536))" || rc=$?
+  case "$rc" in
+    0) ;;
+    4) continue ;;
+    *)
+      failed "$server" "$rc"
+      continue
+      ;;
+  esac
   size="$(wc -c < "$dir/$file" | tr -d ' ')"
   got="$(sha256sum -- "$dir/$file" | cut -d ' ' -f 1)"
   if [ "$size" = "$csize" ] && [ "$got" = "$sha256" ]; then
@@ -320,10 +353,14 @@ for attempt in 1 2 3 4 5; do
   if [ "$rc" -eq "$REG_STATUS_OK" ]; then
     got_decision="$(decide_push "$dir/pushed.json" "$file" "$sha256" "$csize" "$sig_sha")"
   fi
+  if [ "$got_decision" = present ]; then
+    result pushed "from $got_from, pushed in ${push_seconds}s ($((rate / 1024)) KiB/s), read back on try $attempt"
+    exit 0
+  fi
   # Pushed unsigned on purpose, the tag reads back as "needs a signature",
   # which for a file upstream signs nowhere is what present means.
-  if [ "$got_decision" = present ] || { [ "$unsigned" -eq 1 ] && [ "$got_decision" = needsig ]; }; then
-    result pushed "from $got_from, pushed in ${push_seconds}s ($((rate / 1024)) KiB/s), read back on try $attempt"
+  if [ "$unsigned" -eq 1 ] && [ "$got_decision" = needsig ]; then
+    result pushed "unsigned: from $got_from, pushed in ${push_seconds}s ($((rate / 1024)) KiB/s) with no signature, read back on try $attempt"
     exit 0
   fi
   sleep $((attempt + 1))

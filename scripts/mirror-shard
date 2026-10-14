@@ -18,7 +18,14 @@
 # those, and scripts/stage reads them: what was pushed counts.
 #
 # Every mirror-file of the shard shares one pull token, kept in a file in the
-# work directory (lib.sh REGISTRY_TOKEN_CACHE).
+# work directory (lib.sh REGISTRY_TOKEN_CACHE), and one record of the servers
+# that failed (lib.sh down_mark): a server that fails for one file is asked
+# last for every file after it.
+#
+# OUT/plan-id is the id of the plan the shard comes from, read from
+# SHARD.tsv's plan directory (scripts/plan writes PLAN/<target>/plan-id and
+# PLAN/<target>/shards/<n>.tsv). It is written first, so even a shard that is
+# killed leaves it. scripts/stage reads no result of another plan.
 #
 # The work goes in the directory with the most free space among $RUNNER_TEMP,
 # /mnt and /tmp, counting each filesystem once. scripts/debloat-runner runs
@@ -56,6 +63,14 @@ case "$DEBLOAT" in
   *) die "DEBLOAT must be auto, always or never, not '$DEBLOAT'" ;;
 esac
 mkdir -p "$out"
+plan_id_file="$(dirname "$(dirname "$shard")")/plan-id"
+plan_id=""
+if [ -f "$plan_id_file" ]; then
+  plan_id="$(cat "$plan_id_file")"
+else
+  warn "$plan_id_file does not exist, so these results name no plan, and scripts/stage reads them only with a plan that names none"
+fi
+printf '%s\n' "$plan_id" > "$out/plan-id"
 
 lines="$(awk 'END { print NR + 0 }' "$shard")"
 [ "$lines" -gt 0 ] || die "$shard has no work line"
