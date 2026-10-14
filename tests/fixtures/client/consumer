@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+#
+# One case of the client suite, inside an Arch container on the host network.
+# Prints "RESULT NAME VALUE" lines for tests/integration/20-client.sh to check,
+# and the logs it read them from.
+#
+#   bash consumer CASE SERVER
+#
+# SERVER is the repository path without its last part, e.g.
+# oci+http://127.0.0.1:5000/it/client/x86_64; [one] and [two] hang below it.
+# Mounted: /in/pacman-oci (the wrapper), /in/gnupg (the signing key's home).
+#
+# Cases:
+#   main-du      -Sy, -S of three packages, -Fy, with DownloadUser
+#   main-root    the same without DownloadUser
+#   noprefetch   -Sy and -S with PACMAN_OCI_PREFETCH=0
+#   registry     -S with PACMAN_OCI_SIG=registry
+#   provider     -S virt, answering 2 at the provider prompt
+#   dead         the wrapper alone, under a parent named pacman, against a
+#                registry that answers 503
+#   resume       -Sy and -S big through the proxy that cuts each blob
+#   resume-serial  the same with PACMAN_OCI_PREFETCH=0
+#   stall        -Sy and -S big through the proxy that stops sending big for
+#                40 s after its first 64 KiB
+#   flip         -Sy and -S alpha gamma through the proxy that changes the
+#                last byte of the first answer for each blob
+#
+# Exit status: 0 the case ran (its results say how it went), 1 it could not.
+set -euo pipefail
+
+case_name="$1"
+server="$2"
+
+install -m 0755 /in/pacman-oci /usr/local/bin/pacman-oci
+# The public keyring and the trust database are all pacman reads; the agent's
+# sockets may sit beside them and are not copied.
+mkdir -m 0700 /tmp/gnupg
+cp /in/gnupg/pubring.kbx /in/gnupg/trustdb.gpg /tmp/gnupg/
+
+# conf DOWNLOADUSER(yes|no) SIGLEVEL: /tmp/pacman.conf with both repositories
+conf() {
+  {
+    printf '[options]\nArchitecture = auto\nSigLevel = %s\n' "$2"
+    printf 'LocalFileSigLevel = Optional\nGPGDir = /tmp/gnupg\n'
+    printf 'XferCommand = /usr/local/bin/pacman-oci %%o %%u\n'
+    if [ "$1" = yes ]; then
+      printf 'DownloadUser = alpm\n'
+    fi
+    printf '\n[one]\nServer = %s/one\n\n[two]\nServer = %s/two\n' "$server" "$server"
+  } > /tmp/pacman.conf
+}
+
+pac() {
+  pacman --config /tmp/pacman.conf --noconfirm "$@"
+}
+
+# count TEXT FILE: lines of FILE that hold TEXT
+count() {
+  awk -v t="$1" 'index($0, t) { n++ } END { print n + 0 }' "$2"
+}
+
+result() {
+  printf 'RESULT %s %s\n' "$1" "$2"
+}
+
+# show FILE: a log, indented, so a failing case can be read from the output
+show() {
+  printf '%s\n' "--- $1"
+  sed 's/^/    /' "$1"
+}
+
+# leftovers: store files and download directories once pacman has ended. The
+# background remover polls once a second, so it gets 3 s.
+leftovers() {
+  sleep 3
+  result "$1_store_files" "$(find /var/lib/pacman/sync /var/cache/pacman/pkg -name '.pacman-oci.*' | wc -l)"
+  result "$1_download_dirs" "$(find /var/lib/pacman/sync /var/cache/pacman/pkg -name 'download-*' | wc -l)"
+}
+
+# sync LABEL ARGS...: one pacman call with the wrapper's debug output
+sync() {
+  local label="$1" rc=0
+  shift
+  PACMAN_OCI_DEBUG=1 pac "$@" > "/tmp/$label.out" 2> "/tmp/$label.err" || rc=$?
+  result "${label}_rc" "$rc"
+  result "${label}_get" "$(count 'pacman-oci: GET ' "/tmp/$label.err")"
+  result "${label}_prefetch_get" "$(count 'pacman-oci: prefetch GET ' "/tmp/$label.err")"
+  result "${label}_served" "$(count ' from the prefetch' "/tmp/$label.err")"
+  show "/tmp/$label.err"
+}
+
+installed() {
+  local rc=0
+  cat /usr/share/client-test/"$1" > /dev/null || rc=$?
+  result "installed_$1" "$rc"
+}
+
+case "$case_name" in
+  main-du | main-root)
+    du=no
+    if [ "$case_name" = main-du ]; then
+      du=yes
+    fi
+    conf "$du" 'Required DatabaseOptional'
+    sync sy -Sy
+    sync s -S alpha beta gamma
+    installed alpha
+    installed beta
+    installed gamma
+    sync fy -Fy
+    rc=0
+    pacman --config /tmp/pacman.conf -Fl alpha > /tmp/fl.out || rc=$?
+    result fl "$rc:$(count usr/share/client-test/alpha /tmp/fl.out)"
+    leftovers main
+    ;;
+  noprefetch)
+    conf yes 'Required DatabaseNever'
+    PACMAN_OCI_PREFETCH=0 sync sy -Sy
+    PACMAN_OCI_PREFETCH=0 sync s -S alpha gamma
+    installed alpha
+    installed gamma
+    leftovers noprefetch
+    ;;
+  registry)
+    conf yes 'Required DatabaseNever'
+    sync sy -Sy
+    PACMAN_OCI_SIG=registry sync s -S alpha beta gamma
+    result s_sig_layers "$(count '.sig ready' /tmp/s.err)"
+    installed alpha
+    installed gamma
+    ;;
+  provider)
+    conf yes 'Required DatabaseNever'
+    sync sy -Sy
+    rc=0
+    printf '2\ny\n' | PACMAN_OCI_DEBUG=1 pacman --config /tmp/pacman.conf -S virt > /tmp/s.out 2> /tmp/s.err || rc=$?
+    result s_rc "$rc"
+    result s_prefetched_default "$(count 'prov-a-1-1-any.pkg.tar.zst ready' /tmp/s.err)"
+    result s_get_chosen "$(count 'pacman-oci: GET http' /tmp/s.err)"
+    rc=0
+    pacman --config /tmp/pacman.conf -Q prov-b > /dev/null || rc=$?
+    result chosen_installed "$rc"
+    show /tmp/s.err
+    ;;
+  dead)
+    # A process named pacman, so the wrapper keeps a run store for it.
+    mkdir -p /tmp/fake /tmp/fakedl
+    cat > /tmp/fake/pacman << 'EOS'
+#!/bin/sh
+for f in alpha-1.0-1-any.pkg.tar.zst beta-2.0-1-any.pkg.tar.zst beta-2.0-1-any.pkg.tar.zst.sig; do
+  t0=$(date +%s%N)
+  rc=0
+  PACMAN_OCI_DEBUG=1 /usr/local/bin/pacman-oci "/tmp/fakedl/$f.part" "$1/one/$f" 2> "/tmp/dead.$f.err" || rc=$?
+  echo "$f $rc $((($(date +%s%N) - t0) / 1000000))"
+done
+EOS
+    chmod 0755 /tmp/fake/pacman
+    /tmp/fake/pacman "$server" > /tmp/dead.out
+    while read -r f rc ms; do
+      case $f in
+        alpha-*) n=first ;;
+        *.sig) n=sig ;;
+        *) n=second ;;
+      esac
+      result "dead_${n}_rc" "$rc"
+      result "dead_${n}_ms" "$ms"
+      result "dead_${n}_get" "$(count 'pacman-oci: GET ' "/tmp/dead.$f.err")"
+      show "/tmp/dead.$f.err"
+    done < /tmp/dead.out
+    ;;
+  resume | resume-serial)
+    conf yes 'Required DatabaseNever'
+    if [ "$case_name" = resume-serial ]; then
+      export PACMAN_OCI_PREFETCH=0
+    fi
+    sync sy -Sy
+    sync s -S big
+    installed big
+    ;;
+  stall)
+    conf yes 'Required DatabaseNever'
+    sync sy -Sy
+    t0=$(date +%s%N)
+    sync s -S big
+    result s_ms "$((($(date +%s%N) - t0) / 1000000))"
+    installed big
+    ;;
+  flip)
+    conf yes 'Required DatabaseNever'
+    sync sy -Sy
+    result sy_refused "$(count 'bytes with sha256' /tmp/sy.err)"
+    sync s -S alpha gamma
+    result s_refused "$(count 'bytes with sha256' /tmp/s.err)"
+    installed alpha
+    installed gamma
+    ;;
+  *)
+    echo "consumer: no case $case_name" >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+#
+# Build the client suite's upstream: two small signed pacman repositories.
+# Runs inside an Arch container, as the calling user, with the output root
+# mounted at /out.
+#
+#   bash build-repos
+#
+# Writes:
+#   /out/one/    alpha 1.0-1, beta 2.0-1, prov-a 1-1 and prov-b 1-1 (both
+#                provide virt), big 1-1 (4 MiB that do not compress, for the
+#                resume cases), each with its .sig, and one.db, one.files
+#   /out/two/    gamma 3.0-1 with its .sig, and two.db, two.files
+#   /out/gnupg   the signing key. It trusts its own key ultimately, so a copy
+#                of it serves as pacman's GPGDir with no pacman-key, which
+#                needs root.
+#
+# Each database carries a %PGPSIG% for every package, as Arch's own do
+# (repo-add --include-sigs). The .db and .files are regular files, never the
+# symbolic links repo-add makes.
+#
+# Exit status: 0 built, 1 a step failed (set -e names it in the log).
+set -euo pipefail
+
+export GNUPGHOME=/out/gnupg
+mkdir -m 0700 "$GNUPGHOME"
+gpg --batch --passphrase '' --quick-gen-key 'mirror-archlinux client test <client@example.invalid>' ed25519 sign never
+
+# mkpkg REPO NAME VERSION [PROVIDES] [BYTES]: one signed package in /out/REPO
+mkpkg() {
+  local repo="/out/$1" name="$2" version="$3" provides="${4:-}" bytes="${5:-0}" d file
+  mkdir -p "$repo"
+  d="$(mktemp -d)"
+  mkdir -p "$d/usr/share/client-test"
+  printf '%s %s\n' "$name" "$version" > "$d/usr/share/client-test/$name"
+  if [ "$bytes" -gt 0 ]; then
+    head -c "$bytes" /dev/urandom > "$d/usr/share/client-test/$name.bin"
+  fi
+  {
+    printf 'pkgname = %s\npkgbase = %s\npkgver = %s\n' "$name" "$name" "$version"
+    printf 'pkgdesc = mirror-archlinux client fixture\nurl = https://example.invalid\n'
+    printf 'builddate = 1700000000\npackager = client test <client@example.invalid>\n'
+    printf 'size = %s\narch = any\nlicense = MIT\n' "$((bytes + 64))"
+    if [ -n "$provides" ]; then
+      printf 'provides = %s\n' "$provides"
+    fi
+  } > "$d/.PKGINFO"
+  file="$name-$version-any.pkg.tar.zst"
+  (cd "$d" && bsdtar --zstd --uid 0 --gid 0 --uname root --gname root -cf "$repo/$file" .PKGINFO usr)
+  gpg --batch --yes --detach-sign --no-armor -o "$repo/$file.sig" "$repo/$file"
+  rm -rf "$d"
+}
+
+mkpkg one alpha 1.0-1
+mkpkg one beta 2.0-1
+mkpkg one prov-a 1-1 virt
+mkpkg one prov-b 1-1 virt
+mkpkg one big 1-1 '' 4194304
+mkpkg two gamma 3.0-1
+
+for repo in one two; do
+  repo-add --quiet --include-sigs "/out/$repo/$repo.db.tar.gz" "/out/$repo"/*.pkg.tar.zst
+  for kind in db files; do
+    cp --remove-destination -L "/out/$repo/$repo.$kind.tar.gz" "/out/$repo/$repo.$kind"
+    rm -f "/out/$repo/$repo.$kind.tar.gz" "/out/$repo/$repo.$kind.tar.gz.old"
+  done
+done
+gpgconf --kill gpg-agent
+ls -l /out/one /out/two /out/gnupg
