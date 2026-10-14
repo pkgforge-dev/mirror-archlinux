@@ -623,11 +623,13 @@ registry_token() {
   fi
   out="$(mktemp)"
   if [ -n "${REGISTRY_TOKEN:-}" ]; then
-    curl -q --silent --show-error --fail --connect-timeout 20 --max-time 60 \
-      --retry 3 --retry-connrefused --retry-delay 2 \
-      --user "${REGISTRY_USER:-token}:$REGISTRY_TOKEN" \
-      --get --data-urlencode "service=$MIRROR_REGISTRY" --data-urlencode "scope=repository:$repo:$scope" \
-      --output "$out" "https://$MIRROR_REGISTRY/token" || rc=$?
+    # The credential goes to curl on stdin, as a config line, never on its
+    # command line, where every process of the runner could read it.
+    printf 'user = "%s:%s"\n' "${REGISTRY_USER:-token}" "$REGISTRY_TOKEN" |
+      curl -q --silent --show-error --fail --connect-timeout 20 --max-time 60 \
+        --retry 3 --retry-connrefused --retry-delay 2 --config - \
+        --get --data-urlencode "service=$MIRROR_REGISTRY" --data-urlencode "scope=repository:$repo:$scope" \
+        --output "$out" "https://$MIRROR_REGISTRY/token" || rc=$?
   else
     curl -q --silent --show-error --fail --connect-timeout 20 --max-time 60 \
       --retry 3 --retry-connrefused --retry-delay 2 \

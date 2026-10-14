@@ -18,8 +18,9 @@ routes = [
   { pattern = "ghcr.mirror.archlinux.pkgforge.dev", custom_domain = true },
 ]
 
-# Each request is at most three cache lookups, two GHCR subrequests and one
-# SHA-256 of a manifest of at most 64 KiB.
+# Each answer is at most three cache lookups, two GHCR subrequests and one
+# SHA-256 of a manifest of at most 64 KiB. A package request also fills its
+# .sig entry: at most two more lookups and one more subrequest.
 [limits]
 cpu_ms = 50
 

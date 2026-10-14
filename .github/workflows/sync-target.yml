@@ -126,7 +126,7 @@ jobs:
           if [ "$GITHUB_REF" = refs/heads/main ]; then
             export STAGING_TAG=staging
           else
-            slug="$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-40)"
+            slug="$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed 's/--*/-/g' | cut -c1-40 | sed 's/^-//; s/-$//')"
             export STAGING_TAG="staging-${slug:-branch}"
           fi
           scripts/stage "$RUNNER_TEMP/plan" "$RUNNER_TEMP/results" "$RUNNER_TEMP/stage" "$TARGET"

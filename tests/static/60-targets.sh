@@ -119,4 +119,21 @@ else
     "add slot steps to the plan job" "reproduce: grep -c 'outputs.slot' .github/workflows/sync.yml"
 fi
 
+# sync-target.yml downloads a chain's artifacts by <kind>-<target>-[0-9]*. A
+# target named like another plus "-" and a digit (x86_64-core-2 beside
+# x86_64-core) would match that pattern and read the other chain's files.
+overlap="$(for c in targets/*.conf; do basename "$c" .conf; done | awk '
+  { name[NR] = $0 }
+  END {
+    for (i = 1; i <= NR; i++) for (j = 1; j <= NR; j++)
+      if (i != j && index(name[j], name[i] "-") == 1 && substr(name[j], length(name[i]) + 2, 1) ~ /[0-9]/)
+        print name[j] " extends " name[i]
+  }')"
+if [ -z "$overlap" ]; then
+  ok "no target name is another's name, a dash and a digit"
+else
+  fail "no target name is another's name, a dash and a digit" "$overlap" \
+    "the artifact patterns of sync-target.yml would mix the two chains" "reproduce: ls targets"
+fi
+
 summary
