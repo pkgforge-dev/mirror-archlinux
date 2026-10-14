@@ -54,7 +54,7 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_shards }}
+      max-parallel: ${{ fromJSON(format('{0}', inputs.max_shards)) }}
       matrix:
         shard: ${{ fromJSON(inputs.shards) }}
     steps:
@@ -149,7 +149,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_batches }}
+      max-parallel: ${{ fromJSON(format('{0}', inputs.max_batches)) }}
       matrix: ${{ fromJSON(needs.stage.outputs.verify_matrix) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

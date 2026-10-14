@@ -261,6 +261,9 @@ jobs:
   # for its own shards and batches only. A job that calls a reusable workflow
   # takes no timeout-minutes (GitHub refuses the key there); every job of
   # sync-target.yml has its own.
+  # A dispatch input reaches an expression as a string, and max-parallel and a
+  # number input of a called workflow refuse a string ("Unexpected value '4'",
+  # run 38569214434). fromJSON(format('{0}', x)) gives a number in every case.
   target:
     needs: plan
     if: ${{ needs.plan.outputs.has_targets == 'true' }}
@@ -269,15 +272,15 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
-      max-parallel: ${{ inputs.max_targets || 4 }}
+      max-parallel: ${{ fromJSON(format('{0}', inputs.max_targets || 4)) }}
       matrix: ${{ fromJSON(needs.plan.outputs.targets) }}
     uses: ./.github/workflows/sync-target.yml
     with:
       target: ${{ matrix.target }}
       shards: ${{ toJSON(matrix.shards) }}
-      max_shards: ${{ inputs.max_shards || 3 }}
-      max_batches: ${{ inputs.max_batches || 3 }}
-      parallel: ${{ inputs.parallel || 6 }}
+      max_shards: ${{ fromJSON(format('{0}', inputs.max_shards || 3)) }}
+      max_batches: ${{ fromJSON(format('{0}', inputs.max_batches || 3)) }}
+      parallel: ${{ fromJSON(format('{0}', inputs.parallel || 6)) }}
       debloat: ${{ inputs.debloat || 'auto' }}
 
   report:

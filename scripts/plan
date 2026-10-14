@@ -355,9 +355,21 @@ plan_target() {
       warn "$name: $srv/$repo.files does not read as a tar archive"
       continue
     fi
-    if [ "$(cut -f 1,5 "$dir/files.tsv" | sort | sha256sum)" != "$(cut -f 1,5 "$dir/records.tsv" | sort | sha256sum)" ]; then
-      warn "$name: $srv/$repo.files names other packages than $repo.db"
+    # Every (file, sha256) of the files database must be in the database. A
+    # files database that leaves packages out is accepted and the packages are
+    # named: upstream serves it so to its own users too (Arch Linux ARM
+    # aarch64 aur.files left out localepurge, 2026-10-14), and pacman -F only
+    # knows less. One that names a package the database does not is refused.
+    cut -f 1,5 "$dir/files.tsv" | sort -u > "$dir/files-pairs.txt"
+    cut -f 1,5 "$dir/records.tsv" | sort -u > "$dir/db-pairs.txt"
+    comm -23 "$dir/files-pairs.txt" "$dir/db-pairs.txt" > "$dir/files-extra.txt"
+    comm -13 "$dir/files-pairs.txt" "$dir/db-pairs.txt" | cut -f 1 > "$dir/files-missing.txt"
+    if [ -s "$dir/files-extra.txt" ]; then
+      warn "$name: $srv/$repo.files names $(awk 'END { print NR + 0 }' "$dir/files-extra.txt") package file(s) that $repo.db does not, e.g. $(awk -F '\t' 'NR == 1 { print $1 " sha256 " $2 }' "$dir/files-extra.txt")"
       continue
+    fi
+    if [ -s "$dir/files-missing.txt" ]; then
+      warn "$name: $srv/$repo.files leaves out $(awk 'END { print NR + 0 }' "$dir/files-missing.txt") package(s) of $repo.db, as upstream serves it: $(tr '\n' ' ' < "$dir/files-missing.txt")"
     fi
     # A signature is absent only when the server says so with a 404; any other
     # failure would otherwise turn a signed database into an unsigned one.

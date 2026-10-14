@@ -410,8 +410,24 @@ if [ "$got" != "$files_sha" ]; then
   exit 1
 fi
 echo "the synced $repo.files is the staged one, sha256 $got"
-xargs -a /in/names.txt pacman --config /tmp/pacman.conf -Fl > /tmp/files-list.txt
-echo "pacman -Fl listed $(wc -l < /tmp/files-list.txt) path(s) for $(wc -l < /in/names.txt) package(s)"
+# plan accepts a files database that leaves out packages of the database (an
+# upstream defect: Arch Linux ARM aarch64 aur.files, 2026-10-14). -Fl reads
+# every batch name that the files database holds, and the rest are named.
+bsdtar -tf "/var/lib/pacman/sync/$repo.files" | sed -n 's|/files$||p' | sort -u > /tmp/files-dirs.txt
+pacman --config /tmp/pacman.conf -Sl "$repo" | awk '{ print $2 "\t" $2 "-" $3 }' > /tmp/name-dir.tsv
+awk -F '\t' 'FILENAME == ARGV[1] { have[$1] = 1; next }
+  FILENAME == ARGV[2] { dir[$1] = $2; next }
+  { if (($0 in dir) && (dir[$0] in have)) print > "/tmp/fl-names.txt"; else print > "/tmp/fl-absent.txt" }
+' /tmp/files-dirs.txt /tmp/name-dir.tsv /in/names.txt
+touch /tmp/fl-names.txt /tmp/fl-absent.txt
+if [ -s /tmp/fl-absent.txt ]; then
+  echo "the files database holds no entry for $(wc -l < /tmp/fl-absent.txt) package(s) of the batch, as upstream serves it: $(tr '\n' ' ' < /tmp/fl-absent.txt)"
+fi
+: > /tmp/files-list.txt
+if [ -s /tmp/fl-names.txt ]; then
+  xargs -a /tmp/fl-names.txt pacman --config /tmp/pacman.conf -Fl > /tmp/files-list.txt
+fi
+echo "pacman -Fl listed $(wc -l < /tmp/files-list.txt) path(s) for $(wc -l < /tmp/fl-names.txt) package(s)"
 
 phase "done"
 echo "@@done"
