@@ -1,9 +1,16 @@
 # ghcr-mirror-archlinux-pkgforge: the HTTPS front for the GHCR mirror.
-# Deploy: npx wrangler@4 deploy --config worker/wrangler.toml
+#
+# Deploy: .github/workflows/worker.yml does it on main. By hand:
+#   cd worker && npx wrangler@4.150.0 deploy
+# Check the configuration with no deploy:
+#   cd worker && npx wrangler@4.150.0 deploy --dry-run --outdir "$(mktemp -d)"
 name = "ghcr-mirror-archlinux-pkgforge"
 main = "src/index.js"
 account_id = "2a97c8f21aff7a773bf976c61ace1381"
-compatibility_date = "2026-10-01"
+compatibility_date = "2026-10-13"
+# From 2026-08-04 the compatibility date turns on the Node.js APIs. This
+# Worker uses only Web APIs (fetch, Cache, Web Crypto), so it opts out.
+compatibility_flags = ["no_nodejs_compat", "no_nodejs_compat_v2"]
 workers_dev = false
 preview_urls = false
 
@@ -11,10 +18,17 @@ routes = [
   { pattern = "ghcr.mirror.archlinux.pkgforge.dev", custom_domain = true },
 ]
 
-# Each request is a cache lookup and at most two small subrequests.
+# Each request is at most three cache lookups, two GHCR subrequests and one
+# SHA-256 of a manifest of at most 64 KiB.
 [limits]
 cpu_ms = 50
 
+# Every request is sampled, but the invocation log is off. The Worker calls
+# console.error only on a 5xx answer or a cache failure, so the logs hold
+# every failure and nothing else.
 [observability]
 enabled = true
-head_sampling_rate = 0.01
+head_sampling_rate = 1
+
+[observability.logs]
+invocation_logs = false
