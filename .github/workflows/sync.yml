@@ -1,14 +1,17 @@
-# Mirror every enabled target to GHCR: plan, mirror in shards, stage, verify
-# with pacman through the wrapper, promote, report.
+# Mirror every enabled target to GHCR: plan, then one chain per pending target
+# (.github/workflows/sync-target.yml: mirror in shards, stage, verify with
+# pacman through the wrapper, promote), then one report.
 #
 # ⛔ A database reaches latest only after every file it names is on the
 # registry and every file new since the promoted database has passed pacman's
-# own checks through the wrapper. Targets are independent: one held target
-# never holds another. HISTORY/design.md has the whole design.
+# own checks through the wrapper. Targets are independent: each runs its own
+# chain, and a slow or held target never delays or holds another.
+# HISTORY/design.md has the whole design.
 #
 # promote runs only on main. A run from any other branch does everything else,
 # writes only write-once package tags and its own staging-<branch> tag, and
-# never moves latest.
+# never moves latest. Runs from every branch share one concurrency group, so
+# two runs never write the same tags at once.
 name: Sync
 
 on:
@@ -20,14 +23,22 @@ on:
         description: Targets (arch-repo, space separated); empty for every enabled one
         type: string
         default: ''
-      max_parallel:
-        description: Most matrix jobs at once; the organisation shares 20
-        type: string
-        default: '8'
+      max_targets:
+        description: Target chains at once; the organisation shares 20 jobs
+        type: number
+        default: 4
+      max_shards:
+        description: Mirror shards at once in each target's chain
+        type: number
+        default: 3
+      max_batches:
+        description: Verify batches at once in each target's chain
+        type: number
+        default: 3
       parallel:
         description: Files mirrored at once in each shard
-        type: string
-        default: '4'
+        type: number
+        default: 6
       debloat:
         description: Free runner disk before mirroring
         type: choice
@@ -41,7 +52,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: sync-${{ github.ref }}
+  group: sync
   cancel-in-progress: false
 
 defaults:
@@ -52,19 +63,18 @@ env:
   MIRROR_REGISTRY: ghcr.io
   SHARD_BYTES: '536870912'
   SHARD_FILES: '400'
-  MAX_SHARDS: '16'
+  MAX_SHARDS: '32'
 
 jobs:
   plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      has_files: ${{ steps.plan.outputs.has_files }}
-      has_work: ${{ steps.plan.outputs.has_work }}
+      targets: ${{ steps.plan.outputs.targets }}
+      has_targets: ${{ steps.plan.outputs.has_targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -88,239 +98,226 @@ jobs:
             args+=("targets/$t.conf")
           done
           scripts/plan "$RUNNER_TEMP/plan" "${args[@]}"
-      - name: Upload the plan
+          mkdir -p "$RUNNER_TEMP/plan-summary"
+          cp "$RUNNER_TEMP/plan/summary.tsv" "$RUNNER_TEMP/plan/targets.json" "$RUNNER_TEMP/plan/pending.json" "$RUNNER_TEMP/plan-summary/"
+      - name: Upload the plan's summary, for the report
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: plan
-          path: ${{ runner.temp }}/plan
+          name: plan-summary
+          path: ${{ runner.temp }}/plan-summary
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      # One artifact per pending target, plan-<target>, so a chain downloads its
+      # own target's plan and nothing else. The plan names a target per slot;
+      # tests/static/60-targets.sh checks there is a slot for every enabled
+      # target.
+      - name: Upload the plan of slot 0
+        if: ${{ steps.plan.outputs.slot0 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot0 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot0 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 1
+        if: ${{ steps.plan.outputs.slot1 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot1 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot1 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 2
+        if: ${{ steps.plan.outputs.slot2 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot2 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot2 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 3
+        if: ${{ steps.plan.outputs.slot3 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot3 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot3 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 4
+        if: ${{ steps.plan.outputs.slot4 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot4 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot4 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 5
+        if: ${{ steps.plan.outputs.slot5 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot5 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot5 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 6
+        if: ${{ steps.plan.outputs.slot6 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot6 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot6 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 7
+        if: ${{ steps.plan.outputs.slot7 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot7 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot7 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 8
+        if: ${{ steps.plan.outputs.slot8 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot8 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot8 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 9
+        if: ${{ steps.plan.outputs.slot9 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot9 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot9 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 10
+        if: ${{ steps.plan.outputs.slot10 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot10 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot10 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 11
+        if: ${{ steps.plan.outputs.slot11 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot11 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot11 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 12
+        if: ${{ steps.plan.outputs.slot12 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot12 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot12 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 13
+        if: ${{ steps.plan.outputs.slot13 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot13 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot13 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 14
+        if: ${{ steps.plan.outputs.slot14 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot14 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot14 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 15
+        if: ${{ steps.plan.outputs.slot15 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot15 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot15 }}
           retention-days: 7
           if-no-files-found: error
           overwrite: true
 
-  mirror:
+  # One chain per pending target, each on its own: a target's promote waits
+  # for its own shards and batches only. A job that calls a reusable workflow
+  # takes no timeout-minutes (GitHub refuses the key there); every job of
+  # sync-target.yml has its own.
+  target:
     needs: plan
-    if: ${{ needs.plan.outputs.has_files == 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    if: ${{ needs.plan.outputs.has_targets == 'true' }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJSON(inputs.max_parallel || '8') }}
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: plan
-          path: ${{ runner.temp }}/plan
-      - name: Mirror the shard
-        env:
-          SHARD_INDEX: ${{ matrix.shard }}
-          PARALLEL: ${{ inputs.parallel || '4' }}
-          DEBLOAT: ${{ inputs.debloat || 'auto' }}
-          REGISTRY_USER: ${{ github.actor }}
-          REGISTRY_TOKEN: ${{ github.token }}
-        run: |
-          # The disk this runner really has, kept in the log: GitHub guarantees
-          # 14 GB and is moving runners to a single disk.
-          df -h / "$RUNNER_TEMP"
-          scripts/mirror-shard "$RUNNER_TEMP/plan/shards/$SHARD_INDEX.tsv" "$RUNNER_TEMP/results/$SHARD_INDEX"
-      - name: Upload the results
-        if: ${{ always() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: results-${{ matrix.shard }}
-          path: ${{ runner.temp }}/results
-          retention-days: 7
-          if-no-files-found: warn
-          overwrite: true
-
-  stage:
-    needs: [plan, mirror]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.has_work == 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      verify_matrix: ${{ steps.stage.outputs.verify_matrix }}
-      has_batches: ${{ steps.stage.outputs.has_batches }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: plan
-          path: ${{ runner.temp }}/plan
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: results-*
-          path: ${{ runner.temp }}/results
-          merge-multiple: false
-      - name: Stage
-        id: stage
-        env:
-          REGISTRY_USER: ${{ github.actor }}
-          REGISTRY_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/results"
-          if [ "$GITHUB_REF" = refs/heads/main ]; then
-            export STAGING_TAG=staging
-          else
-            slug="$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-40)"
-            export STAGING_TAG="staging-${slug:-branch}"
-          fi
-          scripts/stage "$RUNNER_TEMP/plan" "$RUNNER_TEMP/results" "$RUNNER_TEMP/stage"
-      - name: Upload the stage
-        if: ${{ always() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: stage
-          path: ${{ runner.temp }}/stage
-          retention-days: 7
-          if-no-files-found: warn
-          overwrite: true
-
-  verify:
-    needs: stage
-    if: ${{ !cancelled() && needs.stage.result == 'success' && needs.stage.outputs.has_batches == 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ fromJSON(inputs.max_parallel || '8') }}
-      matrix: ${{ fromJSON(needs.stage.outputs.verify_matrix) }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: stage
-          path: ${{ runner.temp }}/stage
-      - name: Verify with pacman through the wrapper
-        env:
-          TARGET: ${{ matrix.target }}
-          BATCH: ${{ matrix.batch }}
-        run: scripts/verify-batch "$RUNNER_TEMP/stage" "$TARGET" "$BATCH" "$RUNNER_TEMP/verify"
-      - name: Upload the verdict
-        if: ${{ always() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: verify-${{ matrix.target }}-${{ matrix.batch }}
-          path: ${{ runner.temp }}/verify
-          retention-days: 7
-          if-no-files-found: warn
-          overwrite: true
-
-  promote:
-    needs: [stage, verify]
-    if: ${{ !cancelled() && needs.stage.result == 'success' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: stage
-          path: ${{ runner.temp }}/stage
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: verify-*
-          path: ${{ runner.temp }}/verify
-          merge-multiple: false
-      - name: Promote each verified target
-        env:
-          REGISTRY_USER: ${{ github.actor }}
-          REGISTRY_TOKEN: ${{ github.token }}
-        run: |
-          # Each target decides alone: one that is refused never holds another.
-          mkdir -p "$RUNNER_TEMP/verify" "$RUNNER_TEMP/promote"
-          : > "$RUNNER_TEMP/promote/results.tsv"
-          for d in "$RUNNER_TEMP"/stage/*/; do
-            d="${d%/}"
-            [ -f "$d/state" ] || continue
-            [ "$(cat "$d/state")" = staged ] || continue
-            t="$(basename "$d")"
-            rc=0
-            scripts/promote "$RUNNER_TEMP/stage" "$RUNNER_TEMP/verify" "$t" 2> "$RUNNER_TEMP/promote/$t.err" || rc=$?
-            cat "$RUNNER_TEMP/promote/$t.err" >&2
-            if [ "$rc" -eq 0 ]; then
-              printf '%s\tpromoted\t%s\n' "$t" "$(cut -f 3,4 "$d/promoted.tsv" | tr '\t' ' ')" >> "$RUNNER_TEMP/promote/results.tsv"
-            else
-              printf '%s\tfailed\t%s\n' "$t" "$(grep -m 1 'promote:' "$RUNNER_TEMP/promote/$t.err" | tr '\t' ' ')" >> "$RUNNER_TEMP/promote/results.tsv"
-            fi
-          done
-      - name: Upload the promotions
-        if: ${{ always() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: promote
-          path: ${{ runner.temp }}/promote
-          retention-days: 30
-          if-no-files-found: warn
-          overwrite: true
+      max-parallel: ${{ inputs.max_targets || 4 }}
+      matrix: ${{ fromJSON(needs.plan.outputs.targets) }}
+    uses: ./.github/workflows/sync-target.yml
+    with:
+      target: ${{ matrix.target }}
+      shards: ${{ toJSON(matrix.shards) }}
+      max_shards: ${{ inputs.max_shards || 3 }}
+      max_batches: ${{ inputs.max_batches || 3 }}
+      parallel: ${{ inputs.parallel || 6 }}
+      debloat: ${{ inputs.debloat || 'auto' }}
 
   report:
-    needs: [plan, mirror, stage, verify, promote]
+    needs: [plan, target]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
+      actions: write
       contents: read
       issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Each artifact into a directory of its own, by a pattern so one that a
-      # skipped job never made is not an error. Whether a single match lands in
-      # DIR or in DIR/<name> has changed between versions of the action; the
-      # step below accepts either.
+      # By a pattern, so an artifact that a skipped job never made is not an
+      # error. Each summary-<target> holds <target>/..., so merged they land
+      # side by side whichever way the action lays out a single match.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: plan
+          pattern: plan-summary
           path: ${{ runner.temp }}/dl-plan
+          merge-multiple: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: stage
-          path: ${{ runner.temp }}/dl-stage
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: promote
-          path: ${{ runner.temp }}/dl-promote
+          pattern: summary-*
+          path: ${{ runner.temp }}/summaries
+          merge-multiple: true
       - name: Report
         env:
           GH_TOKEN: ${{ github.token }}
           TRACK_ISSUES: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
         run: |
-          # dl-NAME/NAME when the action made a subdirectory, dl-NAME when not
-          pick() {
-            if [ -d "$RUNNER_TEMP/dl-$1/$1" ]; then
-              echo "$RUNNER_TEMP/dl-$1/$1"
-            else
-              mkdir -p "$RUNNER_TEMP/dl-$1"
-              echo "$RUNNER_TEMP/dl-$1"
-            fi
-          }
-          plan="$(pick plan)"
-          stage="$(pick stage)"
-          promote="$(pick promote)"
-          touch "$promote/results.tsv"
-          scripts/report "$plan" "$stage" "$promote/results.tsv"
+          mkdir -p "$RUNNER_TEMP/dl-plan" "$RUNNER_TEMP/summaries"
+          scripts/report "$RUNNER_TEMP/dl-plan" "$RUNNER_TEMP/summaries"
+      - name: Start the status workflow
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run status.yml --ref main --repo "$GITHUB_REPOSITORY"
 
   # No needs, in either direction: this runs whatever the sync does, and the
   # watchdog workflow runs the same two checks, so each witnesses the other.

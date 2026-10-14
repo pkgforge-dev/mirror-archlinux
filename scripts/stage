@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 #
-# Stage each pending target's database: check that every file it names is on
-# the registry, push the database under a staging tag, read it back, and split
-# the files new since the promoted database into verification batches.
+# Stage one target's database: check that every file it names is on the
+# registry, push the database under a staging tag, read it back, and split the
+# files new since the promoted database into verification batches.
 #
-#   scripts/stage PLAN RESULTS OUT
+#   scripts/stage PLAN RESULTS OUT TARGET
 #
-# PLAN is scripts/plan's output. RESULTS holds the mirror shards' outputs
-# (any depth; every results.tsv under it is read).
+# PLAN is scripts/plan's output (at least PLAN/TARGET). RESULTS holds the
+# target's mirror shard outputs, at any depth: every results.tsv under it is
+# read, and every lines/*.tsv, which a shard killed before its results.tsv
+# leaves behind.
 #
-# OUT/<target>/state   staged held replaced private error, or the plan's own
-#                      state for a target that was not pending
-# OUT/<target>/why     what was measured
-# OUT/<target>/staged.env  DIGEST, DB_SHA256, FILES_SHA256, TAG of the staged manifest
-# OUT/<target>/batches/<n>.txt  package names, one per line
+# OUT/TARGET/state   staged held replaced private error, or the plan's own
+#                    state for a target that was not pending
+# OUT/TARGET/why     what was measured
+# OUT/TARGET/staged.env  DIGEST, DB_SHA256, FILES_SHA256, TAG of the staged manifest
+# OUT/TARGET/batches/<n>.txt  package names, one per line
+# OUT/TARGET/canaries.txt     the names verify reads first, through the
+#                             wrapper's single-file path; all in batch 0
+# OUT/TARGET/records.tsv      the database's records, for verify's account of
+#                             a package pacman refuses
 # OUT/verify-matrix.json  {"include":[{"target":..,"batch":..},..]}
+# OUT/summary.tsv         target, state, why
 #
 # ⛔ A database is staged only when every file new since the promoted one has a
 # result of pushed or present. A file with no result or a failure holds the
@@ -23,11 +30,19 @@
 # itself. A file whose tag holds other bytes (replaced) holds the target until
 # a person decides, and stage says so at once.
 #
-# Environment: STAGING_TAG (default staging), VERIFY_BATCH_FILES (400),
-# VERIFY_BATCH_BYTES (2147483648), MIRROR_NAMESPACE, REGISTRY_USER,
-# REGISTRY_TOKEN.
+# Verification batches: every file new since the promoted database, plus the
+# canaries, which are always present: the smallest package and every keyring
+# package of the target, so a run with nothing new still proves the path a
+# consumer takes. The number of batches is the larger of ceil(bytes /
+# VERIFY_BATCH_BYTES) and ceil(files / VERIFY_BATCH_FILES); when that is more
+# than VERIFY_MAX_BATCHES, both limits grow until it is not (lib.sh
+# batch_count), and the log says so.
 #
-# Exit status: 0 every target has a state, 1 the step itself could not run.
+# Environment: STAGING_TAG (default staging), VERIFY_BATCH_FILES (400),
+# VERIFY_BATCH_BYTES (2147483648), VERIFY_MAX_BATCHES (40), MIRROR_NAMESPACE,
+# REGISTRY_USER, REGISTRY_TOKEN.
+#
+# Exit status: 0 the target has a state, 1 the step itself could not run.
 set -euo pipefail
 SCRIPT_NAME=stage
 # shellcheck source=lib.sh
@@ -38,9 +53,14 @@ need curl jq awk sha256sum timeout
 plan="${1:-}"
 results="${2:-}"
 out="${3:-}"
-if [ ! -d "$plan" ] || [ -z "$results" ] || [ -z "$out" ]; then
-  die "usage: scripts/stage PLAN RESULTS OUT"
+target="${4:-}"
+if [ ! -d "$plan" ] || [ -z "$results" ] || [ -z "$out" ] || [ -z "$target" ]; then
+  die "usage: scripts/stage PLAN RESULTS OUT TARGET"
 fi
+case "$target" in
+  *[!a-z0-9_.-]*) die "TARGET is a target name, not '$target'" ;;
+esac
+[ -f "$plan/$target/state" ] || die "the plan has no state for $target" "reproduce: ls $plan/$target"
 [ -n "$MIRROR_NAMESPACE" ] || die "MIRROR_NAMESPACE is not set"
 if [ "$MIRROR_REGISTRY_AUTH" != none ] && [ -z "${REGISTRY_TOKEN:-}" ]; then
   die "REGISTRY_TOKEN is not set; staging pushes"
@@ -50,21 +70,30 @@ STAGING_TAG="${STAGING_TAG:-staging}"
   die "STAGING_TAG must be staging or staging-<slug>, not '$STAGING_TAG'"
 BATCH_FILES="${VERIFY_BATCH_FILES:-400}"
 BATCH_BYTES="${VERIFY_BATCH_BYTES:-2147483648}"
+MAX_BATCHES="${VERIFY_MAX_BATCHES:-40}"
+for v in BATCH_FILES BATCH_BYTES MAX_BATCHES; do
+  case "${!v}" in
+    '' | *[!0-9]* | 0) die "$v must be a positive integer, not '${!v}'" ;;
+  esac
+done
 mkdir -p "$out"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin"
+REGISTRY_TOKEN_CACHE="$work/tokens"
+mkdir -m 0700 "$REGISTRY_TOKEN_CACHE"
 ORAS="$("$REPO_ROOT/scripts/install-oras" "$work/bin")"
 ORAS_CONFIG="$work/oras-auth.json"
 oras_login "$ORAS" "$ORAS_CONFIG"
 
 # Every result line from every shard: target filename status seconds detail. No
 # results at all is ordinary: a database that changed by dropping packages
-# names no new file.
+# names no new file. A results.tsv and the lines/ beside it say the same.
 : > "$work/results.tsv"
 if [ -d "$results" ]; then
-  find "$results" -name results.tsv -type f -exec cat {} + > "$work/results.tsv"
+  find "$results" -name results.tsv -type f -exec cat {} + >> "$work/results.tsv"
+  find "$results" -path '*/lines/*' -name '[0-9]*.tsv' -type f -exec cat {} + >> "$work/results.tsv"
 fi
 
 set_state() {
@@ -102,12 +131,12 @@ stage_target() {
   n_bad="$(awk -F '\t' '$2 != "pushed" && $2 != "present" { n++ } END { print n + 0 }' "$dir/accounted.tsv")"
   if [ "$n_replaced" -gt 0 ]; then
     awk -F '\t' '$2 == "replaced"' "$dir/accounted.tsv" > "$dir/replaced.tsv"
-    set_state "$dir" replaced "$n_replaced file(s) have a tag holding other bytes under the same name, first: $(awk -F '\t' '$2 == "replaced" { print $1 ": " $3; exit }' "$dir/accounted.tsv")"
+    set_state "$dir" replaced "$n_replaced file(s) have a tag holding other bytes under the same name, first: $(awk -F '\t' '$2 == "replaced" && !f { print $1 ": " $3; f = 1 }' "$dir/accounted.tsv")"
     return 0
   fi
   if [ "$n_bad" -gt 0 ]; then
     awk -F '\t' '$2 != "pushed" && $2 != "present"' "$dir/accounted.tsv" > "$dir/failing.tsv"
-    set_state "$dir" held "$n_bad file(s) are not on the registry, first: $(awk -F '\t' '$2 != "pushed" && $2 != "present" { print $1 ": " $2 ", " $3; exit }' "$dir/accounted.tsv")"
+    set_state "$dir" held "$n_bad file(s) are not on the registry, first: $(awk -F '\t' '$2 != "pushed" && $2 != "present" && !f { print $1 ": " $2 ", " $3; f = 1 }' "$dir/accounted.tsv")"
     return 0
   fi
 
@@ -211,69 +240,64 @@ stage_target() {
   fi
 
   #-------------------------------------------------------------------------#
-  # Verification batches: every file new since the promoted database, plus a
-  # canary that is always present (the keyring, and the smallest package), so
-  # a run with nothing new still proves the path a consumer takes.
+  # Verification batches. The canaries go to batch 0; the rest, largest first
+  # onto the lightest batch.
   #-------------------------------------------------------------------------#
-  local keyring
-  keyring="$(target_get "$conf" keyring)"
+  cp "$pdir/records.tsv" "$dir/records.tsv"
+  target_keyrings "$conf" > "$work/keyrings.txt"
   {
+    awk -F '\t' 'FILENAME == ARGV[1] { want[$1] = 1; next } ($2 in want) { print $2 }' "$work/keyrings.txt" "$pdir/records.tsv"
+    sort -t $'\t' -k6,6n -k2,2 "$pdir/records.tsv" | awk -F '\t' 'NR == 1 { print $2 }'
+  } | awk '!seen[$0]++' > "$dir/canaries.txt"
+  {
+    awk -F '\t' 'FILENAME == ARGV[1] { c[$1] = 1; next } ($2 in c) { print $2 "\t" $6 }' "$dir/canaries.txt" "$pdir/records.tsv"
     awk -F '\t' '{ print $6 "\t" $5 }' "$pdir/todo.tsv"
-    if [ -n "$keyring" ]; then
-      awk -F '\t' -v k="$keyring" '$2 == k { print $2 "\t" $6 }' "$pdir/records.tsv"
-    fi
-    sort -t $'\t' -k6,6n "$pdir/records.tsv" | awk -F '\t' 'NR == 1 { print $2 "\t" $6 }'
   } | awk -F '\t' '!seen[$1]++' > "$dir/verify.tsv"
 
-  local nfiles nbytes k
+  local nfiles nbytes k flimit blimit wanted
   nfiles="$(awk 'END { print NR + 0 }' "$dir/verify.tsv")"
   nbytes="$(awk -F '\t' '{ s += $2 } END { printf "%.0f\n", s }' "$dir/verify.tsv")"
-  k="$(awk -v b="$nbytes" -v f="$nfiles" -v bb="$BATCH_BYTES" -v bf="$BATCH_FILES" 'BEGIN {
-    kb = int((b + bb - 1) / bb); kf = int((f + bf - 1) / bf)
-    k = (kb > kf) ? kb : kf
-    if (k < 1) k = 1
-    print k
-  }')"
-  sort -t $'\t' -k2,2nr -k1,1 "$dir/verify.tsv" | awk -F '\t' -v k="$k" -v dir="$dir/batches" '
-    {
-      best = 0
-      for (i = 1; i < k; i++) if (load[i] < load[best]) best = i
-      load[best] += $2
-      print $1 > (dir "/" best ".txt")
-    }
-  '
+  read -r k flimit blimit wanted <<< "$(batch_count "$nfiles" "$nbytes" "$BATCH_FILES" "$BATCH_BYTES" "$MAX_BATCHES")"
+  if [ "$wanted" -gt "$k" ]; then
+    log "$name: $nfiles file(s) and $((nbytes / 1048576)) MiB want $wanted batch(es) at $BATCH_FILES files and $((BATCH_BYTES / 1048576)) MiB; VERIFY_MAX_BATCHES=$MAX_BATCHES grows the limits to $flimit files and $((blimit / 1048576)) MiB: $k batch(es)"
+  fi
+  local canary_bytes
+  canary_bytes="$(awk -F '\t' 'FILENAME == ARGV[1] { c[$1] = 1; next } ($1 in c) { s += $2 } END { printf "%.0f\n", s }' "$dir/canaries.txt" "$dir/verify.tsv")"
+  cp "$dir/canaries.txt" "$dir/batches/0.txt"
+  awk -F '\t' 'FILENAME == ARGV[1] { c[$1] = 1; next } !($1 in c)' "$dir/canaries.txt" "$dir/verify.tsv" |
+    sort -t $'\t' -k2,2nr -k1,1 | awk -F '\t' -v k="$k" -v d="$dir/batches" -v c="$canary_bytes" '
+      BEGIN { load[0] = c + 0 }
+      {
+        best = 0
+        for (i = 1; i < k; i++) if (load[i] < load[best]) best = i
+        load[best] += $2
+        print $1 >> (d "/" best ".txt")
+      }
+    '
 
-  set_state "$dir" staged "$repo_path@$digest, $(awk 'END { print NR + 0 }' "$dir/verify.tsv") package(s) to verify in $(find "$dir/batches" -name '*.txt' | awk 'END { print NR + 0 }') batch(es)"
+  set_state "$dir" staged "$repo_path@$digest, $nfiles package(s) to verify in $(find "$dir/batches" -name '*.txt' | awk 'END { print NR + 0 }') batch(es), canaries: $(tr '\n' ' ' < "$dir/canaries.txt" | sed 's/ $//')"
 }
 
-for pdir in "$plan"/*/; do
-  pdir="${pdir%/}"
-  [ -f "$pdir/state" ] || continue
-  stage_target "$pdir"
-done
+stage_target "$plan/$target"
 
 #---------------------------------------------------------------------------#
 # The verify matrix
 #---------------------------------------------------------------------------#
 {
-  for dir in "$out"/*/; do
-    dir="${dir%/}"
-    [ -f "$dir/state" ] || continue
-    [ "$(cat "$dir/state")" = staged ] || continue
+  dir="$out/$target"
+  if [ "$(cat "$dir/state")" = staged ]; then
     for b in "$dir"/batches/*.txt; do
       [ -e "$b" ] || continue
-      jq -cn --arg t "$(basename "$dir")" --arg b "$(basename "$b" .txt)" '{target: $t, batch: $b}'
+      basename "$b" .txt
+    done | sort -n | while IFS= read -r n; do
+      jq -cn --arg t "$target" --arg b "$n" '{target: $t, batch: $b}'
     done
-  done
+  fi
 } | jq -cs '{include: .}' > "$out/verify-matrix.json"
 
 {
   printf 'target\tstate\twhy\n'
-  for dir in "$out"/*/; do
-    dir="${dir%/}"
-    [ -f "$dir/state" ] || continue
-    printf '%s\t%s\t%s\n' "$(basename "$dir")" "$(cat "$dir/state")" "$(cat "$dir/why")"
-  done
+  printf '%s\t%s\t%s\n' "$target" "$(cat "$out/$target/state")" "$(cat "$out/$target/why")"
 } > "$out/summary.tsv"
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then

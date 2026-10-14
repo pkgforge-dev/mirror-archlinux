@@ -1,43 +1,80 @@
 #!/usr/bin/env bash
 #
 # Verify one batch of a staged database the way a consumer reads it: pacman,
-# in the target's own image, with the wrapper as its XferCommand and the staged
-# manifest, pinned by digest, as its only Server.
+# with the wrapper as its XferCommand and the staged manifest, pinned by
+# digest, as its Server.
 #
 #   scripts/verify-batch STAGE TARGET BATCH OUT
 #
-# STAGE is scripts/stage's output. Writes OUT/verify-TARGET-BATCH.tsv:
-#   target batch result detail digest
-# where digest is the staged manifest this verdict is about, so a verdict left
-# over from another attempt is never taken for this one.
-# with result passed or failed, and the full pacman log beside it.
+# STAGE is scripts/stage's output. Writes:
+#   OUT/verify-TARGET-BATCH.tsv   target batch result detail digest
+#   OUT/verify-TARGET-BATCH.log   everything, with a UTC time on each phase
+#   OUT/refused-TARGET-BATCH.tsv  file reason, one line per upstream-refused
+#                                 package (below); written only when there is one
+# result is passed or failed. digest is the staged manifest the verdict is
+# about, so a verdict left over from another attempt is never taken for this
+# one. The verdict is written even when the step is killed (EXIT trap), with
+# the packages named at fault so far.
 #
 # ⭐ pacman checks what it always checks: every file's sha256 against the
 # database and every signature against the distribution's keyring, with its
 # own trust model, before it reports a download complete. A failure here is a
 # failure a consumer would have had.
 #
-# Then one check pacman does not make: with a %PGPSIG% in the database, pacman
-# verifies against it and stores the .sig the wrapper served without reading
-# it (measured with pacman 7.1, 2026-10-14). Each stored .sig must be that
-# %PGPSIG%, decoded, byte for byte, or a later pacman -U from the cache fails.
+# The container is the target's verify_image: x86_64 Arch for every target.
+# pacman.conf says Architecture = the target's arch, and pacman on x86_64 then
+# downloads and checks another arch's packages (measured 2026-10-14), so no
+# target needs emulation. The configuration is written here, not the image's:
+# the target's repository with its staged manifest as the only Server,
+# DownloadUser = alpm (the wrapper runs as that user from a download-XXXXXX
+# directory, the stock Arch path), and DatabaseRequired when the upstream
+# signs its database.
 #
-# pacman reads a configuration written here, not the image's: one repository,
-# its staged manifest as the only Server, and DownloadUser = alpm, so the
-# wrapper runs as that user from a download-XXXXXX directory, the stock Arch
-# path. A target whose upstream signs its database is checked with
-# DatabaseRequired. The first batch of a target also reads the files database.
+# Phases, each logged with its time:
+#   pull       the verify image, and keyring_image when the target names one:
+#              two attempts of 300 s each
+#   keyring    pacman-key --init; the files of keyring_image's
+#              /usr/share/pacman/keyrings added, never over a file the verify
+#              image has; --populate. Then every keyring package installed
+#              with -Sdd, from the staged repository or from keyring_from's
+#              latest, pinned by the digest latest names now, as a second
+#              section; --populate again, so a key added upstream is signed
+#              locally before any package is checked. keyring_from with no
+#              latest yet: a warning, and no refresh; the trust root still
+#              applies and pacman still checks every signature.
+#   canaries   batch 0 only: stage's canaries through the wrapper's single-file
+#              path (PACMAN_OCI_PREFETCH=0), into a cache of their own
+#   batch      every package of the batch through the wrapper's default path
+#              with PACMAN_OCI_SIG=registry, so the signatures pacman stores are
+#              the registry's layers
+#   refusals   after a download that failed, each package alone
+#   sig check  with a %PGPSIG% in the database, pacman verifies against it and
+#              stores the .sig the wrapper served without reading it (measured
+#              with pacman 7.1, 2026-10-14); a later pacman -U from the cache
+#              reads it. Each stored .sig must be that %PGPSIG%, decoded.
+#   files db   pacman -Fy: the synced <repo>.files must be the staged one
+#              (FILES_SHA256), and pacman -Fl must read every name of the batch
 #
-# The keyring is refreshed first, from the staged snapshot itself: pacman-key
-# --init gives the container a local key, the keyring package is installed with
-# the image's trust, and --populate is run again and must succeed, so a master
-# key added upstream is signed locally before any package is checked.
+# Upstream-refused: a package pacman refuses alone for a reason in its
+# signature (lib.sh refusal_reason) is not the mirror's fault when the mirror
+# serves exactly upstream's file: its tag holds the database's sha256 and
+# size, and its signature layer is the decoded %PGPSIG%, or, with no %PGPSIG%,
+# the .sig upstream serves now; or upstream has no signature at all, the tag
+# has none, and every server answers 404 for the .sig. pacman refuses it from
+# upstream too (loong64 extra, 2026-10-14: three packages signed by keys that
+# expired, one signed nowhere). It is listed in OUT/refused-TARGET-BATCH.tsv,
+# and the batch passes when every failure is one of these. Any other failure,
+# and any stored .sig that is not the %PGPSIG%, fails it.
+#
+# Budget: VERIFY_BUDGET seconds (default 4800) from the start, for the pulls
+# and the container together; the container gets what the pulls leave. The
+# workflow step's timeout is above it, so this script, not the runner, ends
+# a run that is too long, and says so.
 #
 # Environment: MIRROR_NAMESPACE, CONTAINER_RUNTIME (docker or podman; docker
-# by default).
-# For the integration suite only: VERIFY_NETWORK (a container network, host
-# to reach a registry on the loopback) and VERIFY_TRUST_KEY (an armored
-# public key the container trusts, for packages signed by a test key).
+# by default), VERIFY_BUDGET.
+# For the integration suite only: VERIFY_NETWORK, a container network (host,
+# to reach a registry on the loopback).
 #
 # Exit status: 0 passed, 1 failed or could not run.
 set -euo pipefail
@@ -45,6 +82,7 @@ SCRIPT_NAME=verify-batch
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+started="$(date -u +%s)"
 stage="${1:-}"
 target="${2:-}"
 batch="${3:-}"
@@ -57,170 +95,477 @@ case "$target$batch" in
 esac
 [ -n "$MIRROR_NAMESPACE" ] || die "MIRROR_NAMESPACE is not set"
 RUNTIME="${CONTAINER_RUNTIME:-docker}"
-need "$RUNTIME" timeout
+need "$RUNTIME" timeout jq sha256sum base64
+BUDGET="${VERIFY_BUDGET:-4800}"
+case "$BUDGET" in
+  '' | *[!0-9]* | 0) die "VERIFY_BUDGET must be a positive number of seconds, not '$BUDGET'" ;;
+esac
 mkdir -p "$out"
 report="$out/verify-$target-$batch.tsv"
 log_file="$out/verify-$target-$batch.log"
+refused_file="$out/refused-$target-$batch.tsv"
+rm -f "$report" "$refused_file"
+: > "$log_file"
 
 verdict() {
   printf '%s\t%s\t%s\t%s\t%s\n' "$target" "$batch" "$1" "$2" "${DIGEST:-unknown}" > "$report"
   log "$target batch $batch: $1: $2"
 }
-trap '[ -f "$report" ] || verdict failed "ended before reaching a verdict"' EXIT
+
+# culprits_so_far -> the packages the log names at fault, one line
+culprits_so_far() {
+  awk -F '\t' '
+    $1 == "@@refused" && !seen[$2]++ { s = s " " $2 }
+    $1 == "@@sigbad" && !seen[$2]++ { s = s " " $2 ": " $3 ";" }
+    END { print substr(s, 2) }
+  ' "$log_file"
+}
+
+# phase NAME: one timed line in the log and on stderr
+phase() {
+  printf '== %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$log_file"
+  log "$*"
+}
+
+work=""
+# shellcheck disable=SC2329 # run by the EXIT trap
+on_exit() {
+  local rc=$? c
+  if [ -n "$work" ]; then
+    rm -rf "$work"
+  fi
+  if [ ! -f "$report" ]; then
+    c="$(culprits_so_far)"
+    verdict failed "ended with status $rc before reaching a verdict${c:+; at fault so far: $c}"
+  fi
+}
+trap on_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 conf="$TARGETS_DIR/$target.conf"
 target_check "$conf"
+arch="$(target_get "$conf" arch)"
 repo="$(target_get "$conf" repo)"
+repo_path="$(target_repository "$conf")"
 image="$(target_get "$conf" verify_image)"
 platform="$(target_get "$conf" verify_platform)"
-keyring="$(target_get "$conf" keyring)"
+keyring_image="$(target_get "$conf" keyring_image)"
+keyring_platform="$(target_get "$conf" keyring_platform)"
+keyring_from="$(target_get "$conf" keyring_from)"
+keyrings="$(target_keyrings "$conf" | tr '\n' ' ' | sed 's/ $//')"
 db_siglevel=DatabaseOptional
 if [ "$(target_get "$conf" db_signed)" = yes ]; then
   db_siglevel=DatabaseRequired
 fi
-files_db=0
-if [ "$batch" = 0 ]; then
-  files_db=1
-fi
 [ -n "$image" ] || die "$conf names no verify_image"
-names="$stage/$target/batches/$batch.txt"
-[ -s "$names" ] || die "no batch $names"
+batch_file="$stage/$target/batches/$batch.txt"
+[ -s "$batch_file" ] || die "no batch $batch_file"
 # shellcheck source=/dev/null # written by scripts/stage
 . "$stage/$target/staged.env"
-: "${DIGEST:?}"
+: "${DIGEST:?}" "${FILES_SHA256:?}"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"; [ -f "$report" ] || verdict failed "ended before reaching a verdict"' EXIT
+mkdir -p "$work/keyrings"
 cp "$WRAPPER" "$work/pacman-oci"
-cp "$names" "$work/names.txt"
-: > "$work/trust.asc"
-if [ -n "${VERIFY_TRUST_KEY:-}" ]; then
-  cp "$VERIFY_TRUST_KEY" "$work/trust.asc"
+cp "$batch_file" "$work/names.txt"
+: > "$work/canaries.txt"
+if [ "$batch" = 0 ] && [ -f "$stage/$target/canaries.txt" ]; then
+  cp "$stage/$target/canaries.txt" "$work/canaries.txt"
 fi
 net_args=()
 if [ -n "${VERIFY_NETWORK:-}" ]; then
   net_args=(--network "$VERIFY_NETWORK")
 fi
-server="$OCI_SCHEME://$MIRROR_REGISTRY/$(target_repository "$conf")@$DIGEST"
+server="$OCI_SCHEME://$MIRROR_REGISTRY/$repo_path@$DIGEST"
 
+#---------------------------------------------------------------------------#
+# keyring_from: the second section, pinned by the digest its latest names now
+#---------------------------------------------------------------------------#
+second_repo=""
+second_server=""
+keyring_repo=""
+if [ -n "$keyrings" ]; then
+  keyring_repo="$repo"
+fi
+if [ -n "$keyring_from" ]; then
+  from_conf="$TARGETS_DIR/$keyring_from.conf"
+  target_check "$from_conf"
+  from_path="$(target_repository "$from_conf")"
+  rc=0
+  REGISTRY_TOKEN='' registry_manifest "$from_path" latest "$work/from-latest.json" || rc=$?
+  case "$rc" in
+    "$REG_STATUS_OK")
+      second_repo="$(target_get "$from_conf" repo)"
+      second_server="$OCI_SCHEME://$MIRROR_REGISTRY/$from_path@sha256:$(sha256sum "$work/from-latest.json" | cut -d ' ' -f 1)"
+      keyring_repo="$second_repo"
+      ;;
+    "$REG_STATUS_ABSENT")
+      keyring_repo=""
+      warn "$target: keyring_from $keyring_from has no latest yet, so the keyring packages ($keyrings) are not refreshed this run" \
+        "the trust root still applies, and pacman still checks every signature against it" \
+        "reproduce: curl -s -H 'Authorization: Bearer QQ==' -H 'Accept: application/vnd.oci.image.manifest.v1+json' $REG_URL/v2/$from_path/manifests/latest"
+      printf 'keyring: keyring_from %s has no latest yet; the refresh is skipped\n' "$keyring_from" >> "$log_file"
+      ;;
+    *)
+      verdict failed "could not read $from_path:latest for keyring_from; no answer is not an absence"
+      exit 1
+      ;;
+  esac
+fi
+
+#---------------------------------------------------------------------------#
+# Pulls: two attempts of 300 s each
+#---------------------------------------------------------------------------#
+# pull IMAGE PLATFORM -> 0 pulled
+pull() {
+  local attempt rc=0
+  for attempt in 1 2; do
+    rc=0
+    timeout --kill-after=10 300 "$RUNTIME" pull --platform "$2" "$1" >> "$work/pull.log" 2>&1 || rc=$?
+    [ "$rc" -ne 0 ] || return 0
+    log "pull of $1 for $2, attempt $attempt, ended $rc"
+    if [ "$attempt" -eq 1 ]; then
+      sleep 10
+    fi
+  done
+  return 1
+}
+
+phase "pull $image ($platform)"
+if ! pull "$image" "$platform"; then
+  cat "$work/pull.log" >> "$log_file"
+  verdict failed "could not pull $image in two attempts of 300 s: $(tail -n 1 "$work/pull.log")"
+  exit 1
+fi
+
+if [ -n "$keyring_image" ]; then
+  phase "pull $keyring_image ($keyring_platform), for its keyring files"
+  if ! pull "$keyring_image" "$keyring_platform"; then
+    cat "$work/pull.log" >> "$log_file"
+    verdict failed "could not pull $keyring_image in two attempts of 300 s: $(tail -n 1 "$work/pull.log")"
+    exit 1
+  fi
+  # create and cp run nothing from the image, so no emulation is needed.
+  cid="$(timeout 120 "$RUNTIME" create --platform "$keyring_platform" "$keyring_image" true)" ||
+    die "could not create a container from $keyring_image" "reproduce: $RUNTIME create --platform $keyring_platform $keyring_image true"
+  rc=0
+  timeout 120 "$RUNTIME" cp "$cid:/usr/share/pacman/keyrings/." "$work/keyrings/" >> "$log_file" 2>&1 || rc=$?
+  timeout 120 "$RUNTIME" rm "$cid" >> "$log_file" 2>&1
+  [ "$rc" -eq 0 ] || die "could not copy /usr/share/pacman/keyrings out of $keyring_image (status $rc)" \
+    "reproduce: $RUNTIME create --platform $keyring_platform $keyring_image true, then $RUNTIME cp ID:/usr/share/pacman/keyrings/. DIR"
+  for f in "$work/keyrings"/* "$work/keyrings"/.[!.]*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    b="${f##*/}"
+    if [ -L "$f" ] || [ ! -f "$f" ] || [[ ! "$b" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      die "$keyring_image holds /usr/share/pacman/keyrings/$b, which is not a plain keyring file"
+    fi
+  done
+  printf 'keyring: from %s: %s\n' "$keyring_image" "$(find "$work/keyrings" -type f -printf '%f ' | sed 's/ $//')" >> "$log_file"
+fi
+
+#---------------------------------------------------------------------------#
+# The container
+#---------------------------------------------------------------------------#
 cat > "$work/verify.sh" << 'EOS'
 set -euo pipefail
-repo="$1" server="$2" keyring="$3" files_db="$4" db_siglevel="$5"
+repo="$1" arch="$2" server="$3" second_repo="$4" second_server="$5" keyrings="$6" keyring_repo="$7" db_siglevel="$8" files_sha="$9"
+
+phase() { printf '== %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
 install -m 0755 /in/pacman-oci /usr/local/bin/pacman-oci
-
-cat > /tmp/pacman.conf << EOF
-[options]
-Architecture = auto
-CheckSpace
-SigLevel = Required $db_siglevel
-LocalFileSigLevel = Optional
-DownloadUser = alpm
-XferCommand = /usr/local/bin/pacman-oci %o %u
-
-[$repo]
-Server = $server
-EOF
+{
+  printf '[options]\nArchitecture = %s\nCheckSpace\nSigLevel = Required %s\n' "$arch" "$db_siglevel"
+  printf 'LocalFileSigLevel = Optional\nDownloadUser = alpm\nXferCommand = /usr/local/bin/pacman-oci %%o %%u\n'
+  printf '\n[%s]\nServer = %s\n' "$repo" "$server"
+  if [ -n "$second_repo" ]; then
+    printf '\n[%s]\nServer = %s\n' "$second_repo" "$second_server"
+  fi
+} > /tmp/pacman.conf
 echo "== pacman.conf"
 grep -vE '^[[:space:]]*(#|$)' /tmp/pacman.conf
 
 pac() { pacman --config /tmp/pacman.conf --noconfirm "$@"; }
 
-echo "== keyring"
+phase "keyring"
 pacman-key --init
+copied=()
+for f in /in/keyrings/*; do
+  [ -f "$f" ] || continue
+  b="${f##*/}"
+  if [ -e "/usr/share/pacman/keyrings/$b" ]; then
+    echo "keyring: keeps the verify image's own $b"
+  else
+    install -m 0644 "$f" "/usr/share/pacman/keyrings/$b"
+    copied+=("$b")
+    echo "keyring: $b from keyring_image"
+  fi
+done
 pacman-key --populate
-if [ -s /in/trust.asc ]; then
-  pacman-key --add /in/trust.asc
-  pacman-key --lsign-key "$(gpg --with-colons --show-keys /in/trust.asc | awk -F : '$1 == "fpr" && f == "" { f = $10 } END { print f }')"
-fi
 pac -Sy
-if [ -n "$keyring" ]; then
-  pac -Sdd "$keyring"
+if [ -n "$keyrings" ] && [ -n "$keyring_repo" ]; then
+  # The keyring packages own the files keyring_image supplied; their keys are
+  # in the keyring now, so the copies give way to the packages.
+  for b in "${copied[@]}"; do
+    rm -f "/usr/share/pacman/keyrings/$b"
+  done
+  read -r -a kr <<< "$keyrings"
+  phase "keyring: install ${kr[*]} from [$keyring_repo]"
+  pac -Sdd "${kr[@]/#/$keyring_repo/}"
   pacman-key --populate
+  # pacman checked the keyring packages' own signatures: the trust root works.
+  printf '@@trust\tkeyring\n'
 fi
 
-echo "== download and check $(wc -l < /in/names.txt) package(s)"
-rc=0
-xargs -a /in/names.txt pacman --config /tmp/pacman.conf --noconfirm -Swdd || rc=$?
-if [ "$rc" -ne 0 ]; then
-  echo "== the batch failed ($rc); each package alone, to name the ones at fault"
+failed=0
+# fetch LIST CACHE [NAME=VALUE ...]: pacman -Swdd of every name in LIST, and
+# after a failure each one alone, to name the ones at fault. For each one at
+# fault, the wrapper is also asked for the package and for its .sig alone, as
+# root into /tmp: its exit statuses say whether the registry serves them.
+fetch() {
+  local list="$1" cache="$2" rc=0 p one f pkg_rc sig_rc
+  shift 2
+  mkdir -p "$cache"
+  sed "s|^|$repo/|" "$list" > /tmp/qualified.txt
+  env "$@" xargs -a /tmp/qualified.txt pacman --config /tmp/pacman.conf --noconfirm --cachedir "$cache" -Swdd || rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  phase "refusals: the download failed ($rc); each package alone, to name the ones at fault"
   while IFS= read -r p; do
     one=0
-    pac -Swdd "$p" > "/tmp/one.log" 2>&1 || one=$?
+    env "$@" pacman --config /tmp/pacman.conf --noconfirm --cachedir "$cache" -Swdd "$repo/$p" > /tmp/one.log 2>&1 || one=$?
     if [ "$one" -ne 0 ]; then
+      failed=1
       echo "CULPRIT $p"
-      sed 's/^/    /' /tmp/one.log | tail -n 6
+      printf '@@refused\t%s\n' "$p"
+      awk -v p="$p" 'NR <= 80 { printf "@@log\t%s\t%s\n", p, $0 }' /tmp/one.log
+      pkg_rc=x
+      sig_rc=x
+      f=""
+      pacman --config /tmp/pacman.conf -Sddp --print-format '%f' "$repo/$p" > /tmp/probe.name || echo "    probe: pacman -Sp did not name the file of $p"
+      f="$(sed -n '$p' /tmp/probe.name)"
+      if [ -n "$f" ]; then
+        rm -rf /tmp/probe
+        mkdir -p /tmp/probe
+        pkg_rc=0
+        /usr/local/bin/pacman-oci "/tmp/probe/$f" "$server/$f" > /tmp/probe.log 2>&1 || pkg_rc=$?
+        sig_rc=0
+        /usr/local/bin/pacman-oci "/tmp/probe/$f.sig" "$server/$f.sig" >> /tmp/probe.log 2>&1 || sig_rc=$?
+        sed "s|^|    probe: |" /tmp/probe.log
+      fi
+      printf '@@probe\t%s\t%s\t%s\n' "$p" "$pkg_rc" "$sig_rc"
     fi
-  done < /in/names.txt
-  exit 1
-fi
+  done < "$list"
+}
 
-# pacman checks a package against the database's %PGPSIG% when it carries one,
-# and keeps the .sig the wrapper served beside it in the cache unread; a later
-# pacman -U from that cache reads it. So each must be that %PGPSIG%, decoded.
-echo "== signature layers against the database's %PGPSIG%"
-bsdtar -xOf "/var/lib/pacman/sync/$repo.db" | awk '
+if [ -s /in/canaries.txt ]; then
+  phase "canaries: $(wc -l < /in/canaries.txt) package(s) through the wrapper's single-file path"
+  fetch /in/canaries.txt /tmp/canary-cache PACMAN_OCI_PREFETCH=0
+fi
+phase "batch: $(wc -l < /in/names.txt) package(s) through the wrapper's default path, signatures from the registry"
+fetch /in/names.txt /var/cache/pacman/pkg PACMAN_OCI_SIG=registry
+
+# NUL bytes are dropped and a record boundary restored before %FILENAME%: a
+# desc that is NUL bytes only (aarch64 extra findnewest-0.3-4) would otherwise
+# join the next record's first line.
+phase "sig check: each stored .sig against the database's %PGPSIG%, decoded"
+bsdtar -xOf "/var/lib/pacman/sync/$repo.db" | tr -d '\000' | sed 's/%FILENAME%/\n&/g' | awk '
   k == "F" { f = $0 }
   k == "P" { print f "\t" $0 }
   { k = ($0 == "%FILENAME%") ? "F" : ($0 == "%PGPSIG%") ? "P" : "" }
 ' > /tmp/pgpsig.tsv
-cache=/var/cache/pacman/pkg
 checked=0
-bad=0
-while IFS=$'\t' read -r f sig; do
-  [ -e "$cache/$f" ] || continue
-  checked=$((checked + 1))
-  if [ ! -f "$cache/$f.sig" ]; then
-    echo "CULPRIT $f: the database carries a %PGPSIG%, and the wrapper served no .sig"
-    bad=1
-    continue
-  fi
-  want="$(printf '%s' "$sig" | base64 -d | sha256sum | cut -d ' ' -f 1)"
-  got="$(sha256sum < "$cache/$f.sig" | cut -d ' ' -f 1)"
-  if [ "$want" != "$got" ]; then
-    echo "CULPRIT $f: its .sig is sha256 $got, its %PGPSIG% decodes to sha256 $want"
-    bad=1
-  fi
-done < /tmp/pgpsig.tsv
+for cache in /var/cache/pacman/pkg /tmp/canary-cache; do
+  [ -d "$cache" ] || continue
+  while IFS=$'\t' read -r f sig; do
+    [ -e "$cache/$f" ] || continue
+    checked=$((checked + 1))
+    if [ ! -f "$cache/$f.sig" ]; then
+      echo "CULPRIT $f: the database carries a %PGPSIG%, and the wrapper served no .sig"
+      printf '@@sigbad\t%s\t%s\n' "$f" "the database carries a %PGPSIG%, and the wrapper served no .sig"
+      failed=1
+      continue
+    fi
+    want="$(printf '%s' "$sig" | base64 -d | sha256sum | cut -d ' ' -f 1)"
+    got="$(sha256sum < "$cache/$f.sig" | cut -d ' ' -f 1)"
+    if [ "$want" != "$got" ]; then
+      echo "CULPRIT $f: its .sig is sha256 $got, its %PGPSIG% decodes to sha256 $want"
+      printf '@@sigbad\t%s\t%s\n' "$f" "its .sig is sha256 $got, its %PGPSIG% decodes to sha256 $want"
+      failed=1
+    fi
+  done < /tmp/pgpsig.tsv
+done
 echo "$checked signature(s) compared"
-if [ "$bad" -ne 0 ]; then
+
+phase "files db: pacman -Fy, and -Fl over every name of the batch"
+pac -Fy
+got="$(sha256sum "/var/lib/pacman/sync/$repo.files" | cut -d ' ' -f 1)"
+if [ "$got" != "$files_sha" ]; then
+  echo "the synced $repo.files is sha256 $got, the staged one $files_sha"
   exit 1
 fi
+echo "the synced $repo.files is the staged one, sha256 $got"
+xargs -a /in/names.txt pacman --config /tmp/pacman.conf -Fl > /tmp/files-list.txt
+echo "pacman -Fl listed $(wc -l < /tmp/files-list.txt) path(s) for $(wc -l < /in/names.txt) package(s)"
 
-if [ "$files_db" = 1 ]; then
-  echo "== files database"
-  pac -Fy
-  pacman --config /tmp/pacman.conf -Fl "$(sed -n 1p /in/names.txt)" | sed -n 1,3p
-fi
-echo "== passed"
+phase "done"
+echo "@@done"
+exit "$failed"
 EOS
 
-pull_rc=0
-for attempt in 1 2 3; do
-  pull_rc=0
-  timeout --kill-after=30 600 "$RUNTIME" pull --platform "$platform" "$image" > "$work/pull.log" 2>&1 || pull_rc=$?
-  [ "$pull_rc" -ne 0 ] || break
-  sleep $((attempt * 10))
-done
-if [ "$pull_rc" -ne 0 ]; then
-  cat "$work/pull.log" > "$log_file"
-  verdict failed "could not pull $image: $(tail -n 1 "$work/pull.log")"
+elapsed=$(($(date -u +%s) - started))
+remaining=$((BUDGET - elapsed))
+if [ "$remaining" -lt 60 ]; then
+  verdict failed "the own budget ran out before the container started: VERIFY_BUDGET=${BUDGET}s, ${elapsed}s spent on the pulls"
+  exit 1
+fi
+phase "container: $remaining s of the ${BUDGET}s budget left"
+rc=0
+timeout --kill-after=30 "$remaining" "$RUNTIME" run --rm --platform "$platform" "${net_args[@]}" \
+  -v "$work/pacman-oci:/in/pacman-oci:ro" \
+  -v "$work/names.txt:/in/names.txt:ro" \
+  -v "$work/canaries.txt:/in/canaries.txt:ro" \
+  -v "$work/keyrings:/in/keyrings:ro" \
+  -v "$work/verify.sh:/in/verify.sh:ro" \
+  "$image" bash /in/verify.sh "$repo" "$arch" "$server" "$second_repo" "$second_server" "$keyrings" "$keyring_repo" \
+  "$db_siglevel" "$FILES_SHA256" >> "$log_file" 2>&1 || rc=$?
+phase "container ended with status $rc"
+
+count="$(awk 'END { print NR + 0 }' "$batch_file")"
+if [ "$rc" -eq 0 ]; then
+  verdict passed "$count package(s) read through the wrapper and checked by pacman"
+  exit 0
+fi
+tail -n 40 "$log_file" >&2
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+  c="$(culprits_so_far)"
+  verdict failed "the own budget ran out: VERIFY_BUDGET=${BUDGET}s, the container was stopped after ${remaining}s (status $rc)${c:+; at fault so far: $c}"
+  exit 1
+fi
+if ! grep -q '^@@done$' "$log_file"; then
+  c="$(culprits_so_far)"
+  verdict failed "the container ended with status $rc before its last phase${c:+; at fault so far: $c}"
   exit 1
 fi
 
-rc=0
-timeout --kill-after=30 5400 "$RUNTIME" run --rm --platform "$platform" "${net_args[@]}" \
-  -v "$work/trust.asc:/in/trust.asc:ro" \
-  -v "$work/pacman-oci:/in/pacman-oci:ro" \
-  -v "$work/names.txt:/in/names.txt:ro" \
-  -v "$work/verify.sh:/in/verify.sh:ro" \
-  "$image" bash /in/verify.sh "$repo" "$server" "$keyring" "$files_db" "$db_siglevel" > "$log_file" 2>&1 || rc=$?
+#---------------------------------------------------------------------------#
+# Every package at fault: upstream-refused, or the batch fails
+#---------------------------------------------------------------------------#
+sigbad="$(awk -F '\t' '$1 == "@@sigbad" { n++ } END { print n + 0 }' "$log_file")"
+awk -F '\t' '$1 == "@@refused" && !seen[$2]++ { print $2 }' "$log_file" > "$work/refused-names.txt"
+sources=()
+mapfile -t sources < <(target_sources "$conf")
 
-if [ "$rc" -eq 0 ]; then
-  verdict passed "$(awk 'END { print NR + 0 }' "$names") package(s) read through the wrapper and checked by pacman"
+# upstream_refused NAME CLASS -> 0 when the mirror serves exactly upstream's
+# file and signature for NAME; sets refused_why either way
+refused_why=""
+upstream_refused() {
+  local name="$1" class="$2" file sha csize pgpsig sig_sha="" tag rc decision layer s got
+  IFS=$'\t' read -r file _ _ _ sha csize _ pgpsig <<<"$(awk -F '\t' -v n="$name" '$2 == n' "$stage/$target/records.tsv")"
+  if [ -z "${file:-}" ]; then
+    refused_why="the staged records name no package $name"
+    return 1
+  fi
+  if [ -n "$pgpsig" ]; then
+    printf '%s' "$pgpsig" | base64 -d > "$work/refused.sig"
+    sig_sha="$(sha256sum "$work/refused.sig" | cut -d ' ' -f 1)"
+  fi
+  tag="$("$WRAPPER" --tag "$file")"
+  rc=0
+  REGISTRY_TOKEN='' registry_manifest "$repo_path" "$tag" "$work/refused.json" || rc=$?
+  if [ "$rc" -ne "$REG_STATUS_OK" ]; then
+    refused_why="its tag $repo_path:$tag does not read (status $rc)"
+    return 1
+  fi
+  decision="$(decide_push "$work/refused.json" "$file" "$sha" "$csize" "$sig_sha")"
+  case "$class" in
+    sig-refused)
+      if [ "$decision" != present ]; then
+        refused_why="its tag does not hold the database's bytes and signature ($decision)"
+        return 1
+      fi
+      [ -z "$sig_sha" ] || return 0
+      # No %PGPSIG%: the layer must be the .sig upstream serves now.
+      read -r layer _ _ <<< "$(manifest_layer "$work/refused.json" "$file.sig")"
+      for s in "${sources[@]}"; do
+        rc=0
+        fetch_upstream "$s/$file.sig" "$work/upstream.sig" 60 || rc=$?
+        case "$rc" in
+          0)
+            got="sha256:$(sha256sum "$work/upstream.sig" | cut -d ' ' -f 1)"
+            if [ "$got" = "$layer" ]; then
+              return 0
+            fi
+            refused_why="its signature layer is $layer, and $s/$file.sig is $got"
+            return 1
+            ;;
+          4) ;;
+          *)
+            refused_why="$s/$file.sig did not answer, so upstream's signature is not known"
+            return 1
+            ;;
+        esac
+      done
+      refused_why="no server serves $file.sig, and the tag holds one"
+      return 1
+      ;;
+    sig-missing)
+      if [ -n "$sig_sha" ] || [ "$decision" != needsig ]; then
+        refused_why="the database or the tag has a signature for it, and pacman read none ($decision)"
+        return 1
+      fi
+      for s in "${sources[@]}"; do
+        rc=0
+        fetch_upstream "$s/$file.sig" "$work/upstream.sig" 60 || rc=$?
+        if [ "$rc" -ne 4 ]; then
+          refused_why="$s/$file.sig answered (status $rc), so upstream may sign it"
+          return 1
+        fi
+      done
+      return 0
+      ;;
+  esac
+  refused_why="pacman refused it for a reason that is not in its signature"
+  return 1
+}
+
+refused=0
+others=""
+: > "$work/refused.tsv"
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  awk -F '\t' -v p="$p" '$1 == "@@log" && $2 == p { sub(/^[^\t]*\t[^\t]*\t/, ""); print }' "$log_file" > "$work/one.log"
+  read -r pkg_rc sig_rc <<< "$(awk -F '\t' -v p="$p" '$1 == "@@probe" && $2 == p { r = $3 " " $4 } END { print (r == "" ? "x x" : r) }' "$log_file")"
+  IFS=$'\t' read -r class line <<< "$(refusal_reason "$work/one.log" "$pkg_rc" "$sig_rc")"
+  if upstream_refused "$p" "$class"; then
+    refused=$((refused + 1))
+    printf '%s\t%s: %s\n' "$(awk -F '\t' -v n="$p" '$2 == n { print $1 }' "$stage/$target/records.tsv")" "$class" "$line" >> "$work/refused.tsv"
+    log "$p: upstream-refused, $class: $line"
+  else
+    others="$others $p ($class: $line; $refused_why);"
+  fi
+done < "$work/refused-names.txt"
+if [ "$refused" -gt 0 ]; then
+  cp "$work/refused.tsv" "$refused_file"
+fi
+
+# Upstream-refused is believed only once the trust root is seen to work: a
+# keyring package installed with its signature checked, or one package of the
+# batch that pacman accepted. A trust root that accepts nothing would refuse
+# every package for a signature reason, and excuse them all.
+if [ "$refused" -gt 0 ] && [ -z "$others" ] && ! grep -q '^@@trust' "$log_file" &&
+  [ "$(awk 'END { print NR + 0 }' "$work/refused-names.txt")" -ge "$count" ]; then
+  others=" every package of the batch was refused, and no keyring package was installed: the trust root is not seen to accept anything;"
+fi
+
+if [ "$sigbad" -eq 0 ] && [ -z "$others" ] && [ "$refused" -gt 0 ]; then
+  verdict passed "$count package(s) read through the wrapper and checked by pacman; $refused of them upstream-refused, pacman refuses them from upstream too: $(cut -f 1 "$refused_file" | tr '\n' ' ' | sed 's/ $//')"
   exit 0
 fi
-culprits="$(sed -n 's/^CULPRIT //p' "$log_file" | tr '\n' ' ')"
-tail -n 40 "$log_file" >&2
-verdict failed "the batch failed its checks (status $rc)${culprits:+; at fault: $culprits}"
+c="$(awk -F '\t' '$1 == "@@sigbad" && !seen[$2]++ { s = s " " $2 ": " $3 ";" } END { print substr(s, 2) }' "$log_file")"
+also=""
+if [ "$refused" -gt 0 ]; then
+  also=" $refused upstream-refused besides: $(cut -f 1 "$refused_file" | tr '\n' ' ' | sed 's/ $//')"
+fi
+verdict failed "the batch failed its checks (status $rc); at fault:${others}${c:+ $c}${also}"
 exit 1

@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 #
-# Build the integration suite's upstream: a small signed pacman repository.
-# Runs inside an Arch container, as the calling user, with the upstream root
-# mounted at /out.
+# Build one of the integration suite's upstream repositories: a small signed
+# pacman repository. Runs inside an Arch container, as the calling user, with
+# the upstream root mounted at /out.
 #
-#   bash build-repo STATE [DIR]
+#   bash build-repo STATE [DIR] [DB]
 #
-# Writes /out/x86_64/DIR (default test). STATE names the contents:
+# Writes /out/DIR (default x86_64/test) with the database DB.db (default test).
+# STATE names the contents. For the main target, x86_64/test:
 #   one        alpha (an epoch and a +), beta_pc (_ before p and c), gamma 3.0-1
-#   two        as one, with gamma 3.0-2 built later
+#   two        as one, with gamma 3.0-2 built later, and eta signed by the
+#              second key, which only the keyring package of x86_64/kr trusts
+#   resigned   as two, with alpha signed again: the same bytes, a new signature
+#   four       as two, with theta 1-1 added, the largest package
 #   replaced   as two, with beta_pc rebuilt under the same filename
 #   three      as two, with delta 1-1 added
 #   ahead-alpha  as two, with alpha rebuilt later
@@ -17,36 +21,98 @@
 #   untrusted  as two, with epsilon signed by a key no one trusts
 #   nopgpsig   as two, with zeta added, and a database that carries no
 #              %PGPSIG%: the detached .sig files are the only signatures, as on
-#              most of ArchPOWER and archriscv
+#              most of archriscv and loong64 core
+#   nopgpsig-four  as nopgpsig, with theta 1-1 added
+# For the other targets:
+#   keyring    test-keyring 1-1 (x86_64/kr): the keyring files of the first and
+#              the second key, under /usr/share/pacman/keyrings
+#   port       an aarch64 repository (aarch64/port): port 1-1 aarch64; unsigned
+#              1-1, which upstream signs nowhere; expired 1-1, signed by a key
+#              that has since expired; and ghost-1-1, a package directory whose
+#              desc is a GNU sparse member of NUL bytes only, as aarch64 extra
+#              findnewest-0.3-4 is upstream
+#   port-junk  as port, with junk-1-1/desc holding bytes that are no record
 #
-# Every other state's database carries %PGPSIG% for every package, as Arch's
-# own core and extra do. pacman 7's repo-add embeds a signature only when given
-# --include-sigs; without it the suite would never take the %PGPSIG% path that
-# every real core package takes.
+# Every database carries %PGPSIG% for every signed package, as Arch's own core
+# and extra do, except nopgpsig. pacman 7's repo-add embeds a signature only
+# when given --include-sigs; without it the suite would never take the
+# %PGPSIG% path that every real core package takes.
 #
-# Package bytes are fixed by their inputs, so a state built twice gives the
-# same package files; that is what lets the suite go back to an earlier state
-# and see the mirror refuse it.
+# Keys, made once per suite run in /out: gnupg (the test key, which the trust
+# root holds), gnupg-second (only the keyring package holds it),
+# gnupg-untrusted and gnupg-expired (made and used with a clock 10 days back,
+# valid for one day). /out/test.asc is the test key alone; /out/trust-root
+# holds the keyring files the suite's keyring image carries: the test key and
+# the expired one.
+#
+# ⭐ Package bytes are fixed by their inputs, and each distinct package file is
+# signed once per suite run: its .sig is kept in /out/sigcache by the file's
+# sha256 and reused whenever the same bytes are built again, as upstream never
+# signs a published file twice. So a state built twice gives the same package
+# files and the same signatures, which is what lets the suite go back to an
+# earlier state and see the mirror refuse it. resigned is the one exception,
+# made on purpose: it replaces alpha's kept signature.
 set -euo pipefail
 
-state="${1:?usage: build-repo STATE [DIR]}"
-repo="/out/x86_64/${2:-test}"
+state="${1:?usage: build-repo STATE [DIR] [DB]}"
+repo="/out/${2:-x86_64/test}"
+db="${3:-test}"
 export GNUPGHOME=/out/gnupg
 
+# mkkey HOME UID [FAKED-TIME]
+mkkey() {
+  local faked=()
+  if [ -n "${3:-}" ]; then
+    faked=(--faked-system-time "$3")
+  fi
+  mkdir -p "$1"
+  chmod 0700 "$1"
+  GNUPGHOME="$1" gpg --batch "${faked[@]}" --passphrase '' --quick-gen-key "$2" ed25519 sign "${4:-never}"
+}
+
+# fpr_of HOME -> the fingerprint of the one key in HOME
+fpr_of() {
+  GNUPGHOME="$1" gpg --batch --with-colons --list-keys | awk -F : '$1 == "fpr" && f == "" { f = $10 } END { print f }'
+}
+
 if [ ! -d "$GNUPGHOME" ]; then
-  mkdir -p -m 0700 "$GNUPGHOME"
-  gpg --batch --passphrase '' --quick-gen-key 'mirror-archlinux test <test@example.invalid>' ed25519 sign never
+  past="$(date -u -d '10 days ago' +%Y%m%dT%H%M%S)"
+  mkkey "$GNUPGHOME" 'mirror-archlinux test <test@example.invalid>'
+  mkkey /out/gnupg-second 'mirror-archlinux second key <second@example.invalid>'
+  mkkey /out/gnupg-untrusted 'untrusted <nobody@example.invalid>'
+  mkkey /out/gnupg-expired 'mirror-archlinux expired key <expired@example.invalid>' "$past!" 1d
   gpg --armor --export > /out/test.asc
-fi
-if [ "$state" = untrusted ] && [ ! -d /out/gnupg-untrusted ]; then
-  mkdir -p -m 0700 /out/gnupg-untrusted
-  GNUPGHOME=/out/gnupg-untrusted gpg --batch --passphrase '' --quick-gen-key 'untrusted <nobody@example.invalid>' ed25519 sign never
+  mkdir -p /out/trust-root /out/keyring-files
+  # The suite's trust root: the test key and the expired one.
+  { gpg --export; GNUPGHOME=/out/gnupg-expired gpg --export; } > /out/trust-root/test.gpg
+  printf '%s:4:\n' "$(fpr_of "$GNUPGHOME")" "$(fpr_of /out/gnupg-expired)" > /out/trust-root/test-trusted
+  : > /out/trust-root/test-revoked
+  # The keyring package: the test key and the second key.
+  { gpg --export; GNUPGHOME=/out/gnupg-second gpg --export; } > /out/keyring-files/test.gpg
+  printf '%s:4:\n' "$(fpr_of "$GNUPGHOME")" "$(fpr_of /out/gnupg-second)" > /out/keyring-files/test-trusted
+  : > /out/keyring-files/test-revoked
+  mkdir -p /out/sigcache
 fi
 
 rm -rf "$repo"
 mkdir -p "$repo"
 
-# mkpkg NAME VERSION ARCH BUILDDATE CONTENT [GNUPGHOME]
+# sign FILE HOME [fresh]: FILE.sig, made once per distinct file and key
+sign() {
+  local file="$1" home="$2" sum cached faked=()
+  sum="$(sha256sum "$file" | cut -d ' ' -f 1)"
+  cached="/out/sigcache/$sum-$(basename "$home").sig"
+  if [ ! -f "$cached" ] || [ "${3:-}" = fresh ]; then
+    if [ "$home" = /out/gnupg-expired ]; then
+      faked=(--faked-system-time "$(date -u -d '10 days ago 1 hour' +%Y%m%dT%H%M%S)!")
+    fi
+    GNUPGHOME="$home" gpg --batch --yes "${faked[@]}" --detach-sign --no-armor -o "$cached.tmp" "$file"
+    mv -f "$cached.tmp" "$cached"
+  fi
+  cp "$cached" "$file.sig"
+}
+
+# mkpkg NAME VERSION ARCH BUILDDATE CONTENT [GNUPGHOME|none] [fresh]
 mkpkg() {
   local name="$1" version="$2" arch="$3" built="$4" content="$5" home="${6:-$GNUPGHOME}" d file
   d="$(mktemp -d)"
@@ -64,15 +130,67 @@ size = 64
 arch = $arch
 license = MIT
 EOF
+  local paths=(.PKGINFO usr)
+  if [ "$name" = test-keyring ]; then
+    mkdir -p "$d/usr/share/pacman/keyrings"
+    cp /out/keyring-files/test.gpg /out/keyring-files/test-trusted /out/keyring-files/test-revoked "$d/usr/share/pacman/keyrings/"
+    touch -d "@$built" "$d"/usr/share/pacman/keyrings/* "$d/usr/share/pacman/keyrings" "$d/usr/share/pacman"
+  fi
   touch -d "@$built" "$d/.PKGINFO" "$d/usr/share/mirror-test/$name" "$d/usr/share/mirror-test" "$d/usr/share" "$d/usr"
   file="$name-$version-$arch.pkg.tar.zst"
-  (cd "$d" && bsdtar --zstd --uid 0 --gid 0 --uname root --gname root -cf "$repo/$file" .PKGINFO usr)
-  GNUPGHOME="$home" gpg --batch --yes --detach-sign --no-armor -o "$repo/$file.sig" "$repo/$file"
+  (cd "$d" && bsdtar --zstd --uid 0 --gid 0 --uname root --gname root -cf "$repo/$file" "${paths[@]}")
+  if [ "$home" != none ]; then
+    sign "$repo/$file" "$home" "${7:-}"
+  fi
   rm -rf "$d"
 }
 
+# add_member DB.tar.gz DIR nul|junk: a package directory with a desc that
+# gives no record, appended to the database
+add_member() {
+  local t
+  t="$(mktemp -d)"
+  gzip -dc "$1" > "$t/db.tar"
+  mkdir -p "$t/m/$2"
+  if [ "$3" = nul ]; then
+    # A file of holes only: GNU tar stores it as a sparse member with no data,
+    # which reads back as NUL bytes.
+    truncate -s 1271 "$t/m/$2/desc"
+  else
+    printf 'bytes that are no record\n' > "$t/m/$2/desc"
+  fi
+  (cd "$t/m" && tar --sparse --format=posix -rf "$t/db.tar" "$2/desc")
+  gzip -9 -n -c "$t/db.tar" > "$1"
+  rm -rf "$t"
+}
+
+case "$state" in
+  keyring)
+    mkpkg test-keyring 1-1 any 1700000050 "the keyring of the test keys"
+    repo-add --quiet --include-sigs "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
+    ls -l "$repo"
+    exit 0
+    ;;
+  port | port-junk)
+    mkpkg port 1-1 aarch64 1700000000 "an aarch64 package"
+    mkpkg unsigned 1-1 any 1700000010 "upstream signs this nowhere" none
+    mkpkg expired 1-1 any 1700000020 "signed by a key that has since expired" /out/gnupg-expired
+    repo-add --quiet --include-sigs "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
+    for f in "$db.db.tar.gz" "$db.files.tar.gz"; do
+      add_member "$repo/$f" ghost-1-1 nul
+      if [ "$state" = port-junk ]; then
+        add_member "$repo/$f" junk-1-1 junk
+      fi
+    done
+    tar -tvf "$repo/$db.db.tar.gz"
+    ls -l "$repo"
+    exit 0
+    ;;
+esac
+
 case "$state" in
   ahead-alpha) mkpkg alpha 1:1.0+r3-1 any 1700300000 "alpha rebuilt later" ;;
+  resigned) mkpkg alpha 1:1.0+r2-1 any 1700000000 "alpha one" "$GNUPGHOME" fresh ;;
   *) mkpkg alpha 1:1.0+r2-1 any 1700000000 "alpha one" ;;
 esac
 case "$state" in
@@ -84,24 +202,32 @@ case "$state" in
   ahead-gamma) mkpkg gamma 3.0-3 any 1700500000 "gamma three" ;;
   *) mkpkg gamma 3.0-2 any 1700100200 "gamma two" ;;
 esac
+if [ "$state" != one ]; then
+  mkpkg eta 1-1 any 1700150000 "eta, signed by the second key" /out/gnupg-second
+fi
 if [ "$state" = three ]; then
   mkpkg delta 1-1 any 1700200000 "delta one"
+fi
+if [ "$state" = four ] || [ "$state" = nopgpsig-four ]; then
+  # Larger than any other package, so the smallest one, verify's canary, is a
+  # file the plan skips.
+  mkpkg theta 1-1 any 1700700000 "$(for i in $(seq 1 25); do printf 'theta %s\n' "$i" | sha256sum | cut -d ' ' -f 1; done)"
 fi
 if [ "$state" = untrusted ]; then
   mkpkg epsilon 1-1 any 1700400000 "epsilon, signed by a stranger" /out/gnupg-untrusted
 fi
-if [ "$state" = nopgpsig ]; then
+if [ "$state" = nopgpsig ] || [ "$state" = nopgpsig-four ]; then
   mkpkg zeta 1-1 any 1700600000 "zeta, signed beside the database only"
   # Without --include-sigs repo-add embeds none; the signatures are also hidden
   # while it runs, so the database carries none whatever its default becomes.
   mkdir -p "$repo/.sigs"
   mv "$repo"/*.sig "$repo/.sigs/"
-  repo-add --quiet "$repo/test.db.tar.gz" "$repo"/*.pkg.tar.zst
+  repo-add --quiet "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
   mv "$repo"/.sigs/*.sig "$repo/"
   rmdir "$repo/.sigs"
   ls -l "$repo"
   exit 0
 fi
 
-repo-add --quiet --include-sigs "$repo/test.db.tar.gz" "$repo"/*.pkg.tar.zst
+repo-add --quiet --include-sigs "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
 ls -l "$repo"

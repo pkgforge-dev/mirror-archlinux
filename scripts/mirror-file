@@ -7,10 +7,12 @@
 #   scripts/mirror-file SHARD.tsv LINE
 #
 # LINE is a line number of SHARD.tsv, a work line from scripts/plan:
-#   target filename tag sha256 csize name action pgpsig
+#   target filename tag sha256 csize name action builddate pgpsig
 #
-# One result line is written to $RESULTS/LINE.tsv whatever happens, by the EXIT
-# trap when nothing else wrote it, so an item that is killed is still counted:
+# One result line is written to $RESULTS/LINE.tsv as soon as the item ends,
+# whatever happens, by the EXIT trap when nothing else wrote it, so an item
+# that is killed is still counted, and a shard that runs out of time keeps
+# the results of every item that ended:
 #   target filename status seconds detail
 #
 #   pushed    pushed now, and read back holding this file and its signature
@@ -31,9 +33,15 @@
 # is absent only when every server answers 404 for it, and then the file is
 # mirrored unsigned, as upstream ships it, and counts as present from then on.
 #
+# ⭐ The manifest is the same bytes whoever pushes it: its created annotation is
+# the package's %BUILDDATE%, and no annotation names the server the bytes came
+# from (the result line does). Two writers of one file push one manifest.
+#
 # Environment: RESULTS, WORK, ORAS, ORAS_CONFIG, SHARD_INDEX, MIRROR_NAMESPACE,
-# REGISTRY_USER, REGISTRY_TOKEN, MIRROR_MIN_RATE (bytes per second a push may
-# not fall below; default 2097152).
+# REGISTRY_USER, REGISTRY_TOKEN, REGISTRY_TOKEN_CACHE (lib.sh), MIRROR_MIN_RATE
+# (bytes per second a push may not fall below; default 2097152). A push
+# attempt gets 300 s plus the time at that rate, and never more than 600 s,
+# GHCR's limit for one upload.
 #
 # Exit status: 0 pushed or present, 1 anything else.
 set -euo pipefail
@@ -71,8 +79,9 @@ on_exit() {
 }
 trap on_exit EXIT
 
-IFS=$'\t' read -r target file tag sha256 csize name _ pgpsig < <(sed -n "${line}p" "$shard")
+IFS=$'\t' read -r target file tag sha256 csize name _ builddate pgpsig < <(sed -n "${line}p" "$shard")
 [ -n "${target:-}" ] && [ -n "${file:-}" ] || die "line $line of $shard is empty"
+created="$(iso_of_epoch "${builddate:-}")" || die "line $line of $shard has build date '${builddate:-}', not seconds since the epoch"
 
 conf="$TARGETS_DIR/$target.conf"
 target_check "$conf"
@@ -220,18 +229,21 @@ fi
 # the media type at the last colon, after any : in the version.
 #---------------------------------------------------------------------------#
 deadline=$((300 + csize / MIN_RATE))
+if [ "$deadline" -gt 600 ]; then
+  deadline=600
+fi
 source_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}"
 mapfile -t oargs < <(oras_args)
 push_args=(
   push "${oargs[@]}"
   --artifact-type application/vnd.pkgforge.archlinux.package.v1
+  --annotation "org.opencontainers.image.created=$created"
   --annotation "org.opencontainers.image.source=$source_url"
   --annotation "org.opencontainers.image.title=$file"
   --annotation "dev.pkgforge.mirror.arch=$arch"
   --annotation "dev.pkgforge.mirror.repo=$repo"
   --annotation "dev.pkgforge.mirror.pkgname=$name"
   --annotation "dev.pkgforge.mirror.sha256=$sha256"
-  --annotation "dev.pkgforge.mirror.upstream=$got_from"
   "$ref"
   "./$file:$PKG_MEDIA_TYPE"
 )
