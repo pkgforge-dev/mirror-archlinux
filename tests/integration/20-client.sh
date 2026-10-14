@@ -203,9 +203,9 @@ done
 # two absent database signatures are empty files, which pacman removes, so -Sy
 # pauses never. With no sandbox they stay misses, so -Sy pauses twice.
 want main-du sy_empty_sig 2 "both absent database signatures are answered with an empty file"
-want_cmp main-du sy_ms lt 1900 "-Sy of two repositories takes less than one 2 s pause"
+want_cmp main-du sy_wall_ms lt 1900 "-Sy of two repositories takes less than one 2 s pause"
 want main-root sy_empty_sig 0 "with no sandbox, an absent database signature stays a miss"
-want_cmp main-root sy_ms ge 4000 "with no sandbox, pacman pauses 2 s after each absent signature"
+want_cmp main-root sy_wall_ms ge 4000 "with no sandbox, pacman pauses 2 s after each absent signature"
 
 consumer noprefetch "$SERVER"
 want noprefetch s_rc 0 "PACMAN_OCI_PREFETCH=0: pacman -S succeeds"
