@@ -10,12 +10,13 @@
 #           branch status as one orphan commit, and the site to Pages as an
 #           artifact
 #   deploy  actions/deploy-pages, on main, when Pages takes a workflow build
+#   worker  on main: raises or clears worker-down from the record build pushed
 #
 # ⚠ A person enables Pages once, with an admin token. GITHUB_TOKEN cannot:
 #   gh api -X POST repos/pkgforge-dev/mirror-archlinux/pages -f build_type=workflow
 # Until then deploy says so in a notice and deploys nothing.
 #
-# The status branch holds the history the next run reads. watchdog.yml reads
+# The status branch holds the history the next run reads. The worker job reads
 # status.json and worker.md from it to raise worker-down.
 name: Status
 

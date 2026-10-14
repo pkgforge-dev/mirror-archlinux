@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Measure what the mirror serves against what upstream serves, for the status
-# page and the watchdog.
+# page and the worker-down check of status.yml.
 #
 #   scripts/status-collect OUT [TARGET.conf ...]
 #

@@ -6,7 +6,7 @@
 # registry and every file new since the promoted database has passed pacman's
 # own checks through the wrapper. Targets are independent: each runs its own
 # chain, and a slow or held target never delays or holds another.
-# HISTORY/design.md has the whole design.
+# docs/design.md has the whole design.
 #
 # promote runs only on main. A run from any other branch does everything else,
 # writes only write-once package tags and its own staging-<branch> tag, and

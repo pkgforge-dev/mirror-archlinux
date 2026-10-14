@@ -53,8 +53,8 @@
 # DownloadUser set (stock Arch) it runs as that user, from a download-XXXXXX
 # directory inside the sync or cache directory; without it, as root.
 #
-# Needs curl, awk, sed, sha256sum, mktemp, base64 (coreutils or busybox). Uses
-# pacman, pacman-conf and timeout when they are there.
+# Needs curl, awk, sed, grep, sha256sum, mktemp, base64 (coreutils or busybox).
+# Uses pacman, pacman-conf and timeout when they are there.
 #
 # Environment:
 #   PACMAN_OCI_DEBUG=1       print every request and decision to stderr
@@ -66,6 +66,8 @@
 #   PACMAN_OCI_NO_DUMMY=1    skip the dummy token GHCR accepts for public
 #                            packages and use the registry's token flow, with no
 #                            prefetch; it exists so that flow runs on schedule
+#   PACMAN_OCI_EMPTY_SIG=0   no empty answer for an absent database signature
+#                            under the sandbox of pacman 7.0 and 7.1
 #   PACMAN_OCI_TEST_PROC=DIR for the test suite only: read the parent process
 #                            from DIR, not /proc. Used only when DIR holds a
 #                            file named pacman-oci-test-proc.
@@ -110,6 +112,7 @@ debug() {
 #   ,down.HOST     HOST failed once its retries were spent
 #   ,absent.FILE   the database manifest of this run has no layer FILE
 #   ,index         FILE<TAB>SHA256<TAB>SIZE of each package the prefetch planned
+#   ,pacver        the version of the parent pacman, asked once per run
 #   ,reaper        the background remover's output
 #   tmp.*          files being written
 #---------------------------------------------------------------------------#

@@ -1,5 +1,5 @@
 # Measure the outcome, not the runs: has each target's latest stopped
-# following upstream? Have the schedules stopped firing? Does the Worker
+# following upstream? Have the schedules stopped firing?
 #
 # ⭐ sync.yml's keepalive job runs the same schedule checks, so each workflow
 # witnesses the other. A schedule that stops firing leaves no run behind to

@@ -9,7 +9,7 @@
 # ⛔ The version and both checksums are written here, not fetched. A checksum
 # read from the same release it checks proves only that the release is
 # self-consistent. These were read from the v1.3.4 release's checksums.txt on
-# 2026-10-13 and match the measurement in HISTORY/design.md.
+# 2026-10-13, as docs/measurements.md records.
 #
 # ⭐ oras is stable and nothing here follows its releases. A newer version is a
 # deliberate edit of the three lines below and nothing else.

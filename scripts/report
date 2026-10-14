@@ -220,7 +220,7 @@ while IFS=$'\t' read -r target state why; do
         sed -n 1,50p "$d/replaced.tsv"
         printf '```\n\n'
       fi
-      printf 'A person decides: wait for upstream to publish a new filename, or accept the new bytes under a new tag (HISTORY/design.md, write-once tags).\n\nRun: %s\n' "$run_url"
+      printf 'A person decides: wait for upstream to publish a new filename, or accept the new bytes under a new tag (docs/design.md, rules).\n\nRun: %s\n' "$run_url"
     } > "$work/body.md"
     track "replaced-$target" raise "$target: a package tag would have to change" "$work/body.md"
   fi

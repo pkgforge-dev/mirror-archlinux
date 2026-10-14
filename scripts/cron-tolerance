@@ -45,7 +45,7 @@
 # 1, so a schedule expected four times a day is given three days of grace. It
 # would still catch a stop, later than it could have. sync.yml fires every
 # three hours and so gets three days; that is the accepted cost of reusing a
-# measured, day-resolution routine (HISTORY/design.md, the watchdog).
+# measured, day-resolution routine (docs/operations.md, staleness).
 #
 # Exit status:
 #   0  a tolerance was derived and printed

@@ -35,7 +35,7 @@
 # Environment:
 #   GITHUB_REPOSITORY  owner/name, default read from the origin remote
 #   SCHEDULES_TODAY    the date to measure against, YYYY-MM-DD, default today in
-#                      UTC. ⚠ For fault injection only. HISTORY/tests-seen-to-fail.md
+#                      UTC. ⚠ For fault injection only. docs/tests.md
 #
 # Needs a token with actions:read. GH_TOKEN in CI, gh's own login locally.
 #
