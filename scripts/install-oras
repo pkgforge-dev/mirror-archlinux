@@ -14,6 +14,11 @@
 # ⭐ oras is stable and nothing here follows its releases. A newer version is a
 # deliberate edit of the three lines below and nothing else.
 #
+# Environment: ORAS_CACHE, a directory that keeps the release archive between
+# calls, so a test suite that installs oras for every step downloads it once.
+# The archive in it is checked against the pinned sha256 on every use, the
+# same as a fresh download, and one that differs is not used.
+#
 # Exit status: 0 installed, 1 could not.
 set -euo pipefail
 
@@ -54,15 +59,31 @@ trap 'rm -rf "$work"' EXIT
 
 asset="oras_${ORAS_VERSION}_linux_${arch}.tar.gz"
 url="https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/${asset}"
-rc=0
-curl -q --fail --location --silent --show-error --connect-timeout 20 --max-time 300 \
-  --retry 3 --retry-connrefused --retry-delay 2 --output "$work/$asset" "$url" || rc=$?
-[ "$rc" -eq 0 ] || die "could not download $url (curl $rc)" "reproduce: curl -fLO $url"
+cached=""
+if [ -n "${ORAS_CACHE:-}" ] && [ -f "$ORAS_CACHE/$asset" ]; then
+  if [ "$(sha256sum "$ORAS_CACHE/$asset" | cut -d ' ' -f 1)" = "$want" ]; then
+    cp "$ORAS_CACHE/$asset" "$work/$asset"
+    cached=1
+  else
+    echo "install-oras: $ORAS_CACHE/$asset does not hash to the pinned $want; downloading again" >&2
+  fi
+fi
+if [ -z "$cached" ]; then
+  rc=0
+  curl -q --fail --location --silent --show-error --connect-timeout 20 --max-time 300 \
+    --retry 3 --retry-connrefused --retry-delay 2 --output "$work/$asset" "$url" || rc=$?
+  [ "$rc" -eq 0 ] || die "could not download $url (curl $rc)" "reproduce: curl -fLO $url"
+fi
 
 got="$(sha256sum "$work/$asset" | cut -d ' ' -f 1)"
 [ "$got" = "$want" ] || die "$asset has sha256 $got, pinned $want" \
   "a release asset that changed after it was published is not installed" \
   "reproduce: curl -fsSL $url | sha256sum"
+if [ -n "${ORAS_CACHE:-}" ] && [ -z "$cached" ]; then
+  mkdir -p "$ORAS_CACHE"
+  cp "$work/$asset" "$ORAS_CACHE/$asset.tmp.$$"
+  mv -f "$ORAS_CACHE/$asset.tmp.$$" "$ORAS_CACHE/$asset"
+fi
 
 tar -xzf "$work/$asset" -C "$work" oras
 install -m 0755 "$work/oras" "$dest/oras"

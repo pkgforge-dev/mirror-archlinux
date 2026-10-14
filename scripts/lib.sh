@@ -72,9 +72,22 @@ need() {
 # targets/<arch>-<repo>.conf: `key = value` lines, # comments, a key may repeat
 # where the list below says so. An unknown key is an error: a typo that is
 # ignored is a setting that silently does nothing.
+#
+# The keys that set the trust root of verify (scripts/verify-batch):
+#   keyring           the keyring packages, space separated. verify installs
+#                     them from the snapshot, then populates again.
+#   keyring_from      a target <arch>-<repo> of the same arch whose promoted
+#                     latest holds the keyring packages, when the target's own
+#                     repository does not.
+#   keyring_image     an image name:tag@sha256:<64 hex> whose
+#                     /usr/share/pacman/keyrings/* is copied into the verify
+#                     container before the first populate. Nothing in it runs.
+#   keyring_platform  the platform of keyring_image, e.g. linux/arm64.
 #---------------------------------------------------------------------------#
-TARGET_KEYS_ONCE="arch repo verify_image verify_platform keyring enabled db_signed"
+TARGET_KEYS_ONCE="arch repo verify_image verify_platform keyring keyring_from keyring_image keyring_platform enabled db_signed"
 TARGET_KEYS_MANY="server db_server"
+# An image pinned by digest, with a tag Renovate can follow.
+IMAGE_PIN_RE='^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$'
 
 # target_check CONF -> exit 0, or die naming the line
 target_check() {
@@ -96,7 +109,7 @@ target_check() {
       printf "%s:%d: unknown key %s\n", f, NR, k; bad = 1
     }
     END { exit bad }
-  ' "$conf" >&2 || die "$conf is not a valid target file" "reproduce: scripts/target check $conf"
+  ' "$conf" >&2 || die "$conf is not a valid target file" "reproduce: bash -c '. scripts/lib.sh; target_check $conf'"
   local arch repo
   arch="$(target_get "$conf" arch)"
   repo="$(target_get "$conf" repo)"
@@ -108,6 +121,42 @@ target_check() {
     '' | yes | no) ;;
     *) die "$conf: db_signed must be yes or no" ;;
   esac
+
+  # The trust root of verify. read -a splits without glob expansion.
+  local keyrings k image platform from
+  keyrings="$(target_get "$conf" keyring)"
+  local names=()
+  read -r -a names <<< "$keyrings"
+  for k in "${names[@]}"; do
+    [[ "$k" =~ ^[a-z0-9@_+][a-z0-9@._+-]*$ ]] || die "$conf: keyring '$k' is not a package name"
+  done
+  image="$(target_get "$conf" keyring_image)"
+  platform="$(target_get "$conf" keyring_platform)"
+  if [ -n "$image" ]; then
+    [[ "$image" =~ $IMAGE_PIN_RE ]] || die "$conf: keyring_image '$image' is not name:tag@sha256:<64 hex>"
+    [ -n "$platform" ] || die "$conf: keyring_image needs keyring_platform, the platform to pull it for"
+  fi
+  if [ -n "$platform" ]; then
+    [ -n "$image" ] || die "$conf: keyring_platform is set and keyring_image is not"
+    [[ "$platform" =~ ^linux/[a-z0-9]+(/v[0-9]+)?$ ]] || die "$conf: keyring_platform '$platform' is not linux/<arch>[/v<n>]"
+  fi
+  from="$(target_get "$conf" keyring_from)"
+  if [ -n "$from" ]; then
+    [ "${#names[@]}" -gt 0 ] || die "$conf: keyring_from is set and keyring names no package"
+    [[ "$from" =~ ^[a-z0-9]+(_[a-z0-9]+)*-[a-z0-9]+([.-][a-z0-9]+)*$ ]] || die "$conf: keyring_from '$from' is not a target name <arch>-<repo>"
+    [ "$from" != "$arch-$repo" ] || die "$conf: keyring_from names the target itself; leave it out instead"
+    [ "${from%%-*}" = "$arch" ] || die "$conf: keyring_from '$from' is another arch than $arch"
+    [ -f "$(dirname "$conf")/$from.conf" ] || die "$conf: keyring_from names $from, and there is no $(dirname "$conf")/$from.conf"
+  fi
+}
+
+# target_keyrings CONF -> the keyring packages, one per line
+target_keyrings() {
+  local names=() k
+  read -r -a names <<< "$(target_get "$1" keyring)"
+  for k in "${names[@]}"; do
+    printf '%s\n' "$k"
+  done
 }
 
 # target_sources CONF -> every server package bytes may come from: the
@@ -294,6 +343,76 @@ db_validate() {
   ' "$1"
 }
 
+# db_check DB RECORDS -> 0 when DB is a whole, well-formed database, with its
+# records in RECORDS (db_records) and the package directories it cannot read
+# in RECORDS.nul. Otherwise 1, and one line on stdout says why.
+#
+# Every package directory must give exactly one record, named after it. The
+# one exception is a desc member that holds nothing but NUL bytes, or nothing:
+# it carries no field at all, pacman lists it with every field None and cannot
+# download it, so nothing is lost by passing over it. Measured 2026-10-14:
+# findnewest-0.3-4/desc in Arch Linux ARM aarch64 extra (1271 NUL bytes) and
+# ntk-1.3.1001-4/desc in Arch Linux RISC-V extra (576), both GNU sparse
+# members. Any other unreadable member refuses the database, as before.
+DB_MAX_NUL_MEMBERS=16
+db_check() {
+  local db="$1" rec="$2" records members unread nonul n f
+  : > "$rec.nul"
+  if ! db_records "$db" "$rec"; then
+    echo "it does not read as a tar archive"
+    return 1
+  fi
+  records="$(awk 'END { print NR + 0 }' "$rec")"
+  if [ "$records" -eq 0 ]; then
+    echo "it lists no package"
+    return 1
+  fi
+  if ! db_validate "$rec" > "$rec.bad"; then
+    echo "$(awk 'END { print NR + 0 }' "$rec.bad") record(s) fail their grammar, first: $(sed -n 1p "$rec.bad")"
+    return 1
+  fi
+  if ! tar -tf "$db" > "$rec.members"; then
+    echo "its member list does not read"
+    return 1
+  fi
+  # The package directories with a desc, and those no record is named after.
+  awk -F / 'NF >= 2 && $2 == "desc" { print $1 }' "$rec.members" > "$rec.dirs"
+  members="$(awk 'END { print NR + 0 }' "$rec.dirs")"
+  awk -F '\t' 'FILENAME == ARGV[1] { have[$2 "-" $3] = 1; next } !($0 in have)' "$rec" "$rec.dirs" > "$rec.unread"
+  unread="$(awk 'END { print NR + 0 }' "$rec.unread")"
+  if [ "$unread" -gt 0 ]; then
+    if [ "$unread" -gt "$DB_MAX_NUL_MEMBERS" ]; then
+      echo "$unread package directories give no record, more than the $DB_MAX_NUL_MEMBERS accepted as NUL-only, first: $(sed -n 1p "$rec.unread")"
+      return 1
+    fi
+    if LC_ALL=C awk '!/^[A-Za-z0-9@_+][A-Za-z0-9@._+:~-]*$/ { bad = 1 } END { exit !bad }' "$rec.unread"; then
+      echo "a package directory has a name no package has: $(LC_ALL=C awk '!/^[A-Za-z0-9@_+][A-Za-z0-9@._+:~-]*$/' "$rec.unread" | sed -n 1p)"
+      return 1
+    fi
+    sed 's|$|/desc|' "$rec.unread" > "$rec.unread-desc"
+    # One read for all of them; the bytes left once NULs are dropped.
+    nonul="$(tar -xOf "$db" -T "$rec.unread-desc" | tr -d '\000' | wc -c | tr -d ' ')" || nonul=-1
+    if [ "$nonul" != 0 ]; then
+      n=0
+      while IFS= read -r f; do
+        n="$(tar -xOf "$db" "$f/desc" | tr -d '\000' | wc -c | tr -d ' ')" || n=-1
+        if [ "$n" != 0 ]; then
+          echo "$f/desc gives no record named after its directory, and holds $n byte(s) that are not NUL"
+          return 1
+        fi
+      done < "$rec.unread"
+      echo "the members that give no record do not read ($nonul)"
+      return 1
+    fi
+    cp "$rec.unread" "$rec.nul"
+  fi
+  if [ "$((records + unread))" -ne "$members" ]; then
+    echo "it holds $members package directories, $records readable records and $unread NUL-only member(s)"
+    return 1
+  fi
+  return 0
+}
+
 # behind A.tsv B.tsv -> "NEWER OLDER": how many packages of B were built
 # after, and before, the same package in A. B is behind A when OLDER > 0.
 # Measured on Arch's archived core.db, 2026-10-01 to 10-12: in every pair of
@@ -453,22 +572,53 @@ reconcile_results() {
 #
 # REGISTRY_USER and REGISTRY_TOKEN, when set, are exchanged for a scoped token.
 # Without them the reads are anonymous, the way any consumer reads.
+#
+# REGISTRY_TOKEN_CACHE, when set, is a directory that keeps each scoped token
+# in a file of its own. Every process that reads it uses the same token, so a
+# shard asks the token endpoint once, not once per read. A 401 or a 403 drops
+# the file and asks again, once.
+#
+# On GHCR a manifest read tries the dummy token Bearer QQ== first, which every
+# public package accepts. Only its 200 is taken as the answer: GHCR answers QQ==
+# with 404 MANIFEST_UNKNOWN for a repository it does not show to anonymous
+# readers (measured 2026-10-14), so with REGISTRY_TOKEN set any other answer is
+# asked again with the real token before it decides anything.
 #---------------------------------------------------------------------------#
 REG_STATUS_OK=0
 REG_STATUS_ERROR=1
 REG_STATUS_ABSENT=4
 
+# registry_token_file REPO SCOPE -> the cache file for that token, or nothing
+registry_token_file() {
+  [ -n "${REGISTRY_TOKEN_CACHE:-}" ] || return 0
+  printf '%s/%s\n' "$REGISTRY_TOKEN_CACHE" "$(printf '%s %s %s' "$MIRROR_REGISTRY" "$1" "$2" | sha256sum | cut -d ' ' -f 1)"
+}
+
+# registry_token_drop REPO SCOPE: forget a cached token the registry refused
+registry_token_drop() {
+  local f
+  f="$(registry_token_file "$1" "$2")"
+  if [ -n "$f" ]; then
+    rm -f -- "$f"
+  fi
+}
+
 # registry_token REPO SCOPE -> a bearer token on stdout. SCOPE is pull or
 # pull,push. Anonymous pulls on GHCR use the dummy token every public package
-# accepts; anything else asks the token endpoint.
+# accepts; anything else asks the token endpoint, or the cache.
 registry_token() {
-  local repo="$1" scope="$2" out rc=0 tok
+  local repo="$1" scope="$2" out rc=0 tok cache tmp
   if [ "$MIRROR_REGISTRY_AUTH" = none ]; then
     printf 'none\n'
     return 0
   fi
   if [ -z "${REGISTRY_TOKEN:-}" ] && [ "$scope" = pull ] && [ "$MIRROR_REGISTRY" = ghcr.io ]; then
     printf 'QQ==\n'
+    return 0
+  fi
+  cache="$(registry_token_file "$repo" "$scope")"
+  if [ -n "$cache" ] && [ -s "$cache" ]; then
+    cat -- "$cache"
     return 0
   fi
   out="$(mktemp)"
@@ -492,6 +642,11 @@ registry_token() {
   tok="$(jq -r '.token // .access_token // empty' "$out")"
   rm -f "$out"
   [ -n "$tok" ] || return 1
+  if [ -n "$cache" ]; then
+    tmp="$(mktemp "$REGISTRY_TOKEN_CACHE/.token.XXXXXX")"
+    printf '%s\n' "$tok" > "$tmp"
+    mv -f -- "$tmp" "$cache"
+  fi
   printf '%s\n' "$tok"
 }
 
@@ -500,17 +655,37 @@ registry_error_code() {
   jq -s -R -r '(fromjson? // {}) | .errors[0].code? // empty' "$1" | tr -d '\r'
 }
 
+# registry_get_manifest URL TOKEN OUT -> the HTTP status on stdout, curl's
+# status as the return value
+registry_get_manifest() {
+  curl -q --silent --show-error --connect-timeout 20 --max-time 60 \
+    --retry 3 --retry-connrefused --retry-delay 2 --max-filesize 4194304 \
+    --header "Authorization: Bearer $2" \
+    --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
+    --output "$3" --write-out '%{http_code}' "$1"
+}
+
 # registry_manifest REPO REF OUT -> the manifest bytes in OUT
 #   returns 0 read, 4 the registry has no such manifest, 1 could not read
 registry_manifest() {
-  local repo="$1" ref="$2" outfile="$3" token code rc=0 err
-  token="$(registry_token "$repo" pull)" || return "$REG_STATUS_ERROR"
-  code="$(curl -q --silent --show-error --connect-timeout 20 --max-time 60 \
-    --retry 3 --retry-connrefused --retry-delay 2 --max-filesize 4194304 \
-    --header "Authorization: Bearer $token" \
-    --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
-    --output "$outfile" --write-out '%{http_code}' \
-    "$REG_URL/v2/$repo/manifests/$ref")" || rc=$?
+  local repo="$1" ref="$2" outfile="$3" token code="" rc=0 err url
+  url="$REG_URL/v2/$repo/manifests/$ref"
+  if [ "$MIRROR_REGISTRY_AUTH" != none ] && [ "$MIRROR_REGISTRY" = ghcr.io ] && [ -n "${REGISTRY_TOKEN:-}" ]; then
+    code="$(registry_get_manifest "$url" 'QQ==' "$outfile")" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "$code" != 200 ]; then
+      code=""
+      rc=0
+    fi
+  fi
+  if [ -z "$code" ]; then
+    token="$(registry_token "$repo" pull)" || return "$REG_STATUS_ERROR"
+    code="$(registry_get_manifest "$url" "$token" "$outfile")" || rc=$?
+    if [ "$rc" -eq 0 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; } && [ -n "$(registry_token_file "$repo" pull)" ]; then
+      registry_token_drop "$repo" pull
+      token="$(registry_token "$repo" pull)" || return "$REG_STATUS_ERROR"
+      code="$(registry_get_manifest "$url" "$token" "$outfile")" || rc=$?
+    fi
+  fi
   if [ "$rc" -ne 0 ]; then
     warn "no answer for $repo:$ref (curl $rc)"
     return "$REG_STATUS_ERROR"
@@ -576,13 +751,19 @@ manifest_layer() {
   ' "$1"
 }
 
-# fetch_upstream URL OUT -> 0 fetched, 4 the server says it has no such file,
-# 1 anything else. Large files get a stall deadline rather than a fixed one.
+# fetch_upstream URL OUT [MAX_SECONDS] -> 0 fetched, 4 the server says it has
+# no such file, 1 anything else. Every fetch has a stall deadline; a database
+# or a signature also has a whole-transfer one (MAX_SECONDS), so a server that
+# trickles moves the caller on to the next server. A package file has no fixed
+# deadline: its size makes any fixed one wrong.
 fetch_upstream() {
-  local url="$1" outfile="$2" code rc=0
+  local url="$1" outfile="$2" code rc=0 max=()
+  if [ -n "${3:-}" ]; then
+    max=(--max-time "$3")
+  fi
   code="$(curl -q --location --silent --show-error --max-redirs 5 \
     --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \
-    --connect-timeout 20 --speed-limit 4096 --speed-time 60 \
+    --connect-timeout 20 --speed-limit 4096 --speed-time 60 "${max[@]}" \
     --retry 2 --retry-connrefused --retry-delay 2 \
     --user-agent "mirror-archlinux (+https://github.com/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux})" \
     --output "$outfile" --write-out '%{http_code}' "$url")" || rc=$?
@@ -606,4 +787,109 @@ fetch_upstream() {
 # Seconds since the epoch, from the environment when a test pins the clock.
 now_epoch() {
   printf '%s\n' "${MIRROR_NOW:-$(date -u +%s)}"
+}
+
+# iso_of_epoch SECONDS -> that time as ISO 8601 UTC
+iso_of_epoch() {
+  case "$1" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
+#---------------------------------------------------------------------------#
+# How work is split
+#
+# shard_count FILES BYTES SHARD_FILES SHARD_BYTES MAX -> "K WANTED"
+#   WANTED = max(ceil(BYTES / SHARD_BYTES), ceil(FILES / SHARD_FILES)), at
+#   least 1; K is WANTED clamped to MAX and to FILES. No file: "0 0".
+#
+# batch_count FILES BYTES BATCH_FILES BATCH_BYTES MAX -> "K FILES_LIMIT BYTES_LIMIT WANTED"
+#   As shard_count with the limits given, but when that gives more than MAX
+#   batches, both limits grow by an eighth at a time until it does not: every
+#   file is still verified, in fewer, larger batches.
+#---------------------------------------------------------------------------#
+shard_count() {
+  awk -v f="$1" -v b="$2" -v sf="$3" -v sb="$4" -v m="$5" 'BEGIN {
+    if (f + 0 <= 0) { print "0 0"; exit }
+    kb = int((b + sb - 1) / sb); kf = int((f + sf - 1) / sf)
+    k = (kb > kf) ? kb : kf
+    if (k < 1) k = 1
+    w = k
+    if (k > m + 0) k = m + 0
+    if (k > f + 0) k = f + 0
+    printf "%d %d\n", k, w
+  }'
+}
+
+batch_count() {
+  awk -v f="$1" -v b="$2" -v bf="$3" -v bb="$4" -v m="$5" 'BEGIN {
+    w = 0
+    for (;;) {
+      kb = int((b + bb - 1) / bb); kf = int((f + bf - 1) / bf)
+      k = (kb > kf) ? kb : kf
+      if (k < 1) k = 1
+      if (w == 0) w = k
+      if (k <= m + 0) break
+      bb = bb + int(bb / 8) + 1
+      bf = bf + int(bf / 8) + 1
+    }
+    printf "%d %d %.0f %d\n", k, bf, bb, w
+  }'
+}
+
+#---------------------------------------------------------------------------#
+# Why pacman refused one package
+#
+# refusal_reason LOG PKG_RC SIG_RC -> "CLASS<TAB>LINE", from pacman's output
+# for that one package (pacman -Swdd, pacman 7.1 wording), and from the exit
+# status of the wrapper asked for the package and for its .sig alone:
+#   sig-missing  no signature could be read: pacman says a required one is
+#                missing or the .sig did not download, or the wrapper serves
+#                the package and no .sig
+#   sig-refused  pacman read a signature and refused it: an expired or unknown
+#                key, a trust it does not accept, or a signature that is not
+#                valid for the bytes. pacman 7.1 takes a key whose primary has
+#                expired for a missing one: it asks a keyserver, then says
+#                "required key missing from keyring" (measured 2026-10-14).
+#   other        anything else: the wrapper does not serve the package, a
+#                checksum, an architecture, a name pacman does not know
+# A line of the other class wins over any signature line: a package with two
+# faults is not excused for the one that is upstream's. The wrapper's own lines
+# are not read: they are its wording, which may change, not pacman's verdict.
+#---------------------------------------------------------------------------#
+refusal_reason() {
+  awk -v pkg="${2:-}" -v sig="${3:-}" '
+    /^pacman-oci:/ { next }
+    {
+      line = $0
+      if (match(line, /failed retrieving file '\''[^'\'']*'\''/)) {
+        name = substr(line, RSTART, RLENGTH)
+        if (name ~ /\.sig'\''$/) { if (missing == "") missing = line }
+        else if (other == "") other = line
+        next
+      }
+      if (line ~ /invalid or corrupted package \(checksum\)|does not have a valid architecture|package architecture is not valid/) {
+        if (other == "") other = line
+        next
+      }
+      if (line ~ /missing required signature/) { if (missing == "") missing = line; next }
+      if (line ~ /signature from ".*" is (expired|invalid|unknown trust|marginal trust|never trusted)/ ||
+          line ~ /key ".*" (is expired|is unknown|is disabled|could not be looked up remotely)/ ||
+          line ~ /required key missing from keyring|signature format error|unsupported signature format/ ||
+          line ~ /invalid or corrupted package \(PGP signature\)/) {
+        if (refused == "") refused = line
+        next
+      }
+      if (line ~ /^error: / && line !~ /^error: failed to commit transaction/ && other == "") other = line
+    }
+    END {
+      if (pkg != "0") print "other\tthe wrapper does not serve the package itself (exit " pkg ")"
+      else if (other != "") print "other\t" other
+      else if (refused != "") print "sig-refused\t" refused
+      else if (missing != "") print "sig-missing\t" missing
+      else if (sig != "0") print "sig-missing\tthe wrapper serves the package and no .sig (exit " sig ")"
+      else print "other\tpacman named no reason"
+    }
+  ' "$1"
 }

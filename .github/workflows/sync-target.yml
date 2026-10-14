@@ -1,0 +1,273 @@
+# One target's chain, called by sync.yml once per pending target: mirror its
+# shards, stage its database, verify it in batches with pacman through the
+# wrapper, promote it (main only), and leave a small summary for the report.
+#
+# ⛔ The chain reads only its own target's artifacts, and every artifact it
+# writes carries the target's name: chains of different targets never share a
+# file, and one target's failure never holds another.
+name: Sync one target
+
+on:
+  workflow_call:
+    inputs:
+      target:
+        description: The target, arch-repo
+        type: string
+        required: true
+      shards:
+        description: The target's shard numbers, a JSON list; [] when it has no file to mirror
+        type: string
+        required: true
+      max_shards:
+        description: Mirror shards at once
+        type: number
+        default: 3
+      max_batches:
+        description: Verify batches at once
+        type: number
+        default: 3
+      parallel:
+        description: Files mirrored at once in each shard
+        type: number
+        default: 6
+      debloat:
+        description: Free runner disk before mirroring (auto, always, never)
+        type: string
+        default: auto
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MIRROR_REGISTRY: ghcr.io
+
+jobs:
+  mirror:
+    if: ${{ inputs.shards != '[]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_shards }}
+      matrix:
+        shard: ${{ fromJSON(inputs.shards) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan-${{ inputs.target }}
+          path: ${{ runner.temp }}/plan/${{ inputs.target }}
+      # The step ends before the job does, so the results of the files that
+      # ended (results/<shard>/lines) are still uploaded below.
+      - name: Mirror the shard
+        timeout-minutes: 110
+        env:
+          TARGET: ${{ inputs.target }}
+          SHARD_INDEX: ${{ matrix.shard }}
+          PARALLEL: ${{ inputs.parallel }}
+          DEBLOAT: ${{ inputs.debloat }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          # The disk this runner really has, kept in the log: GitHub guarantees
+          # 14 GB and is moving runners to a single disk.
+          df -h / "$RUNNER_TEMP"
+          scripts/mirror-shard "$RUNNER_TEMP/plan/$TARGET/shards/$SHARD_INDEX.tsv" "$RUNNER_TEMP/results/$SHARD_INDEX"
+      - name: Upload the results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ inputs.target }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/results
+          retention-days: 7
+          if-no-files-found: warn
+          overwrite: true
+
+  stage:
+    needs: mirror
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      verify_matrix: ${{ steps.stage.outputs.verify_matrix }}
+      has_batches: ${{ steps.stage.outputs.has_batches }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: plan-${{ inputs.target }}
+          path: ${{ runner.temp }}/plan/${{ inputs.target }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: results-${{ inputs.target }}-*
+          path: ${{ runner.temp }}/results
+          merge-multiple: false
+      - name: Stage
+        id: stage
+        env:
+          TARGET: ${{ inputs.target }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            export STAGING_TAG=staging
+          else
+            slug="$(printf '%s' "$GITHUB_REF_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed 's/--*/-/g; s/^-//; s/-$//' | cut -c1-40)"
+            export STAGING_TAG="staging-${slug:-branch}"
+          fi
+          scripts/stage "$RUNNER_TEMP/plan" "$RUNNER_TEMP/results" "$RUNNER_TEMP/stage" "$TARGET"
+      - name: Upload the stage
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stage-${{ inputs.target }}
+          path: ${{ runner.temp }}/stage
+          retention-days: 7
+          if-no-files-found: warn
+          overwrite: true
+
+  verify:
+    needs: stage
+    if: ${{ !cancelled() && needs.stage.result == 'success' && needs.stage.outputs.has_batches == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 95
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_batches }}
+      matrix: ${{ fromJSON(needs.stage.outputs.verify_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage-${{ inputs.target }}
+          path: ${{ runner.temp }}/stage
+      # Budgets nest: verify-batch's own VERIFY_BUDGET (4800 s, the pulls and
+      # the container together) ends inside this step's 85 minutes, which end
+      # inside the job's 95, so the verdict is always uploaded.
+      - name: Verify with pacman through the wrapper
+        timeout-minutes: 85
+        env:
+          TARGET: ${{ matrix.target }}
+          BATCH: ${{ matrix.batch }}
+          VERIFY_BUDGET: '4800'
+        run: scripts/verify-batch "$RUNNER_TEMP/stage" "$TARGET" "$BATCH" "$RUNNER_TEMP/verify"
+      - name: Upload the verdict
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-${{ matrix.target }}-${{ matrix.batch }}
+          path: ${{ runner.temp }}/verify
+          retention-days: 7
+          if-no-files-found: warn
+          overwrite: true
+
+  promote:
+    needs: [stage, verify]
+    if: ${{ !cancelled() && needs.stage.result == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: stage-${{ inputs.target }}
+          path: ${{ runner.temp }}/stage
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: verify-${{ inputs.target }}-*
+          path: ${{ runner.temp }}/verify
+          merge-multiple: false
+      - name: Promote
+        env:
+          TARGET: ${{ inputs.target }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/verify" "$RUNNER_TEMP/promote"
+          rc=0
+          scripts/promote "$RUNNER_TEMP/stage" "$RUNNER_TEMP/verify" "$TARGET" 2> "$RUNNER_TEMP/promote/$TARGET.err" || rc=$?
+          cat "$RUNNER_TEMP/promote/$TARGET.err" >&2
+          if [ "$rc" -eq 0 ]; then
+            if [ -f "$RUNNER_TEMP/stage/$TARGET/promoted.tsv" ]; then
+              printf '%s\tpromoted\t%s\n' "$TARGET" "$(cut -f 3,4 "$RUNNER_TEMP/stage/$TARGET/promoted.tsv" | tr '\t' ' ')" > "$RUNNER_TEMP/promote/result.tsv"
+            fi
+          else
+            printf '%s\tfailed\t%s\n' "$TARGET" "$(grep -m 1 'promote:' "$RUNNER_TEMP/promote/$TARGET.err" | tr '\t' ' ')" > "$RUNNER_TEMP/promote/result.tsv"
+          fi
+          exit "$rc"
+      - name: Upload the promotion
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: promote-${{ inputs.target }}
+          path: ${{ runner.temp }}/promote
+          retention-days: 30
+          if-no-files-found: warn
+          overwrite: true
+
+  # What the report needs of this chain, a few KiB, so the report downloads
+  # no target's plan, stage or verdicts.
+  summary:
+    needs: [mirror, stage, verify, promote]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: stage-${{ inputs.target }}
+          path: ${{ runner.temp }}/stage
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: verify-${{ inputs.target }}-*
+          path: ${{ runner.temp }}/verify
+          merge-multiple: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: promote-${{ inputs.target }}
+          path: ${{ runner.temp }}/promote
+          merge-multiple: true
+      - name: Collect
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/stage" "$RUNNER_TEMP/verify" "$RUNNER_TEMP/promote" "$RUNNER_TEMP/summary"
+          scripts/report collect "$TARGET" "$RUNNER_TEMP/stage" "$RUNNER_TEMP/verify" "$RUNNER_TEMP/promote/result.tsv" "$RUNNER_TEMP/summary/$TARGET"
+      - name: Upload the summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: summary-${{ inputs.target }}
+          path: ${{ runner.temp }}/summary
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true

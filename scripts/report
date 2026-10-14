@@ -3,13 +3,27 @@
 # Say what one sync run did, per target, and keep the two issues that do not
 # heal by themselves in step with it.
 #
-#   scripts/report PLAN STAGE PROMOTED
+#   scripts/report collect TARGET STAGE VERIFY PROMOTED OUT
+#   scripts/report PLAN SUMMARIES
 #
-# PLAN and STAGE are the plan and stage outputs (STAGE may be missing when the
-# run stopped before it), PROMOTED a file of promote results, one line per
-# target: target status detail.
+# collect, once per target at the end of its chain: what that target's stage,
+# verify and promote steps left, into OUT, a small directory the workflow
+# uploads as summary-TARGET. STAGE is scripts/stage's output (it may be
+# missing when the chain stopped before it), VERIFY holds the verify-*.tsv
+# and refused-*.tsv of the target at any depth, PROMOTED a file with promote's
+# line for the target (target status detail), empty or missing when promote
+# did not run. OUT gets:
+#   state.tsv     target state why: promote's word wins over verify's, over
+#                 stage's
+#   verify.tsv    every verdict line of the target
+#   refused.tsv   file reason: every upstream-refused package of the target
+#   failing.tsv, replaced.tsv, settings-url  as stage left them
 #
-# Writes the table to $GITHUB_STEP_SUMMARY when set, otherwise to stdout.
+# The second form writes one table for the run: every target of the plan
+# (PLAN/summary.tsv), with the state each chain collected into
+# SUMMARIES/<target>/state.tsv, and under it the files that hold a target and
+# the upstream-refused packages, per target. To $GITHUB_STEP_SUMMARY when set,
+# otherwise to stdout.
 #
 # Issues (scripts/track-issue), only when TRACK_ISSUES=1:
 #   visibility-<target>  raised when the package reads only with the workflow's
@@ -22,19 +36,79 @@
 #
 # Exit status: 0 no target is held, failed, replaced, private or in error (a
 # target behind upstream's own servers, or staged on a branch, is not a
-# failure); 1 at least one is, so the run shows red; 2 usage.
+# failure; neither is an upstream-refused package); 1 at least one is, so the
+# run shows red; 2 usage.
 set -euo pipefail
 SCRIPT_NAME=report
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-plan="${1:-}"
-stage="${2:-}"
-promoted="${3:-}"
-if [ -z "$plan" ] || [ -z "$stage" ] || [ -z "$promoted" ]; then
-  echo "usage: scripts/report PLAN STAGE PROMOTED" >&2
+usage() {
+  echo "usage: scripts/report collect TARGET STAGE VERIFY PROMOTED OUT | scripts/report PLAN SUMMARIES" >&2
   exit 2
+}
+
+#---------------------------------------------------------------------------#
+# collect
+#---------------------------------------------------------------------------#
+if [ "${1:-}" = collect ]; then
+  [ "$#" -eq 6 ] || usage
+  target="$2" stage="$3" verify="$4" promoted="$5" sout="$6"
+  case "$target" in
+    '' | *[!a-z0-9_.-]*) usage ;;
+  esac
+  mkdir -p "$sout"
+  : > "$sout/verify.tsv"
+  : > "$sout/refused.tsv"
+  if [ -d "$verify" ]; then
+    find "$verify" -name "verify-$target-*.tsv" -type f -exec cat {} + | sort -t $'\t' -k2,2n >> "$sout/verify.tsv"
+    find "$verify" -name "refused-$target-*.tsv" -type f -exec cat {} + | awk -F '\t' '!seen[$1]++' >> "$sout/refused.tsv"
+  fi
+  state="" why=""
+  if [ -f "$stage/$target/state" ]; then
+    state="$(cat "$stage/$target/state")"
+    why="$(cat "$stage/$target/why")"
+    for f in failing.tsv replaced.tsv settings-url; do
+      if [ -f "$stage/$target/$f" ]; then
+        cp "$stage/$target/$f" "$sout/$f"
+      fi
+    done
+  else
+    state=failed
+    why="the chain left no stage result for this target; read the run's mirror and stage jobs"
+  fi
+  if [ "$state" = staged ]; then
+    digest="$(sed -n 's/^DIGEST=//p' "$stage/$target/staged.env")"
+    failed_line="$(awk -F '\t' -v d="$digest" '$3 != "passed" || $5 != d { print "batch " $2 ": " $3 ": " $4; exit }' "$sout/verify.tsv")"
+    if [ -n "$failed_line" ]; then
+      state=failed
+      why="$failed_line"
+    elif [ "$(awk 'END { print NR + 0 }' "$sout/verify.tsv")" -lt "$(find "$stage/$target/batches" -name '*.txt' | awk 'END { print NR + 0 }')" ]; then
+      state=failed
+      why="$(awk 'END { print NR + 0 }' "$sout/verify.tsv") verdict(s) for $(find "$stage/$target/batches" -name '*.txt' | awk 'END { print NR + 0 }') batch(es)"
+    fi
+  fi
+  if [ -f "$promoted" ] && [ -s "$promoted" ]; then
+    line="$(awk -F '\t' -v t="$target" '$1 == t { l = $2 "\t" $3 } END { print l }' "$promoted")"
+    if [ -n "$line" ]; then
+      IFS=$'\t' read -r state why <<< "$line"
+    fi
+  fi
+  refused_n="$(awk 'END { print NR + 0 }' "$sout/refused.tsv")"
+  if [ "$refused_n" -gt 0 ]; then
+    why="$why; $refused_n upstream-refused"
+  fi
+  printf '%s\t%s\t%s\n' "$target" "$state" "$(printf '%s' "$why" | tr '\t\n' '  ')" > "$sout/state.tsv"
+  log "$target: $state: $why"
+  exit 0
 fi
+
+#---------------------------------------------------------------------------#
+# The run's table
+#---------------------------------------------------------------------------#
+[ "$#" -eq 2 ] || usage
+plan="$1"
+summaries="$2"
 summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
 run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}/actions/runs/${GITHUB_RUN_ID:-0}"
 
@@ -46,35 +120,52 @@ fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# target -> final state and why: promote's word wins over stage's over plan's
+# target -> final state and why: the chain's word wins over the plan's
 tail -n +2 "$plan/summary.tsv" | cut -f 1,2,5 > "$work/states.tsv"
-if [ -f "$stage/summary.tsv" ]; then
-  tail -n +2 "$stage/summary.tsv" | cut -f 1,2,3 > "$work/stage.tsv"
-  awk -F '\t' -v OFS='\t' 'FILENAME == ARGV[1] { s[$1] = $2; w[$1] = $3; next } ($1 in s) { $2 = s[$1]; $3 = w[$1] } { print }' \
-    "$work/stage.tsv" "$work/states.tsv" > "$work/merged.tsv"
-  mv -f "$work/merged.tsv" "$work/states.tsv"
+: > "$work/chains.tsv"
+if [ -d "$summaries" ]; then
+  find "$summaries" -name state.tsv -type f -exec cat {} + > "$work/chains.tsv"
 fi
-if [ -s "$promoted" ]; then
-  awk -F '\t' -v OFS='\t' 'FILENAME == ARGV[1] { s[$1] = $2; w[$1] = $3; next } ($1 in s) && $2 == "staged" { $2 = s[$1]; $3 = w[$1] } { print }' \
-    "$promoted" "$work/states.tsv" > "$work/merged.tsv"
-  mv -f "$work/merged.tsv" "$work/states.tsv"
-fi
+# Every pending target has a chain; one that is still pending here left no
+# summary, and nothing says what became of it.
+awk -F '\t' -v OFS='\t' '
+  FILENAME == ARGV[1] { s[$1] = $2; w[$1] = $3; next }
+  ($1 in s) { $2 = s[$1]; $3 = w[$1] }
+  $2 == "pending" { $2 = "failed"; $3 = "its chain left no summary; read the run: " $3 }
+  { print }
+' "$work/chains.tsv" "$work/states.tsv" > "$work/merged.tsv"
+mv -f "$work/merged.tsv" "$work/states.tsv"
+
+# dir_of TARGET -> the directory its chain collected, or nothing
+dir_of() {
+  find "$summaries" -name state.tsv -type f -exec awk -F '\t' -v t="$1" '$1 == t { print FILENAME }' {} + | sed -n 's|/state.tsv$||p' | sed -n 1p
+}
 
 {
   printf '### Sync\n\n| target | state | what was measured |\n| --- | --- | --- |\n'
   awk -F '\t' '{ gsub(/\|/, "\\|", $3); printf "| %s | %s | %s |\n", $1, $2, $3 }' "$work/states.tsv"
   printf '\n'
-  for d in "$stage"/*/; do
-    d="${d%/}"
-    [ -d "$d" ] || continue
+  while IFS=$'\t' read -r target _ _; do
+    [ -n "$target" ] || continue
+    d=""
+    if [ -d "$summaries" ]; then
+      d="$(dir_of "$target")"
+    fi
+    [ -n "$d" ] || continue
     for f in failing replaced; do
       if [ -s "$d/$f.tsv" ]; then
-        printf '<details><summary>%s: %s file(s)</summary>\n\n```\n' "$(basename "$d")" "$f"
+        printf '<details><summary>%s: %s file(s)</summary>\n\n```\n' "$target" "$f"
         sed -n 1,200p "$d/$f.tsv"
         printf '```\n</details>\n\n'
       fi
     done
-  done
+    if [ -s "$d/refused.tsv" ]; then
+      printf '<details><summary>%s: %s upstream-refused file(s), served as upstream serves them</summary>\n\n```\n' \
+        "$target" "$(awk 'END { print NR + 0 }' "$d/refused.tsv")"
+      sed -n 1,200p "$d/refused.tsv"
+      printf '```\n</details>\n\n'
+    fi
+  done < "$work/states.tsv"
 } >> "$summary"
 
 # track KEY raise|clear TITLE BODY|NOTE
@@ -97,14 +188,18 @@ while IFS=$'\t' read -r target state why; do
   case "$state" in
     held | error | replaced | private | failed) bad=1 ;;
   esac
+  d=""
+  if [ -d "$summaries" ]; then
+    d="$(dir_of "$target")"
+  fi
   case "$state" in
     private)
       # shellcheck disable=SC2016 # Markdown backticks, not command substitution
       {
         printf 'The package behind `%s` was created private, and nothing can be promoted until it is public: consumers read it with no credential.\n\n' "$target"
         printf 'GitHub offers no API for package visibility, so this takes one click: open the package settings, Danger Zone, Change visibility, Public.\n\n'
-        if [ -f "$stage/$target/settings-url" ]; then
-          printf '%s\n\n' "$(cat "$stage/$target/settings-url")"
+        if [ -n "$d" ] && [ -f "$d/settings-url" ]; then
+          printf '%s\n\n' "$(cat "$d/settings-url")"
         fi
         printf 'Everything is pushed and verified meanwhile; the next run promotes. Measured: %s\n\nRun: %s\n' "$why" "$run_url"
       } > "$work/body.md"
@@ -120,9 +215,9 @@ while IFS=$'\t' read -r target state why; do
     {
       printf 'A file of `%s` changed its bytes upstream under the same name, or its tag already holds other bytes. A package tag is written once, so the target is held: the promoted database and older snapshots may name the bytes the tag holds now.\n\n' "$target"
       printf 'Measured: %s\n\n' "$why"
-      if [ -f "$stage/$target/replaced.tsv" ]; then
+      if [ -n "$d" ] && [ -f "$d/replaced.tsv" ]; then
         printf '```\n'
-        sed -n 1,50p "$stage/$target/replaced.tsv"
+        sed -n 1,50p "$d/replaced.tsv"
         printf '```\n\n'
       fi
       printf 'A person decides: wait for upstream to publish a new filename, or accept the new bytes under a new tag (HISTORY/design.md, write-once tags).\n\nRun: %s\n' "$run_url"

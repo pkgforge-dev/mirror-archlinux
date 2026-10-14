@@ -19,7 +19,12 @@
 #   latest       last, once everything it points at is in place
 #
 # ⛔ Every batch of the target must have passed, for this very staged digest; a
-# batch with no verdict, or a verdict about another digest, counts as failed. ⛔ latest never moves backwards: immediately before tagging, the
+# batch with no verdict, or a verdict about another digest, counts as failed.
+# A batch passes with upstream-refused packages in it (scripts/verify-batch):
+# the mirror serves exactly upstream's file, and pacman refuses it from
+# upstream too. They are counted in the log.
+#
+# ⛔ latest never moves backwards: immediately before tagging, the
 # fetched time of the snapshot latest names now is read back, and a staged
 # snapshot fetched earlier is refused. A run re-run days later, or a second
 # writer, cannot roll consumers back. (scripts/plan holds the content floor:
@@ -81,6 +86,10 @@ for b in "$dir"/batches/*.txt; do
 done
 [ "$batches" -gt 0 ] || die "$target was staged with no verification batch"
 [ "$passed" -eq "$batches" ] || die "$passed of $batches verification batch(es) of $target passed; nothing is promoted"
+refused="$(find "$verify" -name "refused-$target-*.tsv" -type f -exec cat {} + | awk -F '\t' '!seen[$1]++ { n++ } END { print n + 0 }')"
+if [ "$refused" -gt 0 ]; then
+  log "$target: $refused upstream-refused file(s) in the passed batches: the mirror serves upstream's bytes and signature, and pacman refuses them from upstream too"
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
