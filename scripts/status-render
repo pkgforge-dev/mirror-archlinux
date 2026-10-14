@@ -1,0 +1,1553 @@
+#!/usr/bin/env python3
+#
+# Render the status site from what scripts/status-collect measured.
+#
+#   python3 -I scripts/status-render IN OUT_SITE
+#
+# IN holds status.json (required), history.jsonl and bench.json (optional).
+# OUT_SITE gets:
+#   index.html                   one static page: inline CSS, light and dark,
+#                                no JavaScript
+#   badges/<target>.svg          coverage and snapshot age of one target
+#   badges/<arch>.svg            the same over the targets of one architecture
+#   badges/all.svg               the same over every target
+#   badges/speed.svg             pacman's time through the oci wrapper and
+#                                through the official mirror, from bench.json
+#   charts/coverage.svg          share of upstream files in the mirror, per
+#                                target, grouped by architecture
+#   charts/freshness.svg         snapshot age per target, against the sync
+#                                interval
+#   charts/size.svg              GiB per target, in the mirror and upstream only
+#   charts/history-coverage.svg  coverage per architecture, last 30 days
+#   charts/history-age.svg       oldest snapshot age per architecture, last 30
+#                                days
+#   charts/speed.svg             bench.json: seconds per path and operation
+#   charts/narrow/<chart>.svg    the same charts laid out 420 px wide, for a
+#                                phone
+#   status.json, history.json, bench.json  the data behind the page
+#
+# Every SVG has a title, axis labels, a legend and its own style with a dark
+# variant. Colours are the validated colour-blind safe categorical slots, and
+# an architecture keeps its colour in every chart. A state colour always comes
+# with a shape and a word.
+#
+# Standard library only. Run it with python3 -I, so the script directory and
+# the environment cannot change what is imported. Run without -I, the script
+# starts itself again with it.
+#
+# Exit status: 0 rendered, 1 the input could not be read, 2 usage.
+
+import sys
+import os
+
+if not sys.flags.isolated:
+    os.execv(sys.executable, [sys.executable, "-I"] + sys.argv)
+
+import datetime
+import html
+import json
+import math
+
+PROG = "status-render"
+
+FONT = ('system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", '
+        'Arial, "Noto Sans", "Liberation Sans", sans-serif')
+MONO = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace'
+
+# The reference categorical slots, light and dark, in their validated order.
+SLOTS_LIGHT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
+               "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+SLOTS_DARK = ["#3987e5", "#d95926", "#199e70", "#c98500",
+              "#d55181", "#008300", "#9085e9", "#e66767"]
+# Slot 0 is the de-emphasis grey.
+OTHER_LIGHT = "#a3a29c"
+OTHER_DARK = "#6b6a65"
+# State colours, never used for a series. Each comes with a shape and a word.
+STATE = {"good": "#0ca30c", "warning": "#fab219",
+         "critical": "#d03b3b", "none": "#898781", "unknown": "#898781"}
+
+ARCH_ORDER = ["x86_64", "aarch64", "armv7h", "loong64", "riscv64"]
+REPO_ORDER = ["core", "extra", "multilib", "alarm", "aur"]
+PATH_ORDER = ["official", "worker", "oci", "oci-serial"]
+PATH_LABEL = {"official": "official mirror", "worker": "Worker, native",
+              "oci": "oci wrapper", "oci-serial": "oci wrapper, serial"}
+OP_ORDER = ["sy", "sw-small", "sw-large"]
+
+WIDE = 760
+NARROW = 420
+PAD = 24
+
+
+def warn(msg):
+    sys.stderr.write("%s: warning: %s\n" % (PROG, msg))
+
+
+def die(msg, *more):
+    sys.stderr.write("%s: %s\n" % (PROG, msg))
+    for m in more:
+        sys.stderr.write("  %s\n" % m)
+    sys.exit(1)
+
+
+#---------------------------------------------------------------------------#
+# Formatting
+#---------------------------------------------------------------------------#
+def esc(s):
+    return html.escape("" if s is None else str(s), quote=True)
+
+
+def fmt_int(n):
+    return "-" if n is None else "{:,}".format(int(n))
+
+
+def fmt_pct(r):
+    if r is None:
+        return "-"
+    if r >= 1:
+        return "100%"
+    if r <= 0:
+        return "0%"
+    if r < 0.001:
+        return "<0.1%"
+    v = math.floor(r * 1000) / 10
+    return ("%.1f" % v).rstrip("0").rstrip(".") + "%"
+
+
+def fmt_age(s):
+    if s is None:
+        return "-"
+    if s < 0:
+        s = 0
+    if s < 3600:
+        return "%d min" % round(s / 60)
+    if s < 48 * 3600:
+        return "%.1f h" % (s / 3600)
+    return "%.1f d" % (s / 86400)
+
+
+def fmt_interval(s):
+    return fmt_age(s).replace(".0 h", " h").replace(".0 d", " d")
+
+
+def fmt_gib(b):
+    if b is None:
+        return "-"
+    g = b / 1073741824
+    if g == 0:
+        return "0"
+    if g < 10:
+        return "%.2f" % g
+    if g < 100:
+        return "%.1f" % g
+    return "%.0f" % g
+
+
+def fmt_secs(s):
+    if s is None:
+        return "-"
+    if s < 1:
+        return "%d ms" % round(s * 1000)
+    if s < 10:
+        return "%.2f s" % s
+    return "%.1f s" % s
+
+
+def fmt_hours(h):
+    """An axis tick in hours: 0, 15 min, 1 h, 1 d, 7 d."""
+    if h == 0:
+        return "0"
+    if h < 1:
+        return "%d min" % round(h * 60)
+    if h < 24 or h % 24:
+        return ("%.1f" % h).rstrip("0").rstrip(".") + " h"
+    return "%d d" % (h // 24)
+
+
+def fmt_time(iso):
+    if not iso:
+        return "-"
+    return str(iso).replace("T", " ")[:16]
+
+
+def utc(epoch):
+    return datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+
+
+def parse_time(s):
+    if not isinstance(s, str):
+        return None
+    try:
+        d = datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return d.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def median(values):
+    v = sorted(x for x in values if x is not None)
+    if not v:
+        return None
+    n = len(v)
+    if n % 2:
+        return v[n // 2]
+    return (v[n // 2 - 1] + v[n // 2]) / 2
+
+
+def num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+# Text width, estimated from the proportions of a UI sans. Layout leaves
+# room, so an estimate a little wide is safe and one too narrow is not.
+NARROW_CHARS = set("il.,:;'|!()[]{}1 ")
+WIDE_CHARS = set("mwMW@%")
+
+
+def text_w(s, size, bold=False):
+    w = 0.0
+    for c in str(s):
+        if c in NARROW_CHARS:
+            w += 0.30
+        elif c in WIDE_CHARS:
+            w += 0.86
+        elif c.isupper():
+            w += 0.66
+        elif c.isdigit():
+            w += 0.58
+        else:
+            w += 0.54
+    return w * size * (1.07 if bold else 1.0)
+
+
+# Verdana at 11 px, the width a badge is laid out for. Verdana is wide, so a
+# system font fits in the same box.
+VERDANA = {" ": 3.9, "%": 12.3, ".": 4.0, ",": 4.0, ":": 4.7, "-": 5.0,
+           "_": 7.0, "/": 4.9, "·": 4.0, "(": 4.6, ")": 4.6, "<": 9.2,
+           "a": 6.7, "b": 6.8, "c": 5.8, "d": 6.8, "e": 6.6, "f": 3.9,
+           "g": 6.8, "h": 7.0, "i": 3.0, "j": 3.8, "k": 6.5, "l": 3.0,
+           "m": 10.7, "n": 7.0, "o": 6.7, "p": 6.8, "q": 6.8, "r": 4.7,
+           "s": 5.8, "t": 4.3, "u": 7.0, "v": 6.5, "w": 9.0, "x": 6.5,
+           "y": 6.5, "z": 5.8}
+
+
+def badge_w(s):
+    w = 0.0
+    for c in s:
+        if c in VERDANA:
+            w += VERDANA[c]
+        elif c.isdigit():
+            w += 7.0
+        elif c.isupper():
+            w += 7.6
+        else:
+            w += 7.0
+    return w
+
+
+def nice_step(raw):
+    if raw <= 0:
+        return 1
+    e = math.floor(math.log10(raw))
+    f = raw / 10 ** e
+    for n in (1, 2, 2.5, 5, 10):
+        if f <= n + 1e-9:
+            return n * 10 ** e
+    return 10 ** (e + 1)
+
+
+def nice_ticks(vmax, n=5):
+    if vmax <= 0:
+        vmax = 1
+    step = nice_step(vmax / n)
+    top = math.ceil(vmax / step - 1e-9) * step
+    ticks = []
+    i = 0
+    while i * step <= top + step / 1000:
+        ticks.append(round(i * step, 10))
+        i += 1
+    return ticks, top
+
+
+def hour_ticks(vmax, n=5):
+    """Ticks in hours on steps a reader counts in: 1, 2, 3, 6, 12 h, days."""
+    steps = [0.25, 0.5, 1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 720]
+    step = next((s for s in steps if vmax / s <= n), steps[-1])
+    top = math.ceil(vmax / step - 1e-9) * step
+    return [i * step for i in range(int(round(top / step)) + 1)], top
+
+
+#---------------------------------------------------------------------------#
+# Identity: an architecture keeps its slot, whatever else is on the page
+#---------------------------------------------------------------------------#
+def arch_slots(arches):
+    known = [a for a in ARCH_ORDER if a in arches]
+    extra = sorted(a for a in arches if a not in ARCH_ORDER)
+    slots = {}
+    for i, a in enumerate(ARCH_ORDER):
+        slots[a] = i + 1
+    nxt = len(ARCH_ORDER) + 1
+    for a in extra:
+        slots[a] = nxt if nxt <= len(SLOTS_LIGHT) else 0
+        nxt += 1
+    return known + extra, slots
+
+
+def repo_key(repo):
+    if repo in REPO_ORDER:
+        return (REPO_ORDER.index(repo), repo)
+    return (len(REPO_ORDER), repo)
+
+
+def target_key(t, order):
+    arch = t.get("arch", "")
+    a = order.index(arch) if arch in order else len(order)
+    return (a, repo_key(t.get("repo", "")))
+
+
+#---------------------------------------------------------------------------#
+# States
+#---------------------------------------------------------------------------#
+def freshness(t, interval, tolerance):
+    m = (t.get("mirror") or {}).get("state")
+    if m == "absent":
+        return "none", "not mirrored yet"
+    age = t.get("age_seconds")
+    if m != "promoted" or age is None:
+        return "unknown", "unknown"
+    if t.get("current") is True:
+        return "good", "matches upstream"
+    if age <= 2 * interval:
+        return "good", "within 2 syncs"
+    if age <= tolerance:
+        return "warning", "late"
+    return "critical", "stale"
+
+
+def cov_ratio(t):
+    return (t.get("coverage") or {}).get("ratio_files")
+
+
+def target_level(t, interval, tolerance):
+    f, _ = freshness(t, interval, tolerance)
+    if f in ("none", "unknown"):
+        return f
+    r = cov_ratio(t)
+    if f == "good" and (r is None or r < 1):
+        return "warning"
+    return f
+
+
+def target_word(t, interval, tolerance):
+    lvl = target_level(t, interval, tolerance)
+    if lvl == "warning" and freshness(t, interval, tolerance)[0] == "good":
+        return lvl, "partial"
+    return lvl, {"good": "ok", "warning": "late", "critical": "stale",
+                 "none": "not mirrored yet", "unknown": "unknown"}[lvl]
+
+
+LEVEL_RANK = {"good": 0, "warning": 1, "critical": 2, "unknown": 1, "none": 1}
+
+
+def not_read(t):
+    """Why a target has no coverage: which side could not be read."""
+    if not (t.get("upstream") or {}).get("ok"):
+        return "upstream not read"
+    return "registry not read"
+
+
+#---------------------------------------------------------------------------#
+# SVG
+#---------------------------------------------------------------------------#
+def chart_style():
+    rules = []
+    for i, c in enumerate(SLOTS_LIGHT):
+        rules.append(".s%d{fill:%s}.l%d{stroke:%s}" % (i + 1, c, i + 1, c))
+    rules.append(".s0{fill:%s}.l0{stroke:%s}" % (OTHER_LIGHT, OTHER_LIGHT))
+    for k, c in STATE.items():
+        rules.append(".st-%s{fill:%s}" % (k, c))
+    dark = []
+    for i, c in enumerate(SLOTS_DARK):
+        dark.append(".s%d{fill:%s}.l%d{stroke:%s}" % (i + 1, c, i + 1, c))
+    dark.append(".s0{fill:%s}.l0{stroke:%s}" % (OTHER_DARK, OTHER_DARK))
+    return (
+        ".bg{fill:#fcfcfb;stroke:rgba(11,11,11,.10)}"
+        "text{font-family:%(f)s}"
+        ".tt{font-size:16px;font-weight:600;fill:#0b0b0b}"
+        ".hd{font-size:30px;font-weight:600;fill:#0b0b0b}"
+        ".sub{font-size:13px;fill:#52514e}"
+        ".lb{font-size:12px;fill:#0b0b0b}"
+        ".gr{font-size:12px;font-weight:600;fill:#52514e;paint-order:stroke;stroke:#fcfcfb;"
+        "stroke-width:5px;stroke-linejoin:round}"
+        ".vl{font-size:12px;fill:#0b0b0b;font-variant-numeric:tabular-nums}"
+        ".mu{fill:#6f6e69}"
+        ".lg{font-size:12px;fill:#52514e}"
+        ".tk{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}"
+        ".ax{font-size:12px;fill:#52514e}"
+        ".note{font-size:13px;fill:#6f6e69}"
+        ".grid{stroke:#e9e8e3;stroke-width:1}"
+        ".base{stroke:#c3c2b7;stroke-width:1}"
+        ".ref{stroke:#7d7b75;stroke-width:1}"
+        ".lead{stroke:#c3c2b7;stroke-width:1;fill:none}"
+        ".track{fill:#ebeae5}"
+        ".ring{stroke:#fcfcfb;stroke-width:2}"
+        ".cut{stroke:#fcfcfb;stroke-width:2}"
+        ".line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}"
+        ".hollow{fill:none;stroke:#898781;stroke-width:1.5}"
+        "%(rules)s"
+        "@media (prefers-color-scheme:dark){"
+        ".bg{fill:#1a1a19;stroke:rgba(255,255,255,.10)}"
+        ".tt,.hd,.lb,.vl{fill:#ffffff}"
+        ".sub,.gr,.ax,.lg{fill:#c3c2b7}"
+        ".tk,.note,.mu{fill:#9a9890}"
+        ".grid{stroke:#2a2a28}"
+        ".base,.lead{stroke:#3d3d3a}"
+        ".ref{stroke:#9a9890}"
+        ".track{fill:#2e2e2c}"
+        ".ring,.cut,.gr{stroke:#1a1a19}"
+        "%(dark)s}"
+    ) % {"f": FONT, "rules": "".join(rules), "dark": "".join(dark)}
+
+
+class Svg:
+    def __init__(self, title, desc, w):
+        self.title = title
+        self.desc = desc
+        self.w = w
+        self.parts = []
+
+    def add(self, s):
+        self.parts.append(s)
+
+    def text(self, x, y, s, cls, anchor=None):
+        a = ' text-anchor="%s"' % anchor if anchor else ""
+        self.add('<text x="%.1f" y="%.1f" class="%s"%s>%s</text>' % (x, y, cls, a, esc(s)))
+
+    def render(self, height):
+        w = self.w
+        return (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
+            'viewBox="0 0 %d %d" role="img" aria-labelledby="title desc">\n'
+            '<title id="title">%s</title>\n<desc id="desc">%s</desc>\n'
+            '<style>%s</style>\n'
+            '<rect class="bg" x="0.5" y="0.5" width="%d" height="%d" rx="12"/>\n'
+            '%s\n</svg>\n'
+        ) % (w, height, w, height, esc(self.title), esc(self.desc),
+             chart_style(), w - 1, height - 1, "\n".join(self.parts))
+
+
+def wrap(s, size, width):
+    lines = []
+    cur = ""
+    for word in s.split():
+        nxt = (cur + " " + word).strip()
+        if cur and text_w(nxt, size) > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = nxt
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def header(svg, title, headline, caption):
+    """The title, the headline number and its caption. Returns the next y."""
+    svg.text(PAD, 40, title, "tt")
+    svg.text(PAD, 82, headline, "hd")
+    y = 82
+    x = PAD + text_w(headline, 30, True) + 14
+    room = svg.w - PAD - x
+    lines = wrap(caption, 13, room) if room > 200 else []
+    if 0 < len(lines) <= 2:
+        if len(lines) == 1:
+            svg.text(x, y - 3, lines[0], "sub")
+        else:
+            svg.text(x, y - 18, lines[0], "sub")
+            svg.text(x, y - 1, lines[1], "sub")
+        return y + 30
+    for ln in wrap(caption, 13, svg.w - 2 * PAD):
+        y += 19
+        svg.text(PAD, y, ln, "sub")
+    return y + 30
+
+
+def glyph(svg, level, cx, cy):
+    if level == "good":
+        svg.add('<circle cx="%.1f" cy="%.1f" r="5" class="st-good"/>' % (cx, cy))
+    elif level == "warning":
+        svg.add('<path d="M%.1f %.1fl5.6 9.6h-11.2z" class="st-warning"/>' % (cx, cy - 5.6))
+    elif level == "critical":
+        svg.add('<path d="M%.1f %.1fl5 5-5 5-5-5z" class="st-critical"/>' % (cx, cy - 5))
+    else:
+        svg.add('<circle cx="%.1f" cy="%.1f" r="4.25" class="hollow"/>' % (cx, cy))
+
+
+def legend(svg, y, items):
+    """items: (kind, class, label), kind box, line or glyph. Returns the next y."""
+    x = PAD
+    for kind, cls, label in items:
+        w = 16 + text_w(label, 12) + 18
+        if x + w - 18 > svg.w - PAD and x > PAD:
+            x = PAD
+            y += 20
+        if kind == "box":
+            svg.add('<rect x="%.1f" y="%.1f" width="10" height="10" rx="2" class="%s"/>'
+                    % (x, y - 9, cls))
+        elif kind == "line":
+            svg.add('<path d="M%.1f %.1fh12" class="line %s"/>' % (x - 1, y - 4, cls))
+        else:
+            glyph(svg, cls, x + 5, y - 4)
+        svg.text(x + 16, y, label, "lg")
+        x += w
+    return y + 16
+
+
+def hbar(x0, y, w, h, r=4, round_end=True):
+    """A bar from x0 rightwards: square at the baseline, rounded data end."""
+    if w <= 0:
+        return ""
+    if not round_end or w < 1:
+        return "M%.1f %.1fh%.1fv%.1fh%.1fz" % (x0, y, w, h, -w)
+    r = min(r, w, h / 2)
+    return ("M%.1f %.1fh%.1fa%.1f %.1f 0 0 1 %.1f %.1fv%.1fa%.1f %.1f 0 0 1 %.1f %.1fh%.1fz"
+            % (x0, y, w - r, r, r, r, r, h - 2 * r, r, r, -r, r, -(w - r)))
+
+
+class Row:
+    def __init__(self, kind, label, segments=None, value="", more="", short=None,
+                 tip="", level=None):
+        self.kind = kind            # group or bar
+        self.label = label
+        self.segments = segments or []   # (value, class); the outer end is rounded
+        self.value = value          # ink, beside the bar
+        self.more = more            # muted, after value; left out when narrow
+        self.short = short          # replaces value when narrow
+        self.tip = tip
+        self.level = level
+
+
+def bar_chart(svg, y, rows, vmax, ticks, tick_fmt, axis_label, ref=None, at_tip=False):
+    """Horizontal bars, one per row, grouped by group rows. A bar longer than
+    vmax is cut at the end of the scale and marked. The value stands in a
+    column at the right, or at the tip of its bar. Returns the height."""
+    narrow = svg.w < 600
+    row_h = 24
+    group_h = 28
+    bar_h = 12
+
+    def shown(r):
+        if narrow:
+            return (r.short if r.short is not None else r.value), ""
+        return r.value, r.more
+
+    label_w = max([text_w(r.label, 12) for r in rows if r.kind == "bar"] + [48]) + 22
+    glyph_w = 16 if any(r.level for r in rows) else 0
+    widths = []
+    for r in rows:
+        if r.kind != "bar":
+            continue
+        v, m = shown(r)
+        widths.append(text_w(v, 12) + (8 + text_w(m, 12) if m else 0))
+    value_w = max(widths + [30]) + 12 + glyph_w
+    x0 = PAD + label_w
+    x1 = svg.w - PAD - value_w
+    plot_w = x1 - x0
+    top = y + (18 if ref else 0)
+
+    def sx(v):
+        return x0 + (0 if vmax <= 0 else plot_w * min(max(v, 0), vmax) / vmax)
+
+    yy = top
+    marks = []
+    for r in rows:
+        if r.kind == "group":
+            yy += group_h
+            marks.append('<text x="%.1f" y="%.1f" class="gr">%s</text>' % (PAD, yy - 9, esc(r.label)))
+            continue
+        cy = yy + row_h / 2
+        marks.append('<text x="%.1f" y="%.1f" class="lb">%s</text>' % (PAD + 8, cy + 4, esc(r.label)))
+        segs = []
+        pos = 0.0
+        total = sum(v for v, _ in r.segments if v)
+        for i, (v, cls) in enumerate(r.segments):
+            if not v or v <= 0 or pos >= vmax:
+                continue
+            a = sx(pos)
+            b = sx(pos + v)
+            if pos > 0:
+                a += 2          # the surface gap between two segments
+            last = all(not s[0] or s[0] <= 0 for s in r.segments[i + 1:]) or pos + v >= vmax
+            d = hbar(a, cy - bar_h / 2, b - a, bar_h, round_end=last)
+            if d:
+                segs.append('<path d="%s" class="%s"/>' % (d, cls))
+            pos += v
+        if total > vmax:
+            # Cut at the end of the scale: two gaps across the bar.
+            for dx in (16, 10):
+                segs.append('<path d="M%.1f %.1fl4 -%d" class="cut"/>'
+                            % (x1 - dx, cy + bar_h / 2 + 1, bar_h + 2))
+        tip = "<title>%s</title>" % esc(r.tip) if r.tip else ""
+        marks.append('<g>%s%s<rect x="%.1f" y="%.1f" width="%.1f" height="%d" '
+                     'fill="#000" fill-opacity="0"/></g>'
+                     % (tip, "".join(segs), x0, yy, svg.w - PAD - x0, row_h))
+        vx = x1 + 12
+        if at_tip:
+            vx = (sx(min(total, vmax)) if total > 0 else x0) + 8
+        if r.level:
+            gl = Svg("", "", svg.w)
+            glyph(gl, r.level, vx + 5, cy)
+            marks.append("".join(gl.parts))
+            vx += glyph_w
+        v, m = shown(r)
+        more = '<tspan class="mu" dx="8">%s</tspan>' % esc(m) if m else ""
+        marks.append('<text x="%.1f" y="%.1f" class="vl">%s%s</text>' % (vx, cy + 4, esc(v), more))
+        yy += row_h
+    bottom = yy + 8
+    for t in ticks:
+        x = sx(t)
+        svg.add('<path d="M%.1f %.1fV%.1f" class="%s"/>' % (x, top + 6, bottom, "base" if t == 0 else "grid"))
+        svg.text(x, bottom + 16, tick_fmt(t), "tk", "middle")
+    if ref and ref[0] <= vmax:
+        x = sx(ref[0])
+        svg.add('<path d="M%.1f %.1fV%.1f" class="ref"/>' % (x, top - 2, bottom))
+        svg.text(x + 4, top + 2, ref[1], "tk")
+    svg.add("\n".join(marks))
+    svg.text(x0 + plot_w / 2, bottom + 38, axis_label, "ax", "middle")
+    return bottom + 38 + 22
+
+
+#---------------------------------------------------------------------------#
+# Charts from status.json
+#---------------------------------------------------------------------------#
+def grouped(targets, order):
+    out = []
+    for a in order:
+        ts = [t for t in targets if t.get("arch") == a]
+        if ts:
+            out.append((a, sorted(ts, key=lambda t: repo_key(t.get("repo", "")))))
+    return out
+
+
+def chart_coverage(ctx, w):
+    s = ctx["status"]["summary"]
+    svg = Svg("Coverage by repository",
+              "Share of each repository's upstream files that the mirror serves, "
+              "by file name and sha256, grouped by architecture.", w)
+    cap = ("of %s upstream files are in the mirror, by name and sha256. %d of %d "
+           "repositories have a snapshot." % (fmt_int(s.get("upstream_files")),
+                                             s.get("promoted", 0), s.get("targets", 0)))
+    y = header(svg, "Coverage by repository", fmt_pct(s.get("coverage_files")), cap)
+    groups = grouped(ctx["targets"], ctx["order"])
+    items = [("box", "s%d" % ctx["slots"][a], a) for a, _ in groups]
+    y = legend(svg, y, items + [("box", "track", "upstream only")])
+    rows = []
+    for a, ts in groups:
+        rows.append(Row("group", a))
+        for t in ts:
+            c = t.get("coverage")
+            name = t.get("target")
+            if not c or not c.get("of_files"):
+                rows.append(Row("bar", t.get("repo"), [], not_read(t),
+                                short="-", tip="%s: %s" % (name, not_read(t))))
+                continue
+            r = c.get("ratio_files") or 0
+            rows.append(Row(
+                "bar", t.get("repo"),
+                [(r * 100, "s%d" % ctx["slots"][a]), ((1 - r) * 100, "track")],
+                fmt_pct(r), "%s / %s" % (fmt_int(c["files"]), fmt_int(c["of_files"])),
+                tip="%s: %s of %s files (%s), %s of %s GiB" % (
+                    name, fmt_int(c["files"]), fmt_int(c["of_files"]), fmt_pct(r),
+                    fmt_gib(c.get("bytes")), fmt_gib(c.get("of_bytes")))))
+    ticks = [0, 25, 50, 75, 100] if w >= 600 else [0, 50, 100]
+    h = bar_chart(svg, y, rows, 100, ticks, lambda v: "%d%%" % v,
+                  "Share of upstream files in the mirror")
+    return svg.render(h), h
+
+
+def chart_freshness(ctx, w):
+    status, interval, tolerance = ctx["status"], ctx["interval"], ctx["tolerance"]
+    svg = Svg("Snapshot age",
+              "Hours since each repository's promoted snapshot was fetched from "
+              "upstream, against the sync interval. A bar past the stale limit is "
+              "cut at the end of the scale.", w)
+    ages = [t["age_seconds"] for t in ctx["targets"]
+            if num(t.get("age_seconds")) and (t.get("mirror") or {}).get("state") == "promoted"]
+    s = status["summary"]
+    cap = ("oldest snapshot. Sync runs every %s. %d of %d repositories match "
+           "upstream now." % (fmt_interval(interval), s.get("current", 0), s.get("targets", 0)))
+    y = header(svg, "Snapshot age", fmt_age(max(ages)) if ages else "none", cap)
+    y = legend(svg, y, [
+        ("glyph", "good", "matches upstream, or within 2 syncs"),
+        ("glyph", "warning", "late"),
+        ("glyph", "critical", "stale, over %s" % fmt_interval(tolerance)),
+        ("glyph", "none", "not mirrored yet"),
+    ])
+    hours = [a / 3600 for a in ages]
+    ih = interval / 3600
+    vmax = max([min(max(hours + [0]), tolerance / 3600), 2 * ih * 1.2])
+    ticks, top = hour_ticks(vmax, 5 if w >= 600 else 3)
+    rows = []
+    for a, ts in grouped(ctx["targets"], ctx["order"]):
+        rows.append(Row("group", a))
+        for t in ts:
+            lvl, word = freshness(t, interval, tolerance)
+            age = t.get("age_seconds")
+            if lvl in ("none", "unknown") or not num(age):
+                rows.append(Row("bar", t.get("repo"), [], word, short="-",
+                                tip="%s: %s" % (t.get("target"), word), level=lvl))
+                continue
+            rows.append(Row("bar", t.get("repo"), [(age / 3600, "st-%s" % lvl)],
+                            fmt_age(age), word, short=fmt_age(age),
+                            tip="%s: fetched %s, %s ago, %s" % (
+                                t.get("target"), (t.get("mirror") or {}).get("fetched"),
+                                fmt_age(age), word), level=lvl))
+    h = bar_chart(svg, y, rows, top, ticks, fmt_hours,
+                  "Time since the snapshot was fetched from upstream",
+                  ref=(ih, "sync every %s" % fmt_interval(interval)))
+    return svg.render(h), h
+
+
+def chart_size(ctx, w):
+    s = ctx["status"]["summary"]
+    svg = Svg("Size by repository",
+              "Compressed package bytes per repository: in the mirror, and upstream "
+              "only.", w)
+    cap = ("in the mirror, of %s GiB upstream (%s by bytes)."
+           % (fmt_gib(s.get("upstream_bytes")), fmt_pct(s.get("coverage_bytes"))))
+    y = header(svg, "Size by repository", "%s GiB" % fmt_gib(s.get("mirrored_bytes")), cap)
+    groups = grouped(ctx["targets"], ctx["order"])
+    items = [("box", "s%d" % ctx["slots"][a], a) for a, _ in groups]
+    y = legend(svg, y, items + [("box", "track", "upstream only")])
+    gib = 1073741824
+    vmax = max([((t.get("coverage") or {}).get("of_bytes") or 0) / gib for t in ctx["targets"]] + [0.001])
+    ticks, top = nice_ticks(vmax, 5 if w >= 600 else 3)
+    rows = []
+    for a, ts in groups:
+        rows.append(Row("group", a))
+        for t in ts:
+            c = t.get("coverage")
+            if not c or c.get("of_bytes") is None:
+                rows.append(Row("bar", t.get("repo"), [], not_read(t), short="-",
+                                tip="%s: %s" % (t.get("target"), not_read(t))))
+                continue
+            mb = (c.get("bytes") or 0) / gib
+            nb = (c.get("of_bytes") or 0) / gib
+            rows.append(Row("bar", t.get("repo"),
+                            [(mb, "s%d" % ctx["slots"][a]), (max(nb - mb, 0), "track")],
+                            "%s GiB" % fmt_gib(c.get("bytes")),
+                            "of %s" % fmt_gib(c.get("of_bytes")),
+                            short=fmt_gib(c.get("of_bytes")),
+                            tip="%s: %s of %s GiB in the mirror" % (
+                                t.get("target"), fmt_gib(c.get("bytes")), fmt_gib(c.get("of_bytes")))))
+    h = bar_chart(svg, y, rows, top, ticks, lambda v: "%g" % v, "GiB of compressed packages",
+                  at_tip=True)
+    return svg.render(h), h
+
+
+#---------------------------------------------------------------------------#
+# History
+#---------------------------------------------------------------------------#
+def history_series(history, now, days=30):
+    """{arch: [(t, coverage ratio or None, oldest age or None)]}, last DAYS."""
+    start = now - days * 86400
+    out = {}
+    for line in history:
+        t = parse_time(line.get("t"))
+        if t is None or t < start or t > now + 3600:
+            continue
+        per = {}
+        for name, x in (line.get("x") or {}).items():
+            if not isinstance(x, dict) or "-" not in name:
+                continue
+            p = per.setdefault(name.split("-", 1)[0], [0, 0, None, False])
+            if num(x.get("n")) and num(x.get("m")):
+                p[0] += x["n"]
+                p[1] += x["m"]
+                p[3] = True
+            if num(x.get("a")):
+                p[2] = x["a"] if p[2] is None else max(p[2], x["a"])
+        for arch, (n, m, age, have) in per.items():
+            out.setdefault(arch, []).append((t, (m / n) if have and n > 0 else None, age))
+    for arch in out:
+        out[arch].sort()
+    return out
+
+
+def bucket(points, step, how):
+    """One point per STEP seconds: the last value, or the largest. A point
+    with no value is left out."""
+    if step <= 0:
+        return [(t, v) for t, v in points if v is not None]
+    keep = {}
+    for t, v in points:
+        if v is None:
+            continue
+        k = int(t // step)
+        if k not in keep:
+            keep[k] = (t, v)
+        elif how == "max":
+            keep[k] = (max(keep[k][0], t), max(keep[k][1], v))
+        else:
+            keep[k] = max(keep[k], (t, v))
+    return [keep[k] for k in sorted(keep)]
+
+
+def time_ticks(x0, x1, plot_w):
+    span = x1 - x0
+    most = max(2, int(plot_w // 72))
+    steps = [3600 * h for h in (3, 6, 12, 24, 48, 120, 240)]
+    step = next((s for s in steps if span / s <= most), steps[-1])
+    fmt = "%H:%M" if step < 86400 else "%b %d"
+    t = math.ceil(x0 / step) * step
+    ticks = []
+    while t <= x1:
+        d = utc(t)
+        label = d.strftime(fmt)
+        if fmt == "%H:%M" and d.hour == 0:
+            label = d.strftime("%b %d")
+        ticks.append((t, label.replace(" 0", " ")))
+        t += step
+    return ticks
+
+
+def line_chart(svg, y, series, slots, y_ticks, ty, y_fmt, y_label, x0, x1, ref=None):
+    """One line per series. ty maps a value to 0..1 up the plot."""
+    items = [("line", "l%d" % slots.get(a, 0), a) for a, _ in series]
+    if ref:
+        items.append(("line", "ref", ref[1]))
+    y = legend(svg, y, items)
+    end_w = max([text_w("%s %s" % (a, y_fmt(v, True)), 12)
+                 for a, pts in series for _, v in pts[-1:]] + [40])
+    plot_l = PAD + 46
+    plot_r = svg.w - PAD - end_w - 20
+    top = y + 10
+    bottom = top + (200 if svg.w >= 600 else 170)
+
+    def sx(t):
+        return plot_l + (plot_r - plot_l) * (t - x0) / max(x1 - x0, 1)
+
+    def sy(v):
+        return bottom - (bottom - top) * min(max(ty(v), 0.0), 1.0)
+
+    for v in y_ticks:
+        svg.add('<path d="M%.1f %.1fH%.1f" class="%s"/>' % (plot_l, sy(v), plot_r,
+                                                          "base" if v == y_ticks[0] else "grid"))
+        svg.text(plot_l - 8, sy(v) + 4, y_fmt(v), "tk", "end")
+    for t, label in time_ticks(x0, x1, plot_r - plot_l):
+        svg.add('<path d="M%.1f %.1fv4" class="base"/>' % (sx(t), bottom))
+        svg.text(sx(t), bottom + 18, label, "tk", "middle")
+    if ref:
+        svg.add('<path d="M%.1f %.1fH%.1f" class="ref"/>' % (plot_l, sy(ref[0]), plot_r))
+
+    ends = []
+    for arch, pts in series:
+        cls = slots.get(arch, 0)
+        if not pts:
+            continue
+        steps = [b[0] - a[0] for a, b in zip(pts, pts[1:])]
+        gap = max(4 * (median(steps) or 3600), 2 * 3600)
+        d = []
+        prev = None
+        for t, v in pts:
+            d.append("%s%.1f %.1f" % ("M" if prev is None or t - prev > gap else "L", sx(t), sy(v)))
+            prev = t
+        svg.add('<path d="%s" class="line l%d"><title>%s</title></path>' % ("".join(d), cls, esc(arch)))
+        lt, lv = pts[-1]
+        ends.append([sy(lv), arch, lv, sx(lt), sy(lv)])
+    # End labels 15 px apart at least, each with a leader line when it moved.
+    ends.sort()
+    for i in range(1, len(ends)):
+        if ends[i][0] < ends[i - 1][0] + 15:
+            ends[i][0] = ends[i - 1][0] + 15
+    if ends and ends[-1][0] > bottom + 4:
+        shift = ends[-1][0] - bottom - 4
+        for e in ends:
+            e[0] -= shift
+    lx = plot_r + 16
+    for ly, arch, v, ex, ey in ends:
+        if abs(ly - ey) > 2:
+            svg.add('<path d="M%.1f %.1fL%.1f %.1f" class="lead"/>' % (ex + 6, ey, lx - 4, ly))
+    for ly, arch, v, ex, ey in ends:
+        svg.add('<circle cx="%.1f" cy="%.1f" r="4" class="s%d ring"><title>%s %s</title></circle>'
+                % (ex, ey, slots.get(arch, 0), esc(arch), esc(y_fmt(v, True))))
+        svg.add('<text x="%.1f" y="%.1f" class="vl">%s<tspan class="mu" dx="5">%s</tspan></text>'
+                % (lx, ly + 4, esc(arch), esc(y_fmt(v, True))))
+    if not ends:
+        svg.text((plot_l + plot_r) / 2, (top + bottom) / 2, "No history yet", "note", "middle")
+    svg.text((plot_l + plot_r) / 2, bottom + 42, "Time, UTC", "ax", "middle")
+    svg.add('<text class="ax" text-anchor="middle" transform="translate(%.1f %.1f) rotate(-90)">%s</text>'
+            % (PAD + 6, (top + bottom) / 2, esc(y_label)))
+    return bottom + 42 + 22
+
+
+def history_window(ctx):
+    now = ctx["now"]
+    series = ctx["series"]
+    times = [p[0] for pts in series.values() for p in pts]
+    x1 = now
+    x0 = max(min(times), now - 30 * 86400) if times else now - 86400
+    if x1 - x0 < 86400:
+        x0 = x1 - 86400
+    if (x1 - x0) / 86400 >= 29.5:
+        span = "last 30 days"
+    elif times:
+        span = "since %s" % utc(min(times)).strftime("%b %d, %H:%M UTC").replace(" 0", " ")
+    else:
+        span = "no history yet"
+    # More than 2 days: one point per 6 hours, so a line reads as a trend.
+    step = 6 * 3600 if x1 - x0 > 2 * 86400 else 0
+    return x0, x1, span, step
+
+
+def chart_history_coverage(ctx, w):
+    x0, x1, span, step = history_window(ctx)
+    s = ctx["status"]["summary"]
+    svg = Svg("Coverage, last 30 days",
+              "Share of upstream files in the mirror per architecture over time. "
+              "With more than 2 days of history, one point per 6 hours, the last "
+              "value of each.", w)
+    y = header(svg, "Coverage, last 30 days", fmt_pct(s.get("coverage_files")),
+               "of upstream files in the mirror now. One line per architecture, %s." % span)
+    series = []
+    for a in ctx["hist_order"]:
+        pts = [(t, None if c is None else c * 100) for t, c, _ in ctx["series"][a]]
+        series.append((a, bucket(pts, step, "last")))
+    series = [(a, p) for a, p in series if p]
+
+    def pct(v, end=False):
+        return fmt_pct(v / 100) if end else "%d%%" % v
+
+    ticks = [0, 25, 50, 75, 100] if w >= 600 else [0, 50, 100]
+    h = line_chart(svg, y, series, ctx["slots"], ticks, lambda v: v / 100, pct,
+                   "Share of upstream files", x0, x1)
+    return svg.render(h), h
+
+
+AGE_TICKS = [0.25, 0.5, 1, 3, 6, 12, 24, 72, 168, 720]
+
+
+def chart_history_age(ctx, w):
+    x0, x1, span, step = history_window(ctx)
+    s = ctx["status"]["summary"]
+    ih = ctx["interval"] / 3600
+    svg = Svg("Snapshot age, last 30 days",
+              "Age of the oldest promoted snapshot per architecture over time, on a "
+              "log scale, against the sync interval. With more than 2 days of "
+              "history, one point per 6 hours, the largest of each.", w)
+    oldest = s.get("oldest_age_seconds")
+    y = header(svg, "Snapshot age, last 30 days", fmt_age(oldest) if num(oldest) else "none",
+               "oldest snapshot now. One line per architecture, %s, log scale." % span)
+    series = []
+    for a in ctx["hist_order"]:
+        pts = [(t, None if g is None else g / 3600) for t, _, g in ctx["series"][a]]
+        series.append((a, bucket(pts, step, "max")))
+    series = [(a, p) for a, p in series if p]
+    vals = [v for _, pts in series for _, v in pts]
+    hi_v = max(vals + [2 * ih])
+    lo = 0.5 if min(vals + [ih]) >= 0.5 else 0.25
+    hi = next((t for t in AGE_TICKS if t >= hi_v), AGE_TICKS[-1])
+    ticks = [t for t in AGE_TICKS if lo <= t <= hi]
+    if w < 600 and len(ticks) > 4:
+        ticks = [t for i, t in enumerate(ticks) if i % 2 == 0 or t == hi]
+
+    def ty(v):
+        return (math.log(max(v, lo)) - math.log(lo)) / (math.log(hi) - math.log(lo))
+
+    def hours(v, end=False):
+        return fmt_age(v * 3600) if end else fmt_hours(v)
+
+    h = line_chart(svg, y, series, ctx["slots"], ticks, ty, hours,
+                   "Age, log scale", x0, x1,
+                   ref=(ih, "sync every %s" % fmt_interval(ctx["interval"])))
+    return svg.render(h), h
+
+
+#---------------------------------------------------------------------------#
+# Bench
+#---------------------------------------------------------------------------#
+def bench_cases(bench):
+    out = {}
+    for c in (bench or {}).get("cases") or []:
+        if isinstance(c, dict):
+            out[(c.get("path"), c.get("op"))] = c
+    return out
+
+
+def bench_totals(bench):
+    cases = bench_cases(bench)
+    totals = {}
+    for p in PATH_ORDER:
+        vals = []
+        for op in OP_ORDER:
+            c = cases.get((p, op))
+            if c and c.get("ok") is True and num(c.get("seconds")):
+                vals.append(c["seconds"])
+            else:
+                vals = None
+                break
+        totals[p] = sum(vals) if vals else None
+    return totals
+
+
+def op_label(op, c):
+    files = c.get("files") if c else None
+    n = " %s" % fmt_int(files) if isinstance(files, int) else ""
+    return {"sy": "pacman -Sy, the databases",
+            "sw-small": "pacman -Sw, the%s smallest packages" % n,
+            "sw-large": "pacman -Sw, the%s largest packages" % n}.get(op, op)
+
+
+def chart_speed(ctx, w):
+    bench = ctx["bench"]
+    svg = Svg("pacman speed by path",
+              "Median seconds of pacman -Sy and -Sw through the official mirror, the "
+              "Worker, and the oci wrapper with and without prefetch.", w)
+    # The oci wrapper is the path this mirror ships: it has the colour, and
+    # the other paths are the grey it is measured against.
+    items = [("box", "s1", "oci wrapper"), ("box", "s0", "official mirror, Worker, oci serial")]
+    if not bench:
+        y = header(svg, "pacman speed by path", "no data",
+                   "No benchmark yet. The status workflow runs scripts/bench-consumer once a day.")
+        y = legend(svg, y, items)
+        top = y + 10
+        bottom = top + 110
+        svg.add('<path d="M%d %.1fV%.1f" class="base"/>' % (PAD + 140, top, bottom))
+        svg.add('<path d="M%d %.1fH%.1f" class="base"/>' % (PAD + 140, bottom, svg.w - PAD - 60))
+        svg.text((PAD + 140 + svg.w - PAD - 60) / 2, (top + bottom) / 2 + 4,
+                 "No measurement yet", "note", "middle")
+        svg.text((PAD + 140 + svg.w - PAD - 60) / 2, bottom + 34, "Seconds, median of the rounds",
+                 "ax", "middle")
+        h = bottom + 56
+        return svg.render(h), h
+    totals = bench_totals(bench)
+    cases = bench_cases(bench)
+    rounds = max([len(c.get("rounds") or []) for c in cases.values()] + [0])
+    oci = totals.get("oci")
+    cap = ("for -Sy and -Sw through the oci wrapper, median of %d rounds. Official "
+           "mirror: %s. Measured %s on %s." % (rounds, fmt_secs(totals.get("official")),
+                                             str(bench.get("date", "?"))[:10], bench.get("host", "?")))
+    y = header(svg, "pacman speed by path", fmt_secs(oci) if oci is not None else "failed", cap)
+    y = legend(svg, y, items)
+    vals = [c["seconds"] for c in cases.values() if num(c.get("seconds"))]
+    ticks, top = nice_ticks(max(vals + [0.1]), 5 if w >= 600 else 3)
+    rows = []
+    for op in OP_ORDER:
+        some = [cases.get((p, op)) for p in PATH_ORDER]
+        if not any(some):
+            continue
+        rows.append(Row("group", op_label(op, next((c for c in some if c), None))))
+        for p in PATH_ORDER:
+            c = cases.get((p, op))
+            cls = "s1" if p == "oci" else "s0"
+            if not c:
+                rows.append(Row("bar", PATH_LABEL[p], [], "not measured", short="-"))
+            elif c.get("ok") is not True or not num(c.get("seconds")):
+                rows.append(Row("bar", PATH_LABEL[p], [], "failed",
+                                tip="%s, %s: failed" % (PATH_LABEL[p], op)))
+            else:
+                rows.append(Row("bar", PATH_LABEL[p], [(c["seconds"], cls)], fmt_secs(c["seconds"]),
+                                tip="%s, %s: median %s of %s; %s files, %.1f MiB" % (
+                                    PATH_LABEL[p], op, fmt_secs(c["seconds"]),
+                                    ", ".join(fmt_secs(r) for r in (c.get("rounds") or []) if num(r)),
+                                    fmt_int(c.get("files")), (c.get("bytes") or 0) / 1048576)))
+    h = bar_chart(svg, y, rows, top, ticks, lambda v: "%g s" % v,
+                  "Seconds, median of the rounds; shorter is faster", at_tip=True)
+    return svg.render(h), h
+
+
+#---------------------------------------------------------------------------#
+# Badges
+#---------------------------------------------------------------------------#
+BADGE_LIGHT = {"good": "#1a7f37", "warning": "#9a6700", "critical": "#cf222e",
+               "none": "#6e7781", "unknown": "#6e7781", "info": "#0969da"}
+BADGE_DARK = {"good": "#238636", "warning": "#9e6a03", "critical": "#da3633",
+              "none": "#6e7681", "unknown": "#6e7681", "info": "#1f6feb"}
+
+
+def badge(label, message, level):
+    lw = round(badge_w(label) + 12)
+    mw = round(badge_w(message) + 12)
+    w = lw + mw
+    title = "%s: %s" % (label, message)
+    style = (".lab{fill:#555}.msg{fill:%s}text{font-family:%s;font-size:11px;fill:#fff}"
+             "@media (prefers-color-scheme:dark){.lab{fill:#3d444d}.msg{fill:%s}}"
+             % (BADGE_LIGHT[level], FONT, BADGE_DARK[level]))
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="20" viewBox="0 0 %d 20" '
+        'role="img" aria-label="%s">\n<title>%s</title>\n<style>%s</style>\n'
+        '<clipPath id="r"><rect width="%d" height="20" rx="3"/></clipPath>\n'
+        '<g clip-path="url(#r)"><rect class="lab" width="%d" height="20"/>'
+        '<rect class="msg" x="%d" width="%d" height="20"/></g>\n'
+        '<text x="%.1f" y="14" text-anchor="middle">%s</text>\n'
+        '<text x="%.1f" y="14" text-anchor="middle">%s</text>\n</svg>\n'
+    ) % (w, w, esc(title), esc(title), style, w, lw, lw, mw,
+         lw / 2, esc(label), lw + mw / 2, esc(message))
+
+
+def target_badge(t, interval, tolerance):
+    lvl = target_level(t, interval, tolerance)
+    if lvl == "none":
+        return badge(t["target"], "not mirrored", "none")
+    if lvl == "unknown":
+        return badge(t["target"], "unknown", "unknown")
+    return badge(t["target"], "%s · %s" % (fmt_pct(cov_ratio(t)), fmt_age(t.get("age_seconds"))), lvl)
+
+
+def group_badge(label, targets, interval, tolerance, count=False):
+    promoted = [t for t in targets if (t.get("mirror") or {}).get("state") == "promoted"]
+    if not promoted:
+        return badge(label, "not mirrored", "none")
+    n = sum(((t.get("coverage") or {}).get("of_files") or 0) for t in targets)
+    m = sum(((t.get("coverage") or {}).get("files") or 0) for t in targets)
+    worst = max((target_level(t, interval, tolerance) for t in targets), key=lambda lv: LEVEL_RANK[lv])
+    if worst in ("none", "unknown"):
+        worst = "warning"
+    ages = [t["age_seconds"] for t in promoted if num(t.get("age_seconds"))]
+    if count:
+        msg = "%s · %d/%d repos" % (fmt_pct(m / n if n else None), len(promoted), len(targets))
+    else:
+        msg = "%s · %s" % (fmt_pct(m / n if n else None), fmt_age(max(ages) if ages else None))
+    return badge(label, msg, worst)
+
+
+def speed_badge(bench):
+    if not bench:
+        return badge("pacman speed", "no data", "none")
+    tot = bench_totals(bench)
+    if tot.get("oci") is None:
+        return badge("pacman speed", "oci failed", "critical")
+    return badge("pacman speed", "oci %s · official %s" % (fmt_secs(tot["oci"]), fmt_secs(tot.get("official"))),
+                 "info")
+
+
+#---------------------------------------------------------------------------#
+# The page
+#---------------------------------------------------------------------------#
+PAGE_CSS = """
+:root{color-scheme:light dark;--page:#f6f6f3;--surface:#fcfcfb;--ink:#0b0b0b;
+--ink2:#52514e;--muted:#6f6e69;--line:#e6e5df;--ring:rgba(11,11,11,.10);
+--code:#efeee9;--link:#1c5cab;--good:#0ca30c;--warning:#fab219;--critical:#d03b3b;
+--none:#898781}
+@media (prefers-color-scheme:dark){:root{--page:#0d0d0d;--surface:#1a1a19;
+--ink:#ffffff;--ink2:#c3c2b7;--muted:#9a9890;--line:#2c2c2a;
+--ring:rgba(255,255,255,.10);--code:#262624;--link:#86b6ef}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--page);color:var(--ink);font:15px/1.55 FONT}
+a{color:var(--link)}
+.wrap{max-width:1680px;margin:0 auto;padding:28px 16px 56px}
+.top{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:flex-end;
+justify-content:space-between;margin-bottom:24px}
+h1{font-size:28px;line-height:1.2;margin:0 0 6px;font-weight:650;letter-spacing:-.01em}
+h2{font-size:19px;margin:44px 0 14px;font-weight:620}
+p{margin:0 0 10px;max-width:76ch}
+.lede{color:var(--ink2)}
+.meta{color:var(--muted);font-size:13px}
+.badges{display:flex;flex-wrap:wrap;gap:8px}
+.badges img{display:block;height:20px;width:auto}
+.hero{display:grid;grid-template-columns:minmax(0,1fr);gap:20px 32px;
+background:var(--surface);border:1px solid var(--ring);border-radius:16px;padding:16px}
+@media (min-width:600px){.hero{padding:24px}}
+@media (min-width:900px){.hero{grid-template-columns:minmax(0,4fr) minmax(0,7fr);align-items:center}}
+.big{font-size:56px;line-height:1;font-weight:650;letter-spacing:-.03em;margin:0}
+@media (min-width:600px){.big{font-size:72px}}
+.big-cap{color:var(--ink2);margin:12px 0 0}
+.tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+@media (min-width:560px){.tiles{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.tile{border:1px solid var(--ring);border-radius:12px;padding:12px 14px;min-width:0}
+.tile .k{font-size:13px;color:var(--ink2)}
+.tile .v{font-size:22px;font-weight:620;line-height:1.3;overflow-wrap:anywhere}
+.tile .s{font-size:12px;color:var(--muted)}
+.use{display:grid;grid-template-columns:minmax(0,1fr);gap:16px}
+@media (min-width:900px){.use{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.use h3{font-size:15px;margin:0 0 6px;font-weight:620}
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,720px),1fr));
+gap:20px;justify-items:center}
+figure{margin:0;width:100%;max-width:860px;min-width:0}
+figure img{display:block;width:100%;height:auto}
+details{margin:6px 4px 0}
+summary{cursor:pointer;color:var(--ink2);font-size:13px;padding:2px 0}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--ring);
+border-radius:12px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);
+white-space:nowrap;vertical-align:baseline}
+tr:last-child td{border-bottom:0}
+th{font-weight:600;color:var(--ink2)}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+td details{margin:0;display:inline-block}
+td summary{padding:0}
+.st{display:inline-flex;align-items:center;gap:7px}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
+.dot.good{background:var(--good)}
+.dot.warning{width:0;height:0;border-radius:0;border-left:5px solid transparent;
+border-right:5px solid transparent;border-bottom:9px solid var(--warning)}
+.dot.critical{border-radius:1px;background:var(--critical);transform:rotate(45deg) scale(.82)}
+.dot.none,.dot.unknown{border:1.5px solid var(--none)}
+code,pre{font-family:MONO;font-size:13px}
+code{background:var(--code);padding:1px 5px;border-radius:5px}
+pre{background:var(--code);padding:14px 16px;border-radius:12px;overflow-x:auto;margin:0}
+pre code{background:none;padding:0}
+.missing{white-space:normal;color:var(--ink2);font-size:12px;max-width:60ch;margin-top:4px}
+footer{margin-top:48px;color:var(--muted);font-size:13px}
+""".replace("FONT", FONT).replace("MONO", MONO)
+
+
+def state_cell(level, word):
+    return '<span class="st"><span class="dot %s" aria-hidden="true"></span>%s</span>' % (
+        esc(level), esc(word))
+
+
+def table(head, rows, nums=()):
+    h = "".join('<th class="n">%s</th>' % esc(x) if i in nums else "<th>%s</th>" % esc(x)
+                for i, x in enumerate(head))
+    body = "".join("<tr>%s</tr>" % "".join('<td class="n">%s</td>' % c if i in nums else "<td>%s</td>" % c
+                                           for i, c in enumerate(r)) for r in rows)
+    return "<table><thead><tr>%s</tr></thead><tbody>%s</tbody></table>" % (h, body)
+
+
+def page(ctx, charts, badges):
+    status, targets = ctx["status"], ctx["targets"]
+    interval, tolerance, bench = ctx["interval"], ctx["tolerance"], ctx["bench"]
+    s = status["summary"]
+    wk = status.get("worker") or {}
+    worker_url = status.get("worker_url") or ""
+    site = status.get("site_url") or ""
+    source = status.get("source") or ""
+    ns = status.get("namespace") or ""
+    registry = status.get("registry") or "ghcr.io"
+
+    def tile(k, v, sub="", raw=False):
+        return ('<div class="tile"><div class="k">%s</div><div class="v">%s</div>'
+                '<div class="s">%s</div></div>' % (esc(k), v if raw else esc(v), esc(sub)))
+
+    oldest = s.get("oldest_age_seconds")
+    if wk.get("ok") is True:
+        wv, wl = "ok", "good"
+    elif wk.get("ok") is False:
+        wv, wl = "failing", "critical"
+    else:
+        wv, wl = "not judged", "unknown"
+    ghcr_ms = fmt_secs((status.get("ghcr") or {}).get("median_manifest_seconds"))
+    wsub = "median %s; GHCR manifest %s" % (fmt_secs(wk.get("median_seconds")), ghcr_ms)
+    if wk.get("failed_runs"):
+        wsub = "%d run(s) in a row; median %s" % (wk["failed_runs"], fmt_secs(wk.get("median_seconds")))
+    totals = bench_totals(bench) if bench else {}
+    if totals.get("oci") is not None:
+        last = tile("pacman, oci wrapper", fmt_secs(totals["oci"]),
+                    "official mirror %s" % fmt_secs(totals.get("official")))
+    else:
+        last = tile("GHCR manifest", ghcr_ms, "median, read with no credential")
+    tiles = "".join([
+        tile("Repositories with a snapshot", "%d of %d" % (s.get("promoted", 0), s.get("targets", 0)),
+             "%d match upstream now" % s.get("current", 0)),
+        tile("Files in the mirror", fmt_int(s.get("mirrored_files")),
+             "of %s upstream" % fmt_int(s.get("upstream_files"))),
+        tile("Size in the mirror", "%s GiB" % fmt_gib(s.get("mirrored_bytes")),
+             "of %s GiB, %s" % (fmt_gib(s.get("upstream_bytes")), fmt_pct(s.get("coverage_bytes")))),
+        tile("Oldest snapshot", fmt_age(oldest) if num(oldest) else "none",
+             "sync runs every %s" % fmt_interval(interval)),
+        tile("Worker", state_cell(wl, wv), wsub, raw=True),
+        last,
+    ])
+
+    def fig(name, alt, tbl):
+        _, hw = charts[name]["wide"]
+        _, hn = charts[name]["narrow"]
+        return ('<figure><a href="charts/%(n)s.svg"><picture>'
+                '<source media="(max-width: 600px)" srcset="charts/narrow/%(n)s.svg" width="%(nw)d" height="%(nh)d">'
+                '<img src="charts/%(n)s.svg" width="%(ww)d" height="%(wh)d" alt="%(alt)s" loading="lazy">'
+                '</picture></a><details><summary>Table</summary><div class="scroll">%(t)s</div></details></figure>'
+                % {"n": name, "nw": NARROW, "nh": hn, "ww": WIDE, "wh": hw, "alt": esc(alt), "t": tbl})
+
+    cov_rows, size_rows, fresh_rows = [], [], []
+    for t in targets:
+        c = t.get("coverage") or {}
+        lvl, word = freshness(t, interval, tolerance)
+        cov_rows.append([esc(t["target"]), esc(fmt_int(c.get("files"))), esc(fmt_int(c.get("of_files"))),
+                         esc(fmt_pct(c.get("ratio_files"))), esc(fmt_int(c.get("missing")))])
+        size_rows.append([esc(t["target"]), esc(fmt_gib(c.get("bytes"))), esc(fmt_gib(c.get("of_bytes"))),
+                          esc(fmt_pct(c.get("ratio_bytes")))])
+        fresh_rows.append([esc(t["target"]), state_cell(lvl, word),
+                           esc(fmt_time((t.get("mirror") or {}).get("fetched"))),
+                           esc(fmt_age(t.get("age_seconds"))), esc(fmt_age(t.get("lag_seconds")))])
+    hist_rows = []
+    for a in ctx["hist_order"]:
+        pts = ctx["series"][a]
+        covs = [p for p in pts if p[1] is not None]
+        ages = [p[2] for p in pts if p[2] is not None]
+        hist_rows.append([esc(a), esc(utc(pts[0][0]).strftime("%Y-%m-%d %H:%M")),
+                          esc(fmt_pct(covs[0][1]) if covs else "-"), esc(fmt_pct(covs[-1][1]) if covs else "-"),
+                          esc(fmt_age(max(ages)) if ages else "-"), esc(fmt_int(len(pts)))])
+    hist_table = table(["architecture", "first point", "coverage then", "coverage now",
+                        "largest age", "points"], hist_rows, (2, 3, 4, 5))
+    speed_rows = []
+    cases = bench_cases(bench)
+    for op in OP_ORDER:
+        for p in PATH_ORDER:
+            c = cases.get((p, op))
+            if c:
+                speed_rows.append([esc(op), esc(PATH_LABEL[p]),
+                                   esc(fmt_secs(c.get("seconds")) if c.get("ok") is True else "failed"),
+                                   esc(", ".join(fmt_secs(r) for r in (c.get("rounds") or []) if num(r))),
+                                   esc(fmt_int(c.get("files"))),
+                                   esc("%.1f" % ((c.get("bytes") or 0) / 1048576))])
+    figs = "".join([
+        fig("coverage", "Coverage by repository: %s of upstream files are in the mirror."
+            % fmt_pct(s.get("coverage_files")),
+            table(["repository", "in the mirror", "upstream", "share", "missing"], cov_rows, (1, 2, 3, 4))),
+        fig("freshness", "Snapshot age per repository, against the sync interval.",
+            table(["repository", "state", "fetched, UTC", "age", "lag"], fresh_rows, (3, 4))),
+        fig("history-coverage", "Coverage per architecture over the last 30 days.", hist_table),
+        fig("history-age", "Oldest snapshot age per architecture over the last 30 days.", hist_table),
+        fig("size", "Size by repository: %s GiB of %s GiB are in the mirror."
+            % (fmt_gib(s.get("mirrored_bytes")), fmt_gib(s.get("upstream_bytes"))),
+            table(["repository", "GiB in the mirror", "GiB upstream", "share"], size_rows, (1, 2, 3))),
+        fig("speed", "pacman speed through each path, from the daily benchmark.",
+            table(["operation", "path", "median", "rounds", "files", "MiB"], speed_rows, (2, 4, 5))
+            if speed_rows else "<p>No benchmark yet.</p>"),
+    ])
+
+    repo_rows = []
+    for t in targets:
+        c = t.get("coverage") or {}
+        u = t.get("upstream") or {}
+        lvl, word = target_word(t, interval, tolerance)
+        names = c.get("missing_names") or []
+        miss = esc(fmt_int(c.get("missing")))
+        if names:
+            more = (c.get("missing") or 0) - len(names)
+            miss = ('<details><summary>%s</summary><div class="missing">%s%s</div></details>'
+                    % (miss, ", ".join("<code>%s</code>" % esc(n) for n in names),
+                       esc(", and %s more" % fmt_int(more)) if more > 0 else ""))
+        probes = []
+        for key in ("db", "package"):
+            p = (t.get("worker") or {}).get(key)
+            if p:
+                probes.append("%s %s%s" % (key, p.get("code"), " failed" if p.get("ok") is False else ""))
+        repo_rows.append([
+            "<code>%s</code>" % esc(t["target"]), state_cell(lvl, word),
+            esc(fmt_pct(c.get("ratio_files"))), esc(fmt_int(c.get("files"))), esc(fmt_int(c.get("of_files"))),
+            miss, esc(fmt_gib(c.get("of_bytes"))), esc(fmt_age(t.get("age_seconds"))),
+            esc(fmt_age(t.get("lag_seconds"))), esc(fmt_time((t.get("mirror") or {}).get("fetched"))),
+            esc(u.get("server") or u.get("error") or "-"), esc(", ".join(probes) or "-"),
+            '<img src="badges/%s.svg" alt="%s badge" height="20">' % (esc(t["target"]), esc(t["target"])),
+        ])
+    repos = table(["repository", "state", "coverage", "files", "upstream", "missing", "GiB", "age",
+                   "lag", "fetched, UTC", "upstream server", "Worker", "badge"],
+                  repo_rows, (2, 3, 4, 5, 6, 7, 8))
+
+    probe_rows = []
+    for t in targets:
+        for key in ("db", "package"):
+            p = (t.get("worker") or {}).get(key)
+            if not p:
+                continue
+            ok = p.get("ok")
+            lvl = "good" if ok is True else ("critical" if ok is False else "unknown")
+            probe_rows.append([
+                esc(t["target"]), esc(key), "<code>%s</code>" % esc(p.get("url")),
+                esc(p.get("code")), esc(p.get("expect") if p.get("expect") is not None else "-"),
+                esc(fmt_secs(p.get("seconds"))), esc(p.get("location") or "-"),
+                state_cell(lvl, "ok" if ok is True else (p.get("error") or "not judged"))])
+    probes_html = (table(["repository", "probe", "URL", "HTTP", "expected", "time", "redirect to",
+                          "result"], probe_rows, (3, 4, 5))
+                   if probe_rows else "<p>The Worker was not probed.</p>")
+
+    badge_rows = []
+    for name in badges:
+        badge_rows.append(['<img src="badges/%s.svg" alt="%s badge" height="20">' % (esc(name), esc(name)),
+                           "<code>%sbadges/%s.svg</code>" % (esc(site), esc(name))])
+
+    use = ""
+    if worker_url:
+        use = (
+            '<h2>Use the mirror</h2><div class="use">'
+            '<div><h3>Through the Worker, no client</h3><p>pacman downloads as usual. The Worker '
+            'answers each request with a redirect to GHCR.</p><pre><code>[core]\nServer = %(w)s/$arch/$repo\n'
+            'Include = /etc/pacman.d/mirrorlist</code></pre></div>'
+            '<div><h3>Through the oci wrapper</h3><p>pacman reads the registry with '
+            '<code>client/pacman-oci</code> as its XferCommand.</p><pre><code>[options]\n'
+            'XferCommand = /usr/local/bin/pacman-oci %%o %%u\n\n[core]\n'
+            'Server = oci://%(r)s/%(ns)s/$arch/$repo\nInclude = /etc/pacman.d/mirrorlist</code></pre></div>'
+            '</div>' % {"w": esc(worker_url), "r": esc(registry), "ns": esc(ns)})
+
+    return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>mirror-archlinux status</title>
+<meta name="description" content="Coverage, freshness and speed of the Arch Linux repositories mirrored to GHCR.">
+<style>%(css)s</style>
+</head>
+<body>
+<div class="wrap">
+<header class="top">
+<div>
+<h1>mirror-archlinux status</h1>
+<p class="lede">Arch Linux repositories for %(narch)d architectures, mirrored to GitHub Container Registry and served to pacman.</p>
+<p class="meta">Measured %(gen)s. Source: <a href="%(source)s">%(source_text)s</a>.</p>
+</div>
+<div class="badges"><img src="badges/all.svg" alt="all repositories badge" height="20"><img src="badges/speed.svg" alt="pacman speed badge" height="20"></div>
+</header>
+<section class="hero" aria-label="Summary">
+<div>
+<p class="big">%(cov)s</p>
+<p class="big-cap">of upstream files are in the mirror, counted by file name and sha256 over %(n)d repositories.</p>
+</div>
+<div class="tiles">%(tiles)s</div>
+</section>
+%(use)s
+<h2>Charts</h2>
+<div class="charts">%(figs)s</div>
+<h2>Repositories</h2>
+<div class="scroll">%(repos)s</div>
+<h2>Worker probes</h2>
+<p>Each probe is one GET with no redirect followed. A repository with a snapshot must answer 302 to <code>https://*.githubusercontent.com</code>. A repository with no snapshot must answer 404. Two failed runs in a row open the <code>worker-down</code> issue.</p>
+<div class="scroll">%(probes)s</div>
+<h2>Badges</h2>
+<div class="scroll">%(badges)s</div>
+<footer>
+<p>Coverage counts an upstream file when the mirror's database names the same file name with the same sha256. Age is the time since the snapshot was fetched from upstream. Lag is the newest upstream build date minus the newest build date in the mirror. A snapshot that matches upstream is current at any age.</p>
+<p>Data: <a href="status.json">status.json</a>, <a href="history.json">history.json</a>, <a href="bench.json">bench.json</a>. Written by <code>scripts/status-collect</code> and <code>scripts/status-render</code>.</p>
+</footer>
+</div>
+</body>
+</html>
+""" % {
+        "css": PAGE_CSS, "gen": esc(fmt_time(status.get("generated")) + " UTC"),
+        "source": esc(source), "source_text": esc(source.replace("https://", "")),
+        "narch": len(ctx["order"]), "cov": esc(fmt_pct(s.get("coverage_files"))),
+        "n": s.get("targets", 0), "tiles": tiles, "use": use, "figs": figs, "repos": repos,
+        "probes": probes_html, "badges": table(["badge", "URL"], badge_rows),
+    }
+
+
+#---------------------------------------------------------------------------#
+# Input
+#---------------------------------------------------------------------------#
+def read_json(path, what, required):
+    if not os.path.exists(path):
+        if required:
+            die("%s: no such file" % path, "it is %s" % what, "reproduce: ls -l %s" % path)
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        if required:
+            die("%s does not read as JSON: %s" % (path, e),
+                "reproduce: python3 -I -m json.tool %s" % path)
+        warn("%s does not read as JSON, so it is left out: %s" % (path, e))
+        return None
+
+
+def read_history(path):
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError as e:
+                warn("%s line %d is not JSON, so it is left out: %s" % (path, i, e))
+                continue
+            if not isinstance(obj, dict) or parse_time(obj.get("t")) is None:
+                warn("%s line %d has no time t, so it is left out" % (path, i))
+                continue
+            out.append(obj)
+    return out
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def main(argv):
+    if len(argv) != 3:
+        sys.stderr.write("usage: python3 -I scripts/status-render IN OUT_SITE\n")
+        return 2
+    src, site = argv[1], argv[2]
+    status = read_json(os.path.join(src, "status.json"), "scripts/status-collect's output", True)
+    if not isinstance(status, dict) or status.get("schema") != 1:
+        die("%s/status.json is not schema 1" % src,
+            "reproduce: python3 -I -m json.tool %s/status.json" % src)
+    if not isinstance(status.get("summary"), dict):
+        die("%s/status.json has no summary" % src)
+    targets = status.get("targets")
+    if not isinstance(targets, list) or not targets:
+        die("%s/status.json names no target" % src)
+    for t in targets:
+        if not isinstance(t, dict) or not isinstance(t.get("target"), str) or "-" not in t["target"]:
+            die("%s/status.json has a target entry with no arch-repo name: %r" % (src, t))
+        t.setdefault("arch", t["target"].split("-", 1)[0])
+        t.setdefault("repo", t["target"].split("-", 1)[1])
+    history = read_history(os.path.join(src, "history.jsonl"))
+    bench = read_json(os.path.join(src, "bench.json"), "scripts/bench-consumer's output", False)
+    if bench is not None and (not isinstance(bench, dict) or bench.get("schema") != 1
+                              or not isinstance(bench.get("cases"), list)):
+        warn("%s/bench.json is not schema 1 with a cases list, so it is left out" % src)
+        bench = None
+    if bench is not None and not bench["cases"]:
+        bench = None
+
+    sync = status.get("sync") or {}
+    order, slots = arch_slots({t["arch"] for t in targets})
+    now = status.get("generated_epoch") or parse_time(status.get("generated")) or 0
+    series = history_series(history, now)
+    ctx = {
+        "status": status, "bench": bench, "order": order, "slots": slots, "now": now,
+        "targets": sorted(targets, key=lambda t: target_key(t, order)),
+        "interval": (sync.get("interval_minutes") or 180) * 60,
+        "tolerance": (sync.get("tolerance_days") or 3) * 86400,
+        "series": series,
+        "hist_order": [a for a in order if a in series] + sorted(a for a in series if a not in order),
+    }
+
+    builders = [("coverage", chart_coverage), ("freshness", chart_freshness),
+                ("size", chart_size), ("history-coverage", chart_history_coverage),
+                ("history-age", chart_history_age), ("speed", chart_speed)]
+    charts = {}
+    for name, build in builders:
+        charts[name] = {"wide": build(ctx, WIDE), "narrow": build(ctx, NARROW)}
+        write(os.path.join(site, "charts", name + ".svg"), charts[name]["wide"][0])
+        write(os.path.join(site, "charts", "narrow", name + ".svg"), charts[name]["narrow"][0])
+
+    interval, tolerance = ctx["interval"], ctx["tolerance"]
+    badges = []
+    for t in ctx["targets"]:
+        write(os.path.join(site, "badges", t["target"] + ".svg"), target_badge(t, interval, tolerance))
+        badges.append(t["target"])
+    for a in order:
+        ts = [t for t in ctx["targets"] if t["arch"] == a]
+        write(os.path.join(site, "badges", a + ".svg"), group_badge(a, ts, interval, tolerance))
+        badges.append(a)
+    write(os.path.join(site, "badges", "all.svg"),
+          group_badge("mirror", ctx["targets"], interval, tolerance, count=True))
+    badges.append("all")
+    write(os.path.join(site, "badges", "speed.svg"), speed_badge(bench))
+    badges.append("speed")
+
+    write(os.path.join(site, "index.html"), page(ctx, charts, badges))
+    write(os.path.join(site, "status.json"), json.dumps(status, indent=1) + "\n")
+    write(os.path.join(site, "history.json"), json.dumps(history, separators=(",", ":")) + "\n")
+    write(os.path.join(site, "bench.json"),
+          json.dumps(bench if bench is not None else {"schema": 1, "cases": []}, indent=1) + "\n")
+    sys.stderr.write("%s: %d chart(s) in 2 widths, %d badge(s), %d history point(s), bench %s, in %s\n"
+                     % (PROG, len(charts), len(badges), len(history),
+                        "present" if bench else "absent", site))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
