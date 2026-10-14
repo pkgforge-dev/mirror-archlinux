@@ -15,7 +15,7 @@ fi
 
 cd "$REPO_ROOT"
 found=0
-for f in .github/workflows/*.yml; do
+for f in .github/workflows/*.yml .github/workflows/*.yaml; do
   [ -e "$f" ] || continue
   found=$((found + 1))
   out="$(actionlint -no-color "$f" 2>&1)" && rc=0 || rc=$?
@@ -26,7 +26,7 @@ for f in .github/workflows/*.yml; do
   fi
 done
 if [ "$found" -eq 0 ]; then
-  fail "there are workflows to lint" "no .github/workflows/*.yml" "reproduce: ls .github/workflows"
+  fail "there are workflows to lint" "no .github/workflows/*.yml or *.yaml" "reproduce: ls .github/workflows"
 fi
 
 summary
