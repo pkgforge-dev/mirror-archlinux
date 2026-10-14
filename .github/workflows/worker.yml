@@ -1,0 +1,95 @@
+# The Cloudflare Worker in worker/ (ghcr.mirror.archlinux.pkgforge.dev).
+#
+#   test     node --test 'worker/test/*.test.js' in the pinned node image
+#   deploy   wrangler deploy from main, then tests/worker/live.sh against the
+#            deployed Worker. With no CLOUDFLARE_API_TOKEN secret, the job
+#            shows a notice and ends with success, with no deploy.
+#
+# The Worker holds no secret: the API token is used only by wrangler-action,
+# and the account id is in worker/wrangler.toml.
+name: Worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'worker/**'
+      - '.github/workflows/worker.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: worker-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Worker tests in the pinned node image
+        run: |
+          # tag: 24-alpine
+          image=docker.io/library/node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
+          docker run --rm -v "$PWD:/work:ro" -w /work "$image" node --test 'worker/test/*.test.js'
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check for the Cloudflare API token
+        id: token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::notice::The CLOUDFLARE_API_TOKEN secret is not set, so the Worker is not deployed. Make it from the Edit Cloudflare Workers token template."
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Deploy the Worker
+        if: steps.token.outputs.deploy == 'true'
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4.1.3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          wranglerVersion: "4.150.0"
+          workingDirectory: worker
+          command: deploy
+      - name: Check the deployed Worker
+        if: steps.token.outputs.deploy == 'true'
+        env:
+          WORKER_LIVE: '1'
+        run: |
+          # A new version can take some seconds to reach every data centre, so
+          # the check runs up to 3 times. Each failed attempt stays in the log.
+          rc=0
+          for attempt in 1 2 3; do
+            rc=0
+            REPO_ROOT="$PWD" bash tests/worker/live.sh || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              exit 0
+            fi
+            echo "::warning::tests/worker/live.sh attempt $attempt ended $rc"
+            if [ "$attempt" -lt 3 ]; then
+              sleep 20
+            fi
+          done
+          exit "$rc"

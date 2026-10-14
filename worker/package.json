@@ -1,0 +1,6 @@
+{
+  "name": "ghcr-mirror-archlinux-pkgforge",
+  "private": true,
+  "description": "The HTTPS front for the GHCR mirror. No dependencies: tests/worker/10-node.sh runs the tests.",
+  "type": "module"
+}
