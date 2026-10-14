@@ -290,6 +290,11 @@ pac() { pacman --config /tmp/pacman.conf --noconfirm "$@"; }
 
 phase "keyring"
 pacman-key --init
+# A key that is missing or expired must fail at once. pacman asks a keyserver
+# for it otherwise, and that makes verify wait on a host outside this run.
+# Port 9 on the loopback refuses the connection at once.
+sed -i '/^[[:space:]]*keyserver[[:space:]]/d' /etc/pacman.d/gnupg/gpg.conf
+echo 'keyserver hkp://127.0.0.1:9' >> /etc/pacman.d/gnupg/gpg.conf
 copied=()
 for f in /in/keyrings/*; do
   [ -f "$f" ] || continue
