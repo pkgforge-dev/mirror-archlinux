@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+#
+# Measure what the mirror serves against what upstream serves, for the status
+# page and the watchdog.
+#
+#   scripts/status-collect OUT [TARGET.conf ...]
+#
+# With no target file, every enabled target in targets/ is measured. For each
+# target:
+#   upstream  <repo>.db from the first db_server that answers 200, in order
+#   mirror    the latest manifest and the database it names, read with no
+#             credential (Bearer QQ== on GHCR), the way a consumer reads
+#   coverage  upstream (filename, sha256) pairs that the mirror database also
+#             names, by count and by bytes; the first 20 missing file names
+#   age       now minus the snapshot's fetched time
+#   lag       upstream newest build date minus the mirror's newest build date
+#   worker    GET <worker>/<arch>/<repo>/<repo>.db and one package, with no
+#             redirect followed: 302 to https://*.githubusercontent.com when
+#             latest exists, 404 when it does not
+#   ghcr      the time of the direct latest manifest GET
+#
+# Writes:
+#   OUT/status.json    schema 1, below
+#   OUT/history.jsonl  one compact line appended per run; the last
+#                      STATUS_HISTORY_LINES (2000) lines are kept
+#   OUT/worker.md      the worker-down issue body: every probe, and how to
+#                      reproduce the first failure
+# OUT/history.jsonl is read first when it exists, so the caller puts the
+# previous run's copy there.
+#
+# status.json, schema 1. Times are ISO 8601 UTC, sizes are bytes, durations
+# are seconds, a ratio is 0 to 1, null is "not measured":
+#   schema 1, generated, generated_epoch, source, site_url, registry,
+#   namespace, worker_url
+#   sync      {workflow, interval_minutes, tolerance_days}, from sync.yml's cron
+#   summary   {targets, promoted, current, upstream_files, upstream_bytes,
+#             mirrored_files, mirrored_bytes, coverage_files, coverage_bytes,
+#             oldest_age_seconds, newest_age_seconds}
+#   worker    {probed, ok, probes, failures, failed_runs, failing_since,
+#             median_seconds}; failed_runs counts the runs in a row, this one
+#             included, in which a probe failed
+#   ghcr      {median_manifest_seconds}
+#   targets[] {target, arch, repo, repository,
+#     upstream {ok, server, sha256, files, bytes, newest_builddate, tried[]
+#               {server, result}, error},
+#     mirror   {state promoted|absent|error, error, manifest_code,
+#               manifest_seconds, fetched, run, db_sha256, files, bytes,
+#               newest_builddate},
+#     current  true when the mirror database is upstream's database,
+#     coverage {files, of_files, ratio_files, bytes, of_bytes, ratio_bytes,
+#               missing, missing_names[]} or null when upstream is unread,
+#     age_seconds, lag_seconds,
+#     worker   {db, package}, each {url, code, expect, seconds, location, ok,
+#               error} or null}
+#
+# history.jsonl, one object per line:
+#   {"t": generated, "w": {"ok", "f": failed_runs, "s": failing_since, "ms"},
+#    "g": {"ms"}, "x": {"<target>": {"n": upstream files, "m": mirrored
+#    files, "b": upstream bytes, "mb": mirrored bytes, "a": age, "l": lag,
+#    "c": 1 current, 0 not, null unknown}}}
+#
+# Environment:
+#   MIRROR_NAMESPACE      owner/name, default from GITHUB_REPOSITORY
+#   MIRROR_REGISTRY       default ghcr.io
+#   STATUS_WORKER_URL     default https://ghcr.mirror.archlinux.pkgforge.dev;
+#                         empty: no Worker probe
+#   STATUS_SITE_URL       default https://<owner>.github.io/<name>/
+#   STATUS_HISTORY_LINES  default 2000
+#   MIRROR_NOW            seconds; pins the clock, for the test suite only
+#
+# ⚠ db_records reads the database with GNU tar (--wildcards). busybox tar
+# cannot, so this runs on the runner, not in Alpine.
+#
+# Exit status: 0 measured (a target that cannot be read is a measurement, and
+# is in status.json), 1 the collect itself could not run.
+set -euo pipefail
+SCRIPT_NAME=status-collect
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+need curl jq awk sha256sum tar sort
+
+out="${1:-}"
+[ -n "$out" ] || die "usage: scripts/status-collect OUT [TARGET.conf ...]"
+shift
+[ -n "$MIRROR_NAMESPACE" ] || die "MIRROR_NAMESPACE is not set" \
+  "set it to owner/name, or set GITHUB_REPOSITORY"
+mkdir -p "$out"
+
+# Anonymous, the way a consumer reads: registry_token answers QQ== on GHCR.
+REGISTRY_TOKEN=''
+WORKER_URL="${STATUS_WORKER_URL-https://ghcr.mirror.archlinux.pkgforge.dev}"
+WORKER_URL="${WORKER_URL%/}"
+HISTORY_LINES="${STATUS_HISTORY_LINES:-2000}"
+[[ "$HISTORY_LINES" =~ ^[1-9][0-9]*$ ]] || die "STATUS_HISTORY_LINES must be a positive integer, not '$HISTORY_LINES'"
+owner="${MIRROR_NAMESPACE%%/*}"
+name_part="${MIRROR_NAMESPACE#*/}"
+SITE_URL="${STATUS_SITE_URL:-https://$owner.github.io/${name_part%%/*}/}"
+SOURCE_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-$MIRROR_NAMESPACE}"
+UA="mirror-archlinux-status (+$SOURCE_URL)"
+
+if [ "$#" -eq 0 ]; then
+  for conf in "$TARGETS_DIR"/*.conf; do
+    [ -e "$conf" ] || continue
+    if target_enabled "$conf"; then
+      set -- "$@" "$conf"
+    fi
+  done
+fi
+[ "$#" -gt 0 ] || die "no enabled target" "reproduce: ls $TARGETS_DIR"
+
+now="$(now_epoch)"
+[[ "$now" =~ ^[0-9]+$ ]] || die "the clock reads '$now', not seconds"
+generated="$(jq -nr --argjson t "$now" '$t | todate')"
+
+sync_wf="$REPO_ROOT/.github/workflows/sync.yml"
+interval="$("$REPO_ROOT/scripts/cron-tolerance" --minutes "$sync_wf")"
+read -r _ tolerance <<< "$("$REPO_ROOT/scripts/cron-tolerance" "$sync_wf")"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/t"
+
+#---------------------------------------------------------------------------#
+# get URL OUT [HEADER ...] -> "CODE SECONDS LOCATION" on stdout, curl's status
+# as the return. Redirects are not followed: a probe measures the answer it
+# gets. The body is kept in OUT, so an error body can be quoted.
+#---------------------------------------------------------------------------#
+get() {
+  local url="$1" body="$2" args=() h rc=0 res
+  shift 2
+  for h in "$@"; do
+    args+=(--header "$h")
+  done
+  res="$(curl -q --silent --show-error --connect-timeout 10 --max-time 30 \
+    --proto '=http,https' --user-agent "$UA" "${args[@]}" \
+    --output "$body" --write-out '%{http_code} %{time_total} %{redirect_url}' "$url")" || rc=$?
+  printf '%s\n' "$res"
+  return "$rc"
+}
+
+# A database from upstream: redirects followed, a stall deadline rather than a
+# fixed one, as scripts/plan reads it.
+get_db() {
+  local url="$1" body="$2" rc=0 res
+  res="$(curl -q --location --silent --show-error --max-redirs 5 \
+    --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \
+    --connect-timeout 20 --speed-limit 4096 --speed-time 60 \
+    --retry 2 --retry-connrefused --retry-delay 2 --user-agent "$UA" \
+    --output "$body" --write-out '%{http_code} %{time_total}' "$url")" || rc=$?
+  printf '%s\n' "$res"
+  return "$rc"
+}
+
+# num VALUE -> VALUE when it is a JSON number, else null
+num() {
+  if [[ "${1:-}" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%s\n' "$1"
+  else
+    printf 'null\n'
+  fi
+}
+
+# http_code VALUE -> the three digit code as a number, 0 when curl gave none
+http_code() {
+  if [[ "${1:-}" =~ ^[0-9]{3}$ ]]; then
+    printf '%d\n' "$((10#$1))"
+  else
+    printf '0\n'
+  fi
+}
+
+# records_stats RECORDS.tsv -> "COUNT BYTES NEWEST_BUILDDATE"
+records_stats() {
+  awk -F '\t' '
+    { n++; b += $6; if ($7 + 0 > nb) nb = $7 + 0 }
+    END { printf "%d %.0f %.0f\n", n, b, nb }
+  ' "$1"
+}
+
+# probe NAME URL EXPECT DIR -> one probe object, as JSON, on stdout
+#
+# EXPECT is the code the Worker must answer: 302 when latest exists, 404 when
+# it does not, empty when the registry could not be read. With no EXPECT only
+# no answer or a 5xx fails; any other answer is measured and not judged.
+probe() {
+  local label="$1" url="$2" expect="$3" dir="$4" rc=0 res code secs loc host ok err
+  res="$(get "$url" "$dir/$label.body")" || rc=$?
+  read -r code secs loc <<< "$res"
+  code="$(http_code "${code:-}")"
+  host=""
+  if [ -n "${loc:-}" ]; then
+    host="${loc#*://}"
+    host="${host%%[/?#]*}"
+  fi
+  ok=null
+  err=""
+  if [ "$rc" -ne 0 ]; then
+    err="curl $rc: no answer within the 30 s deadline, or the connection failed"
+  elif [ -z "$expect" ]; then
+    if [ "$code" -ge 500 ]; then err="HTTP $code"; fi
+  elif [ "$code" != "$expect" ]; then
+    err="HTTP $code, expected $expect"
+  elif [ "$expect" = 302 ] && ! [[ "${loc:-}" =~ ^https://[^/?#]*\.githubusercontent\.com/ ]]; then
+    err="302 to '${host:-nothing}', not to https://*.githubusercontent.com"
+  fi
+  if [ -n "$err" ]; then
+    ok=false
+  elif [ -n "$expect" ]; then
+    ok=true
+  fi
+  [ -z "$err" ] || log "worker probe $url: $err"
+  jq -nc --arg url "$url" --argjson code "$code" --arg expect "$expect" \
+    --argjson secs "$(num "${secs:-}")" --arg host "$host" --argjson ok "$ok" --arg err "$err" \
+    '{url: $url, code: $code, expect: (if $expect == "" then null else ($expect | tonumber) end),
+      seconds: $secs, location: (if $host == "" then null else $host end), ok: $ok,
+      error: (if $err == "" then null else $err end)}'
+}
+
+#---------------------------------------------------------------------------#
+# One target
+#---------------------------------------------------------------------------#
+collect_target() {
+  local conf="$1" arch repo name repo_path tw
+  target_check "$conf"
+  arch="$(target_get "$conf" arch)"
+  repo="$(target_get "$conf" repo)"
+  name="$arch-$repo"
+  repo_path="$(target_repository "$conf")"
+  tw="$work/$name"
+  mkdir -p "$tw"
+
+  #-------------------------------------------------------------------------#
+  # Upstream, from the first db_server that answers 200
+  #-------------------------------------------------------------------------#
+  local server rc res code up_server="" up_err="" tried="[]" why
+  while IFS= read -r server; do
+    [ -n "$server" ] || continue
+    rc=0
+    res="$(get_db "$server/$repo.db" "$tw/up.db")" || rc=$?
+    read -r code _ <<< "$res"
+    if [ "$rc" -eq 0 ] && [ "${code:-}" = 200 ]; then
+      up_server="$server"
+      break
+    fi
+    if [ "$rc" -ne 0 ]; then why="curl $rc"; else why="HTTP ${code:-000}"; fi
+    log "$name: $server/$repo.db: $why"
+    tried="$(jq -c --arg s "$server" --arg r "$why" '. + [{server: $s, result: $r}]' <<< "$tried")"
+  done <<< "$(target_all "$conf" db_server)"
+
+  local up_ok=false up_sha="" up_n="" up_b="" up_nb=""
+  if [ -z "$up_server" ]; then
+    up_err="no db_server answered 200 for $repo.db"
+  else
+    up_sha="$(sha256sum "$tw/up.db" | cut -d ' ' -f 1)"
+    rc=0
+    db_records "$tw/up.db" "$tw/up.tsv" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      up_err="$up_server/$repo.db does not read as a database (db_records ended $rc)"
+      log "$name: $up_err"
+    else
+      up_ok=true
+      read -r up_n up_b up_nb <<< "$(records_stats "$tw/up.tsv")"
+    fi
+  fi
+
+  #-------------------------------------------------------------------------#
+  # The mirror's latest, anonymously
+  #-------------------------------------------------------------------------#
+  local token="" m_state m_err="" m_code=0 m_secs="" fetched="" run="" m_sha="" m_n="" m_b="" m_nb="" errc d
+  rc=0
+  token="$(registry_token "$repo_path" pull)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    res="$(get "$REG_URL/v2/$repo_path/manifests/latest" "$tw/latest.json" \
+      "Authorization: Bearer $token" \
+      'Accept: application/vnd.oci.image.manifest.v1+json')" || rc=$?
+    read -r m_code m_secs _ <<< "$res"
+    m_code="$(http_code "${m_code:-}")"
+  else
+    m_secs=""
+  fi
+  if [ -z "$token" ]; then
+    m_state=error
+    m_err="no pull token for $repo_path"
+  elif [ "$rc" -ne 0 ]; then
+    m_state=error
+    m_err="no answer for $repo_path:latest (curl $rc)"
+  elif [ "$m_code" = 200 ] && jq -e '.schemaVersion == 2' "$tw/latest.json" > /dev/null; then
+    m_state=promoted
+  elif [ "$m_code" = 404 ]; then
+    errc="$(registry_error_code "$tw/latest.json")"
+    case "$errc" in
+      MANIFEST_UNKNOWN | NAME_UNKNOWN) m_state=absent ;;
+      *)
+        m_state=error
+        m_err="$repo_path:latest answered 404 with error code '${errc:-none}'"
+        ;;
+    esac
+  else
+    m_state=error
+    m_err="$repo_path:latest answered HTTP $m_code"
+  fi
+
+  if [ "$m_state" = promoted ]; then
+    fetched="$(jq -r '.annotations["dev.pkgforge.mirror.fetched"] // empty' "$tw/latest.json")"
+    run="$(jq -r '.annotations["dev.pkgforge.mirror.run"] // empty' "$tw/latest.json")"
+    if [ -n "$fetched" ] && ! [[ "$fetched" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+      warn "$name: latest names a fetched time '$fetched' that is not ISO 8601 UTC; the age is not measured"
+      fetched=""
+    fi
+    read -r d _ _ <<< "$(manifest_layer "$tw/latest.json" "$repo.db")"
+    if [ -z "${d:-}" ]; then
+      m_state=error
+      m_err="$repo_path:latest has no single layer titled $repo.db"
+    else
+      rc=0
+      registry_blob "$repo_path" "$d" "$tw/mirror.db" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        m_state=error
+        m_err="could not read $repo.db ($d) of $repo_path"
+      else
+        m_sha="${d#sha256:}"
+        rc=0
+        db_records "$tw/mirror.db" "$tw/mirror.tsv" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+          m_state=error
+          m_err="$repo.db of $repo_path:latest does not read as a database"
+        else
+          read -r m_n m_b m_nb <<< "$(records_stats "$tw/mirror.tsv")"
+        fi
+      fi
+    fi
+  fi
+  [ -z "$m_err" ] || log "$name: $m_err"
+
+  #-------------------------------------------------------------------------#
+  # Coverage: an upstream file counts when the mirror names the same file
+  # name with the same sha256
+  #-------------------------------------------------------------------------#
+  local cov=null cm cn cmb cnb missing_json
+  if [ "$up_ok" = true ] && [ "$m_state" != error ]; then
+    touch "$tw/mirror.tsv"
+    read -r cn cm cnb cmb <<< "$(awk -F '\t' -v miss="$tw/missing.txt" '
+      FILENAME == ARGV[1] { have[$1 SUBSEP $5] = 1; next }
+      { n++; nb += $6; if (($1 SUBSEP $5) in have) { m++; mb += $6 } else print $1 > miss }
+      END { close(miss); printf "%d %d %.0f %.0f\n", n, m, nb, mb }
+    ' "$tw/mirror.tsv" "$tw/up.tsv")"
+    touch "$tw/missing.txt"
+    missing_json="$(LC_ALL=C sort "$tw/missing.txt" | awk 'NR <= 20' | jq -R . | jq -sc .)"
+    cov="$(jq -nc --argjson m "$cm" --argjson n "$cn" --argjson mb "$cmb" --argjson nb "$cnb" \
+      --argjson names "$missing_json" \
+      '{files: $m, of_files: $n, ratio_files: (if $n > 0 then $m / $n else null end),
+        bytes: $mb, of_bytes: $nb, ratio_bytes: (if $nb > 0 then $mb / $nb else null end),
+        missing: ($n - $m), missing_names: $names}')"
+  fi
+
+  #-------------------------------------------------------------------------#
+  # The Worker, with no redirect followed
+  #-------------------------------------------------------------------------#
+  local w_db=null w_pkg=null expect="" pkg
+  if [ -n "$WORKER_URL" ]; then
+    case "$m_state" in
+      promoted) expect=302 ;;
+      absent) expect=404 ;;
+    esac
+    w_db="$(probe db "$WORKER_URL/$arch/$repo/$repo.db" "$expect" "$tw")"
+    if [ "$m_state" = promoted ]; then
+      # One package by a plain name: the first by name, so the probe is the
+      # same file from run to run while the database stays the same.
+      pkg="$(awk -F '\t' '$1 ~ /^[a-z0-9][a-z0-9._-]*[.]pkg[.]tar[.][a-z0-9]+$/ { print $1 }' "$tw/mirror.tsv" |
+        LC_ALL=C sort | awk 'NR == 1')"
+      if [ -n "$pkg" ]; then
+        w_pkg="$(probe package "$WORKER_URL/$arch/$repo/$pkg" 302 "$tw")"
+      fi
+    fi
+  fi
+
+  jq -nc \
+    --arg target "$name" --arg arch "$arch" --arg repo "$repo" \
+    --arg repository "$MIRROR_REGISTRY/$repo_path" \
+    --argjson up_ok "$up_ok" --arg up_server "$up_server" --arg up_sha "$up_sha" \
+    --argjson up_n "$(num "$up_n")" --argjson up_b "$(num "$up_b")" --argjson up_nb "$(num "$up_nb")" \
+    --argjson tried "$tried" --arg up_err "$up_err" \
+    --arg m_state "$m_state" --arg m_err "$m_err" --argjson m_code "$m_code" \
+    --argjson m_secs "$(num "${m_secs:-}")" --arg fetched "$fetched" --arg run "$run" \
+    --arg m_sha "$m_sha" --argjson m_n "$(num "$m_n")" --argjson m_b "$(num "$m_b")" \
+    --argjson m_nb "$(num "$m_nb")" --argjson cov "$cov" --argjson now "$now" \
+    --argjson w_db "$w_db" --argjson w_pkg "$w_pkg" '
+    def nul: if . == "" then null else . end;
+    {
+      target: $target, arch: $arch, repo: $repo, repository: $repository,
+      upstream: {ok: $up_ok, server: ($up_server | nul), sha256: ($up_sha | nul),
+        files: $up_n, bytes: $up_b, newest_builddate: $up_nb, tried: $tried, error: ($up_err | nul)},
+      mirror: {state: $m_state, error: ($m_err | nul), manifest_code: $m_code, manifest_seconds: $m_secs,
+        fetched: ($fetched | nul), run: ($run | nul), db_sha256: ($m_sha | nul),
+        files: $m_n, bytes: $m_b, newest_builddate: $m_nb},
+      current: (if $up_sha != "" and $m_sha != "" then $up_sha == $m_sha
+                elif $m_state == "absent" and $up_ok then false else null end),
+      coverage: $cov,
+      age_seconds: (if $fetched != "" then $now - ($fetched | fromdateiso8601) else null end),
+      lag_seconds: (if $up_nb != null and $m_nb != null then $up_nb - $m_nb else null end),
+      worker: {db: $w_db, package: $w_pkg}
+    }' > "$work/t/$name.json"
+
+  printf '%-20s upstream %-5s %6s files  mirror %-8s coverage %s  worker %s\n' "$name" \
+    "$up_ok" "${up_n:-?}" "$m_state" \
+    "$(jq -r 'if .coverage == null then "unknown" else "\(.coverage.files)/\(.coverage.of_files)" end' "$work/t/$name.json")" \
+    "$(jq -r '[.worker.db, .worker.package] | map(select(. != null) | "\(.code)\(if .ok == false then "!" else "" end)") | join(",") | if . == "" then "-" else . end' "$work/t/$name.json")" >&2
+}
+
+for conf in "$@"; do
+  collect_target "$conf"
+done
+
+#---------------------------------------------------------------------------#
+# The Worker's failure streak, from the previous run's line
+#---------------------------------------------------------------------------#
+prev_f=0
+prev_s=""
+if [ -s "$out/history.jsonl" ]; then
+  last="$(tail -n 1 "$out/history.jsonl")"
+  rc=0
+  parsed="$(jq -r '[(.w.f // 0 | tostring), (.w.s // "")] | join(" ")' <<< "$last" 2> "$work/jq.err")" || rc=$?
+  if [ "$rc" -eq 0 ] && [[ "$parsed" =~ ^([0-9]+)\ ?(.*)$ ]]; then
+    prev_f="${BASH_REMATCH[1]}"
+    prev_s="${BASH_REMATCH[2]}"
+  else
+    warn "the last line of $out/history.jsonl does not read; the Worker failure count starts again" \
+      "$(cat "$work/jq.err")" "reproduce: tail -n 1 $out/history.jsonl | jq ."
+  fi
+fi
+
+jq -s \
+  --arg generated "$generated" --argjson now "$now" --arg source "$SOURCE_URL" \
+  --arg site "$SITE_URL" --arg registry "$MIRROR_REGISTRY" --arg ns "$MIRROR_NAMESPACE" \
+  --arg worker "$WORKER_URL" --argjson interval "$(num "$interval")" \
+  --argjson tolerance "$(num "${tolerance:-}")" \
+  --argjson prev_f "$prev_f" --arg prev_s "$prev_s" '
+  def median: sort | if length == 0 then null elif length % 2 == 1 then .[length / 2 | floor]
+    else (.[length / 2 - 1] + .[length / 2]) / 2 end;
+  def sum_of(f): map(f // 0) | add // 0;
+  . as $t
+  | ([$t[] | .worker.db, .worker.package | select(. != null)]) as $probes
+  | ([$probes[] | select(.ok == false)] | length) as $fail
+  | (if ($probes | length) == 0 then null
+     elif $fail > 0 then false
+     elif ([$probes[] | select(.ok == true)] | length) > 0 then true
+     else null end) as $wok
+  | ([$t[] | select(.coverage != null)]) as $cov
+  | ([$t[] | .age_seconds | select(. != null)]) as $ages
+  | {
+      schema: 1,
+      generated: $generated,
+      generated_epoch: $now,
+      source: $source,
+      site_url: $site,
+      registry: $registry,
+      namespace: $ns,
+      worker_url: (if $worker == "" then null else $worker end),
+      sync: {workflow: ".github/workflows/sync.yml", interval_minutes: $interval, tolerance_days: $tolerance},
+      summary: {
+        targets: ($t | length),
+        promoted: ([$t[] | select(.mirror.state == "promoted")] | length),
+        current: ([$t[] | select(.current == true)] | length),
+        upstream_files: ($cov | sum_of(.coverage.of_files)),
+        upstream_bytes: ($cov | sum_of(.coverage.of_bytes)),
+        mirrored_files: ($cov | sum_of(.coverage.files)),
+        mirrored_bytes: ($cov | sum_of(.coverage.bytes)),
+        coverage_files: (($cov | sum_of(.coverage.of_files)) as $n
+          | if $n > 0 then ($cov | sum_of(.coverage.files)) / $n else null end),
+        coverage_bytes: (($cov | sum_of(.coverage.of_bytes)) as $n
+          | if $n > 0 then ($cov | sum_of(.coverage.bytes)) / $n else null end),
+        oldest_age_seconds: ($ages | max),
+        newest_age_seconds: ($ages | min)
+      },
+      worker: {
+        probed: ($worker != ""),
+        ok: $wok,
+        probes: ($probes | length),
+        failures: $fail,
+        failed_runs: (if $wok == false then $prev_f + 1 else 0 end),
+        failing_since: (if $wok == false then (if $prev_f > 0 and $prev_s != "" then $prev_s else $generated end) else null end),
+        median_seconds: ([$probes[] | .seconds | select(. != null)] | median)
+      },
+      ghcr: {median_manifest_seconds: ([$t[] | .mirror.manifest_seconds | select(. != null)] | median)},
+      targets: ($t | sort_by(.target))
+    }' "$work"/t/*.json > "$work/status.json"
+mv "$work/status.json" "$out/status.json"
+
+#---------------------------------------------------------------------------#
+# History: one compact line per run, the last HISTORY_LINES kept
+#---------------------------------------------------------------------------#
+jq -c '{
+    t: .generated,
+    w: {ok: .worker.ok, f: .worker.failed_runs, s: .worker.failing_since,
+        ms: (if .worker.median_seconds == null then null else (.worker.median_seconds * 1000 | round) end)},
+    g: {ms: (if .ghcr.median_manifest_seconds == null then null else (.ghcr.median_manifest_seconds * 1000 | round) end)},
+    x: (.targets | map({key: .target, value: {
+          n: .coverage.of_files, m: .coverage.files, b: .coverage.of_bytes, mb: .coverage.bytes,
+          a: .age_seconds, l: .lag_seconds,
+          c: (if .current == true then 1 elif .current == false then 0 else null end)}}) | from_entries)
+  }' "$out/status.json" > "$work/line.json"
+if [ -f "$out/history.jsonl" ]; then
+  cat "$out/history.jsonl" "$work/line.json" > "$work/history.all"
+else
+  cp "$work/line.json" "$work/history.all"
+fi
+tail -n "$HISTORY_LINES" "$work/history.all" > "$work/history.jsonl"
+mv "$work/history.jsonl" "$out/history.jsonl"
+
+#---------------------------------------------------------------------------#
+# The worker-down issue body
+#---------------------------------------------------------------------------#
+# shellcheck disable=SC2016 # Markdown backticks inside a jq program
+jq -r '
+  def cell: if . == null then "-" else tostring end;
+  "<!-- written by scripts/status-collect on \(.generated) -->",
+  (if .worker.ok == false then
+     "The Worker fails its probe in \(.worker.failed_runs) run(s) in a row, since \(.worker.failing_since)."
+   elif .worker.ok == true then "The Worker passes every probe."
+   else "The Worker was not probed, or no probe could be judged." end),
+  "",
+  "Worker: \(.worker_url // "not set"). Each probe is a GET with no redirect followed. A target with `latest` must answer 302 to https://*.githubusercontent.com. A target with no `latest` must answer 404.",
+  "",
+  "| target | probe | HTTP | expected | seconds | result |",
+  "| --- | --- | --- | --- | --- | --- |",
+  (.targets[] as $t | [["db", $t.worker.db], ["package", $t.worker.package]][]
+    | select(.[1] != null)
+    | "| \($t.target) | \(.[0]) | \(.[1].code) | \(.[1].expect | cell) | \(.[1].seconds | cell) | \(if .[1].ok == true then "ok" elif .[1].ok == false then .[1].error else "not judged" end) |"),
+  "",
+  ([.targets[] | .worker.db, .worker.package | select(. != null and .ok == false)] | first // null
+   | if . == null then empty else
+       "reproduce:\n\n```bash\ncurl --connect-timeout 10 --max-time 30 -sS -o /dev/null -w \"%{http_code} %{redirect_url}\\n\" \"\(.url)\"\n```\n"
+     end),
+  "This issue closes itself when the Worker passes its probes again."
+' "$out/status.json" > "$work/worker.md"
+mv "$work/worker.md" "$out/worker.md"
+
+jq -r '"status-collect: \(.summary.targets) target(s), \(.summary.promoted) promoted, coverage \(if .summary.coverage_files == null then "unknown" else (.summary.coverage_files * 1000 | floor / 10 | tostring) + "%" end), worker \(.worker.ok | if . == null then "not judged" else tostring end), failed runs \(.worker.failed_runs)"' "$out/status.json" >&2

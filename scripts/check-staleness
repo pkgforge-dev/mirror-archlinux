@@ -16,7 +16,13 @@
 # run that is green and promotes nothing, a target held run after run by one
 # bad file: each ends here, as a database that has stopped following upstream.
 #
-# OUT/<target>.state   current fresh stale unknown
+# A target with no latest at all, whose file git added no more than the
+# tolerance ago, is new: the sync has not seeded it yet. Older, it is stale. ⚠
+# When git cannot say when the file was added (no git, a shallow clone, a file
+# git does not track), it is stale: an unknown age is never a grace period.
+# watchdog.yml checks out the whole history for this.
+#
+# OUT/<target>.state   current fresh new stale unknown
 # OUT/<target>.md      the issue body for a stale or unknown target
 #
 # Environment: MIRROR_NOW (seconds) pins the clock, for the test suite only.
@@ -53,6 +59,29 @@ run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pkgforge-
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+# added_date CONF -> YYYY-MM-DD of the last commit that added CONF, or nothing
+# when git cannot say; what git said then goes to stderr.
+added_date() {
+  local dir base shallow rc=0
+  if ! command -v git > /dev/null; then
+    log "git is not on PATH, so the date $1 was added is unknown"
+    return 0
+  fi
+  dir="$(dirname "$1")"
+  base="$(basename "$1")"
+  shallow="$(git -C "$dir" rev-parse --is-shallow-repository 2> "$work/git.err")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "git cannot say when $1 was added: $(sed -n 1p "$work/git.err")"
+    return 0
+  fi
+  if [ "$shallow" != false ]; then
+    log "the clone is shallow, so the date $1 was added is unknown" \
+      "reproduce: git -C $dir rev-parse --is-shallow-repository"
+    return 0
+  fi
+  git -C "$dir" log --diff-filter=A --format=%cs -- "$base" | awk 'NR == 1'
+}
+
 worst=0
 for conf in "$@"; do
   target_check "$conf"
@@ -71,8 +100,11 @@ for conf in "$@"; do
   fi
   rc=0
   REGISTRY_TOKEN='' registry_manifest "$repo_path" latest "$work/$name.json" || rc=$?
+  latest_absent=0
   if [ "$rc" -eq "$REG_STATUS_OK" ]; then
     fetched="$(jq -r '.annotations["dev.pkgforge.mirror.fetched"] // empty' "$work/$name.json")"
+  elif [ "$rc" -eq "$REG_STATUS_ABSENT" ]; then
+    latest_absent=1
   fi
 
   # What upstream serves now
@@ -88,12 +120,20 @@ for conf in "$@"; do
   done <<< "$(target_all "$conf" db_server)"
 
   verdict="$(stale_verdict "$promoted" "$upstream" "$fetched" "$today" "$tolerance")"
+  added=""
+  if [ "$verdict" = stale ] && [ "$latest_absent" -eq 1 ]; then
+    added="$(added_date "$conf")"
+    if [ -n "$added" ] && [ "$("$REPO_ROOT/scripts/date-age" "$added" "$today")" -le "$tolerance" ]; then
+      verdict=new
+    fi
+  fi
   printf '%s\n' "$verdict" > "$out/$name.state"
-  printf '%-24s %-8s promoted %s, fetched %s, upstream %s, tolerance %s day(s)\n' \
-    "$name" "$verdict" "${promoted:-none}" "${fetched:-never}" "${upstream:-unreadable}" "$tolerance"
+  printf '%-24s %-8s promoted %s, fetched %s, upstream %s, tolerance %s day(s)%s\n' \
+    "$name" "$verdict" "${promoted:-none}" "${fetched:-never}" "${upstream:-unreadable}" "$tolerance" \
+    "${added:+, target added $added}"
 
   case "$verdict" in
-    current | fresh) continue ;;
+    current | fresh | new) continue ;;
   esac
   worst=3
   # shellcheck disable=SC2016 # Markdown backticks, not command substitution
@@ -105,6 +145,9 @@ for conf in "$@"; do
     printf '| `latest` serves | `%s` |\n' "${promoted:-nothing readable}"
     printf '| fetched | %s |\n' "${fetched:-never}"
     printf '| upstream now | `%s` |\n' "${upstream:-no db_server answered}"
+    if [ "$latest_absent" -eq 1 ]; then
+      printf '| target file added | %s |\n' "${added:-unknown to git}"
+    fi
     printf '| tolerance | %s day(s), from sync.yml'"'"'s cron |\n\n' "$tolerance"
     printf 'The latest sync runs and their summaries: %s\n\n' "$run_url"
     printf 'Each run'"'"'s summary names the state of every target (held, replaced, private, behind, error) and the files at fault.\n\n'

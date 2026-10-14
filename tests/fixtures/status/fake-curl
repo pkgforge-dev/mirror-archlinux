@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+#
+# A stand-in for curl, for tests/unit/60-status.sh. It makes no network
+# request: every URL is answered from files under FAKE_CURL_ROOT.
+#
+#   PATH=<dir holding this file as curl>:$PATH FAKE_CURL_ROOT=DIR scripts/status-collect OUT
+#
+# For https://HOST/PATH (the query string dropped), with F = ROOT/HOST/PATH:
+#   F.code      the HTTP code to answer; 000 is a connection that fails
+#   F.location  the Location of a 3xx answer
+#   F.time      the seconds %{time_total} reports (default 0.012)
+#   F           the body; a code of 200 when F exists and F.code does not
+#   ROOT/HOST/.404  the body of a 404 for a file that is not there
+# A host with no directory under ROOT does not resolve.
+#
+# Understood: --output/-o, --write-out/-w, --fail/-f (in a short option group
+# too), --location/-L for one 3xx hop. Options that take a value are skipped
+# with their value; any other option is skipped alone. -K and --config are
+# refused, so a caller that needs them fails loudly here.
+#
+# FAKE_CURL_LOG, when set, gets one line per request: the URL.
+#
+# Exit status: 0, or curl's own codes: 6 no such host, 7 no connection,
+# 22 --fail and a code of 400 or more, 2 an option this stand-in refuses.
+set -euo pipefail
+
+root="${FAKE_CURL_ROOT:?FAKE_CURL_ROOT is not set}"
+outfile=""
+fmt=""
+url=""
+fail=0
+follow=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o | --output) outfile="$2"; shift 2 ;;
+    -w | --write-out) fmt="$2"; shift 2 ;;
+    -f | --fail) fail=1; shift ;;
+    -L | --location) follow=1; shift ;;
+    -K | --config)
+      echo "fake-curl: $1 is not supported" >&2
+      exit 2
+      ;;
+    --proto | --proto-redir | --max-redirs | --connect-timeout | --max-time | --speed-limit | \
+      --speed-time | --retry | --retry-delay | --retry-max-time | -H | --header | -A | \
+      --user-agent | --max-filesize | --data-urlencode | -u | --user | -X | --request | \
+      -C | --continue-at | -e | --referer | -D | --dump-header | --parallel-max)
+      shift 2
+      ;;
+    http://* | https://*) url="$1"; shift ;;
+    --*) shift ;;
+    -*)
+      case "$1" in
+        *f*) fail=1 ;;
+      esac
+      case "$1" in
+        *L*) follow=1 ;;
+      esac
+      shift
+      ;;
+    *) shift ;;
+  esac
+done
+[ -n "$url" ] || { echo "fake-curl: no URL" >&2; exit 2; }
+if [ -n "${FAKE_CURL_LOG:-}" ]; then
+  printf '%s\n' "$url" >> "$FAKE_CURL_LOG"
+fi
+
+# answer URL -> sets code, body (a file or empty), location, seconds
+answer() {
+  local rest host path f
+  rest="${1#*://}"
+  host="${rest%%/*}"
+  path="/${rest#*/}"
+  [ "$rest" != "$host" ] || path=/
+  path="${path%%\?*}"
+  if [ ! -d "$root/$host" ]; then
+    echo "curl: (6) Could not resolve host: $host" >&2
+    return 6
+  fi
+  f="$root/$host$path"
+  body=""
+  location=""
+  seconds=0.012
+  if [ -f "$f.time" ]; then seconds="$(cat "$f.time")"; fi
+  if [ -f "$f.code" ]; then
+    code="$(cat "$f.code")"
+    if [ -f "$f" ]; then body="$f"; fi
+    if [ -f "$f.location" ]; then location="$(cat "$f.location")"; fi
+  elif [ -f "$f" ]; then
+    code=200
+    body="$f"
+  else
+    code=404
+    if [ -f "$root/$host/.404" ]; then body="$root/$host/.404"; fi
+  fi
+  return 0
+}
+
+rc=0
+answer "$url" || rc=$?
+[ "$rc" -eq 0 ] || exit "$rc"
+case "$code" in
+  3??)
+    if [ "$follow" -eq 1 ] && [ -n "$location" ]; then
+      url="$location"
+      rc=0
+      answer "$url" || rc=$?
+      [ "$rc" -eq 0 ] || exit "$rc"
+    fi
+    ;;
+esac
+
+write_out() {
+  local s="$fmt" redirect=""
+  case "$code" in
+    3??) redirect="$location" ;;
+  esac
+  s="${s//%\{http_code\}/$code}"
+  s="${s//%\{time_total\}/$seconds}"
+  s="${s//%\{redirect_url\}/$redirect}"
+  s="${s//%\{url_effective\}/$url}"
+  s="${s//\\n/$'\n'}"
+  printf '%s' "$s"
+}
+
+if [ "$code" = 000 ]; then
+  echo "curl: (7) Failed to connect" >&2
+  write_out
+  exit 7
+fi
+if [ "$fail" -eq 1 ] && [ "$code" -ge 400 ]; then
+  echo "curl: (22) The requested URL returned error: $code" >&2
+  write_out
+  exit 22
+fi
+if [ -n "$outfile" ]; then
+  if [ -n "$body" ]; then cp "$body" "$outfile"; else : > "$outfile"; fi
+elif [ -n "$body" ]; then
+  cat "$body"
+fi
+write_out

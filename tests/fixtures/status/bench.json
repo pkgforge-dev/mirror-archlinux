@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "date": "2026-10-14T05:52:10Z",
+  "host": "fixture runner",
+  "pacman": "7.1.0",
+  "cases": [
+    {"path": "official", "op": "sy", "seconds": 1.42, "rounds": [1.51, 1.42, 1.38], "files": 2, "bytes": 8961000, "ok": true},
+    {"path": "official", "op": "sw-small", "seconds": 4.85, "rounds": [5.02, 4.85, 4.71], "files": 40, "bytes": 1203000, "ok": true},
+    {"path": "official", "op": "sw-large", "seconds": 9.31, "rounds": [9.88, 9.31, 9.12], "files": 3, "bytes": 512700000, "ok": true},
+    {"path": "worker", "op": "sy", "seconds": 1.61, "rounds": [1.70, 1.61, 1.59], "files": 2, "bytes": 8961000, "ok": true},
+    {"path": "worker", "op": "sw-small", "seconds": 6.12, "rounds": [6.30, 6.12, 6.04], "files": 40, "bytes": 1203000, "ok": true},
+    {"path": "worker", "op": "sw-large", "seconds": 8.74, "rounds": [9.10, 8.74, 8.66], "files": 3, "bytes": 512700000, "ok": true},
+    {"path": "oci", "op": "sy", "seconds": 1.18, "rounds": [1.25, 1.18, 1.16], "files": 2, "bytes": 8961000, "ok": true},
+    {"path": "oci", "op": "sw-small", "seconds": 3.96, "rounds": [4.10, 3.96, 3.90], "files": 40, "bytes": 1203000, "ok": true},
+    {"path": "oci", "op": "sw-large", "seconds": 8.12, "rounds": [8.40, 8.12, 8.05], "files": 3, "bytes": 512700000, "ok": true},
+    {"path": "oci-serial", "op": "sy", "seconds": 1.44, "rounds": [1.52, 1.44, 1.40], "files": 2, "bytes": 8961000, "ok": true},
+    {"path": "oci-serial", "op": "sw-small", "seconds": 24.6, "rounds": [25.1, 24.6, 24.3], "files": 40, "bytes": 1203000, "ok": true},
+    {"path": "oci-serial", "op": "sw-large", "seconds": 9.05, "rounds": [9.40, 9.05, 8.98], "files": 3, "bytes": 512700000, "ok": true}
+  ]
+}

@@ -3,11 +3,19 @@
 # How many days of silence from one workflow's schedule is normal.
 #
 #   scripts/cron-tolerance .github/workflows/sync.yml
+#   scripts/cron-tolerance --minutes .github/workflows/sync.yml
 #
 # Prints two integers on one line: the largest gap in days the schedule itself
 # produces, and the tolerance built from it.
 #
 #   1 3      a daily cron: it never skips a day, and three days of silence is a stop
+#
+# With --minutes it prints one integer instead: the largest gap in minutes
+# between two firings. scripts/status-collect uses it to show the age of a
+# snapshot against the sync interval.
+#
+#   180      '17 */3 * * *'
+#   1440     '41 7 * * *'
 #
 # ⛔ The number is derived, never written down. A check that says "fail after 3
 # days" stops being right the moment somebody changes a cron from daily to
@@ -26,9 +34,9 @@
 # point: the schedule is the contract and the runs are what is measured against
 # it.
 #
-# ⛔ Day resolution only. The hour and minute fields are read and ignored: a
-# published tag is named for a date, so a check finer than a day has nothing to
-# compare against. ⚠ GitHub's own delay is measured in hours here, the two runs
+# ⛔ Day resolution only, except with --minutes. The hour and minute fields
+# are read and ignored for the tolerance: a published tag is named for a date,
+# so a check finer than a day has nothing to compare against. ⚠ GitHub's own delay is measured in hours here, the two runs
 # on record firing at 17:32Z and 16:36Z against a `30 05` cron, and a delay of
 # hours cannot move a date by more than one day.
 #
@@ -54,8 +62,13 @@ die() {
   exit 1
 }
 
+mode=days
+if [ "${1:-}" = --minutes ]; then
+  mode=minutes
+  shift
+fi
 wf="${1:-}"
-[ -n "$wf" ] || die "usage: cron-tolerance <workflow file>"
+[ -n "$wf" ] || die "usage: cron-tolerance [--minutes] <workflow file>"
 [ -f "$wf" ] || die "no such file: $wf" \
   "reproduce: ls .github/workflows/"
 
@@ -98,8 +111,13 @@ fi
 #
 # ⛔ No strftime and no mktime. Both are gawk extensions and the runners ship
 # mawk, which is also why nothing here uses match()'s third argument. The calendar is walked by hand instead.
+#
+# With --minutes the walk also lists the minutes of each firing day. The
+# minute and hour fields do not depend on the day, so each set of crons that
+# fire together gives one sorted list, made once and kept. The gap from the
+# last firing back round to the first firing of the window counts too.
 #---------------------------------------------------------------------------#
-read -r gap tolerance <<< "$(awk -v crons="$crons" '
+read -r gap tolerance <<< "$(awk -v crons="$crons" -v mode="$mode" '
   function leap(y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
 
   function mdays(y, m) {
@@ -178,18 +196,44 @@ read -r gap tolerance <<< "$(awk -v crons="$crons" '
 
     nc = split(crons, list, "\n")
 
+    # The minutes of the day each cron fires at, ascending.
+    for (i = 1; i <= nc; i++) {
+      if (split(list[i], f, /[[:space:]]+/) != 5) {
+        printf "cron-tolerance: cannot parse cron expression: %s\n", list[i] > "/dev/stderr"
+        exit 2
+      }
+      cnt[i] = 0
+      for (h = 0; h < 24; h++) {
+        a = field(f[2], h, 0, 23)
+        for (mm = 0; mm < 60; mm++) {
+          b = field(f[1], mm, 0, 59)
+          if (a < 0 || b < 0) {
+            printf "cron-tolerance: cannot parse cron expression: %s\n", list[i] > "/dev/stderr"
+            exit 2
+          }
+          if (a == 1 && b == 1) mins[i, ++cnt[i]] = h * 60 + mm
+        }
+      }
+      if (cnt[i] == 0) {
+        printf "cron-tolerance: the cron expression fires at no minute of the day: %s\n", list[i] > "/dev/stderr"
+        exit 2
+      }
+    }
+
     y = 2024; m = 1; d = 1; dow = 1        # 2024-01-01 was a Monday
     run = 0; gap = 0; fired = 0
+    mgap = 0; mlast = -1; mfirst = -1
 
     for (day = 0; day < 1461; day++) {
       hit = 0
+      key = ""
       for (i = 1; i <= nc; i++) {
         r = fires(list[i], m, d, dow)
         if (r < 0) {
           printf "cron-tolerance: cannot parse cron expression: %s\n", list[i] > "/dev/stderr"
           exit 2
         }
-        if (r == 1) { hit = 1 }
+        if (r == 1) { hit = 1; key = key " " i }
       }
       if (hit) {
         fired++
@@ -197,6 +241,25 @@ read -r gap tolerance <<< "$(awk -v crons="$crons" '
         run = 0
       } else {
         run++
+      }
+
+      if (hit && mode == "minutes") {
+        if (!(key in daylist)) {
+          split("", mark)
+          nk = split(key, ks, " ")
+          for (j = 1; j <= nk; j++)
+            for (k = 1; k <= cnt[ks[j]]; k++) mark[mins[ks[j], k]] = 1
+          s = ""
+          for (t = 0; t < 1440; t++) if (t in mark) s = s " " t
+          daylist[key] = s
+        }
+        nt = split(daylist[key], ts, " ")
+        for (j = 1; j <= nt; j++) {
+          abs = day * 1440 + ts[j]
+          if (mlast >= 0 && abs - mlast > mgap) mgap = abs - mlast
+          if (mfirst < 0) mfirst = abs
+          mlast = abs
+        }
       }
 
       d++
@@ -211,6 +274,13 @@ read -r gap tolerance <<< "$(awk -v crons="$crons" '
     }
     if (run > gap) gap = run
 
+    if (mode == "minutes") {
+      # Round from the last firing of the window to the first one.
+      if (1461 * 1440 - mlast + mfirst > mgap) mgap = 1461 * 1440 - mlast + mfirst
+      printf "%d %d\n", mgap, 0
+      exit 0
+    }
+
     # gap counts the silent days between two firings. A daily cron has none, and
     # its largest gap is one day.
     gap = gap + 1
@@ -221,4 +291,8 @@ read -r gap tolerance <<< "$(awk -v crons="$crons" '
 [ -n "${gap:-}" ] && [ -n "${tolerance:-}" ] || die "the cron walk printed nothing for $wf" \
   "reproduce: scripts/cron-tolerance $wf"
 
-printf '%s %s\n' "$gap" "$tolerance"
+if [ "$mode" = minutes ]; then
+  printf '%s\n' "$gap"
+else
+  printf '%s %s\n' "$gap" "$tolerance"
+fi
