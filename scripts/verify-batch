@@ -390,6 +390,24 @@ if [ -n "$keyrings" ] && [ -n "$keyring_repo" ]; then
   # does not install. The marker line gives the verdict pacman's own words.
   rc=0
   pac -Sdd "${kr[@]/#/$keyring_repo/}" > /tmp/keyring.log 2>&1 || rc=$?
+  # A distribution keyring replaces the one the verify image ships: ArchPOWER's
+  # archpower-keyring conflicts with archlinux-keyring, which archlinux:base
+  # holds. pacman does not remove an installed package for a conflict under
+  # --noconfirm, so the package it names to remove is removed and the install
+  # is retried once. The replacement installs in the same step, so the trust
+  # root is never left absent, and -Rdd leaves base alone when it drops the old
+  # keyring. A conflict pacman phrases some other way falls through to the
+  # verdict below unchanged.
+  if [ "$rc" -ne 0 ] && grep -q 'in conflict' /tmp/keyring.log; then
+    drop="$(sed -n 's/.*Remove \([^?]*\)?.*/\1/p' /tmp/keyring.log | sort -u | tr '\n' ' ')"
+    if [ -n "${drop// /}" ]; then
+      printf 'keyring: the target keyring replaces %s; removing it, then installing\n' "$drop" >> /tmp/keyring.log
+      # shellcheck disable=SC2086 # the names are one per word, on purpose
+      pac -Rdd $drop >> /tmp/keyring.log 2>&1 || true
+      rc=0
+      pac -Sdd "${kr[@]/#/$keyring_repo/}" >> /tmp/keyring.log 2>&1 || rc=$?
+    fi
+  fi
   cat /tmp/keyring.log
   if [ "$rc" -ne 0 ]; then
     printf '@@keyring-failed\t%s\t%s\n' "$rc" "$(awk '/^error:/ && !f { print; f = 1 }' /tmp/keyring.log)"
