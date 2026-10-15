@@ -730,7 +730,9 @@ reconcile_results() {
       printf '%s\tfailed\t0\tno result was recorded\n' "$(sed -n "${i}p" "$shard" | cut -f 1,2)" >> "$outfile"
     fi
   done
-  awk -F '\t' '$3 != "pushed" && $3 != "present" { n++ } END { print n + 0 }' "$outfile"
+  # "absent" is not bad: the file is gone from upstream (404 everywhere) though
+  # its database still names it, so mirror-file skipped it rather than failing.
+  awk -F '\t' '$3 != "pushed" && $3 != "present" && $3 != "absent" { n++ } END { print n + 0 }' "$outfile"
 }
 
 #---------------------------------------------------------------------------#

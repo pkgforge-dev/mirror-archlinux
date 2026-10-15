@@ -17,6 +17,10 @@
 #
 #   pushed    pushed now, and read back holding this file and its signature
 #   present   the tag already held them; nothing written
+#   absent    every server answers 404 for the file: upstream's database still
+#             names it but no longer serves it. Skipped, not failed, so one
+#             stale upstream entry cannot hold the whole target; the mirror then
+#             reflects upstream, where the file is a 404 too.
 #   replaced  the tag holds other bytes under this name; never overwritten
 #   failed    anything else
 # A file that the tag now holds with no signature, because upstream publishes
@@ -58,7 +62,7 @@
 # the pauses one file takes after a 429 from the registry (below), each of
 # RATE_PAUSE_MIN to RATE_PAUSE_MAX seconds (20 to 60; lib.sh throttle_pause).
 #
-# Exit status: 0 pushed or present, 1 anything else.
+# Exit status: 0 pushed, present or absent, 1 anything else.
 set -euo pipefail
 SCRIPT_NAME=mirror-file
 # shellcheck source=lib.sh
@@ -248,6 +252,9 @@ esac
 # answers 200 with other bytes is behind, not down: it is not marked.
 #---------------------------------------------------------------------------#
 got_from=""
+dl_absent=0
+dl_error=0
+dl_other=0
 dl_order=()
 mapfile -t dl_order < <(down_last "$down_dir" "${order[@]}")
 for server in "${dl_order[@]}"; do
@@ -255,8 +262,12 @@ for server in "${dl_order[@]}"; do
   fetch_upstream "$server/$file" "$dir/$file" "$((120 + csize / 65536))" || rc=$?
   case "$rc" in
     0) ;;
-    4) continue ;;
+    4)
+      dl_absent=$((dl_absent + 1))
+      continue
+      ;;
     *)
+      dl_error=$((dl_error + 1))
       failed "$server" "$rc"
       continue
       ;;
@@ -267,10 +278,21 @@ for server in "${dl_order[@]}"; do
     got_from="$server"
     break
   fi
+  dl_other=$((dl_other + 1))
   warn "$file from $server is $size bytes with sha256 $got; the database says $csize bytes, $sha256"
   rm -f -- "$dir/$file"
 done
 if [ -z "$got_from" ]; then
+  # Every server answered 404, and none erred or offered other bytes: the file
+  # is gone from upstream though its database still names it. Skip it rather than
+  # fail, so one stale upstream entry cannot hold the whole target; the mirror
+  # then reflects upstream, where this file is a 404 too, and plan lists it again
+  # so it is picked up if it returns. An error (a server down) or other bytes
+  # (a build in flight) is still a failure, retried next run.
+  if [ "$dl_error" -eq 0 ] && [ "$dl_other" -eq 0 ] && [ "$dl_absent" -gt 0 ]; then
+    result absent "every server answers 404 for it ($dl_absent of $n); upstream's database names it but no longer serves the file"
+    exit 0
+  fi
   result failed "no server answered with these bytes (tried $n); a file upstream superseded during the run clears on the next run's plan"
   exit 1
 fi

@@ -171,18 +171,28 @@ stage_target() {
     { k = $1 SUBSEP $2; s = (k in st) ? st[k] : "missing"; print $2, s, (k in det) ? det[k] : "no shard reported it" }
   ' "$work/results.tsv" "$pdir/todo.tsv" > "$dir/accounted.tsv"
 
-  local n_replaced n_bad
+  # "absent" is a file upstream's database names but every server answers 404
+  # for (mirror-file): it is skipped, not held, so one stale upstream entry
+  # cannot hold the whole target, and the promoted database reflects upstream,
+  # where the file is a 404 too. It is excluded from the verification batches
+  # below, since there is nothing to verify. replaced and failed still hold.
+  local n_replaced n_bad n_absent
   n_replaced="$(awk -F '\t' '$2 == "replaced" { n++ } END { print n + 0 }' "$dir/accounted.tsv")"
-  n_bad="$(awk -F '\t' '$2 != "pushed" && $2 != "present" { n++ } END { print n + 0 }' "$dir/accounted.tsv")"
+  n_bad="$(awk -F '\t' '$2 != "pushed" && $2 != "present" && $2 != "absent" { n++ } END { print n + 0 }' "$dir/accounted.tsv")"
+  n_absent="$(awk -F '\t' '$2 == "absent" { n++ } END { print n + 0 }' "$dir/accounted.tsv")"
+  awk -F '\t' '$2 == "absent" { print $1 }' "$dir/accounted.tsv" > "$dir/absent.txt"
   if [ "$n_replaced" -gt 0 ]; then
     awk -F '\t' '$2 == "replaced"' "$dir/accounted.tsv" > "$dir/replaced.tsv"
     set_state "$dir" replaced "$n_replaced file(s) have a tag holding other bytes under the same name, first: $(awk -F '\t' '$2 == "replaced" && !f { print $1 ": " $3; f = 1 }' "$dir/accounted.tsv")"
     return 0
   fi
   if [ "$n_bad" -gt 0 ]; then
-    awk -F '\t' '$2 != "pushed" && $2 != "present"' "$dir/accounted.tsv" > "$dir/failing.tsv"
-    set_state "$dir" held "$n_bad file(s) are not on the registry, first: $(awk -F '\t' '$2 != "pushed" && $2 != "present" && !f { print $1 ": " $2 ", " $3; f = 1 }' "$dir/accounted.tsv")"
+    awk -F '\t' '$2 != "pushed" && $2 != "present" && $2 != "absent"' "$dir/accounted.tsv" > "$dir/failing.tsv"
+    set_state "$dir" held "$n_bad file(s) are not on the registry, first: $(awk -F '\t' '$2 != "pushed" && $2 != "present" && $2 != "absent" && !f { print $1 ": " $2 ", " $3; f = 1 }' "$dir/accounted.tsv")"
     return 0
+  fi
+  if [ "$n_absent" -gt 0 ]; then
+    log "$name: $n_absent file(s) are gone from upstream (404) though its database still names them; skipped, as upstream serves them 404 too, first: $(awk -F '\t' '$2 == "absent" && !f { print $1; f = 1 }' "$dir/accounted.tsv")"
   fi
 
   #-------------------------------------------------------------------------#
@@ -348,7 +358,9 @@ stage_target() {
   } | awk '!seen[$0]++' > "$dir/canaries.txt"
   {
     awk -F '\t' 'FILENAME == ARGV[1] { c[$1] = 1; next } ($2 in c) { print $2 "\t" $6 }' "$dir/canaries.txt" "$pdir/records.tsv"
-    awk -F '\t' '{ print $6 "\t" $5 }' "$pdir/todo.tsv"
+    # The todo files to verify, minus any skipped as absent: there is nothing on
+    # the registry to verify for a file upstream no longer serves.
+    awk -F '\t' 'FILENAME == ARGV[1] { a[$1] = 1; next } !($2 in a) { print $6 "\t" $5 }' "$dir/absent.txt" "$pdir/todo.tsv"
   } | awk -F '\t' '!seen[$1]++' > "$dir/verify.tsv"
 
   local nfiles nbytes k flimit blimit wanted

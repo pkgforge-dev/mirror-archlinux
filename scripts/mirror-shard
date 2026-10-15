@@ -161,6 +161,8 @@ awk -F '\t' '{ n[$3]++ } END { for (s in n) printf "%s %d\n", s, n[s] }' "$out/r
 log "results: $(tr '\n' ' ' < "$out/summary.txt")"
 
 if [ "$bad_count" -gt 0 ]; then
-  awk -F '\t' '$3 != "pushed" && $3 != "present"' "$out/results.tsv" | sed -n 1,20p >&2
+  # "absent" is not a failure (gone from upstream, 404 everywhere; skipped), so
+  # it is left out of this list of the files that did fail.
+  awk -F '\t' '$3 != "pushed" && $3 != "present" && $3 != "absent"' "$out/results.tsv" | sed -n 1,20p >&2
   die "$bad_count of $lines file(s) are not on the registry"
 fi
