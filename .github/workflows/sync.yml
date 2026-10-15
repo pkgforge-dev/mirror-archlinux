@@ -270,6 +270,51 @@ jobs:
           retention-days: 7
           if-no-files-found: error
           overwrite: true
+      - name: Upload the plan of slot 16
+        if: ${{ steps.plan.outputs.slot16 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot16 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot16 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 17
+        if: ${{ steps.plan.outputs.slot17 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot17 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot17 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 18
+        if: ${{ steps.plan.outputs.slot18 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot18 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot18 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 19
+        if: ${{ steps.plan.outputs.slot19 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot19 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot19 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
+      - name: Upload the plan of slot 20
+        if: ${{ steps.plan.outputs.slot20 != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: plan-${{ steps.plan.outputs.slot20 }}
+          path: ${{ runner.temp }}/plan/${{ steps.plan.outputs.slot20 }}
+          retention-days: 7
+          if-no-files-found: error
+          overwrite: true
 
   # One chain per pending target, each on its own: a target's promote waits
   # for its own shards and batches only. A job that calls a reusable workflow

@@ -14,6 +14,7 @@ Each rule below keeps this invariant true for one way it could fail.
 | --- | --- | --- |
 | The database comes only from the target's `db_server` hosts, which the distribution runs. Package bytes can come from any `server`. | The databases are unsigned. The source of a database chooses which validly signed packages get installed, old ones too. | `scripts/plan` |
 | Every field of a database is checked against its grammar first. A filename with `/`, a space, a leading `-` or `.`, a control character or a byte above 0x7e refuses the whole database. | A hostile name becomes a path, an option or a tag. | `scripts/lib.sh` `db_validate` |
+| ⛔ A database that tar cannot read whole is refused. The status is tar's own, read from PIPESTATUS, and not the last stage's: `scripts/lib.sh` sets no `pipefail`, so `tar ... | tr | sed || rc=$?` captures sed. A cut database then gives records for every package before the cut, exit 0 and no message. A database compressed with zstd, which every ArchPOWER database is, is a second way in: GNU tar shells out for the program, and a host without it reads none of the archive. | A mirror stages a database naming part of what upstream published, and the registry holds a tag that no later run will move. | `scripts/lib.sh` `db_tar`, `db_records`, `db_members`, `db_check` |
 | Each package directory gives exactly one record. A `desc` member of NUL bytes only, or empty, is counted and named; at most 16 are accepted. Any other unreadable member refuses the database. | A database that drops packages without a word. An upstream sparse member that holds a target for ever. | `scripts/lib.sh` `db_check` |
 | A file name that `<repo>.files` and `<repo>.db` both name must have one sha256. A files database with another sha256 for a file is refused, and plan tries the next `db_server` that served the same database. Drift is counted by package name, accepted, and named: packages the files database leaves out, packages only the files database names, and packages both name at other file names (a files database that lags). A files database that names fewer than half of the packages of the database, and leaves out 16 or more, is refused: it is of another repository. `FILES_DRIFT_MAX`, when set, replaces that rule with a bound on the file names that only one of the two databases names. | Another sha256 means the two databases are of different snapshots. Drift holds no file a consumer downloads: the database alone decides what pacman installs, and upstream's own users get the same drift (`docs/measurements.md`). A bound on file names refuses every files database during a mass rebuild: each rebuilt package adds 2. | `scripts/plan` |
 | Never behind: a candidate is dropped when one of its packages was built before the same package in the promoted database or in another candidate. `ALLOW_OLDER` lifts the first comparison. | A lagging server rolls consumers back to older builds. | `scripts/plan` |
@@ -192,6 +193,35 @@ With `db_signed = yes`, the SigLevel is `Required DatabaseRequired`. With `keyri
 5. `pacman-key --populate` again, so a key added upstream is signed locally before any package is checked.
 
 `keyring_from` names another target of the same arch. Its `latest` is read when verify starts, and its section is pinned by that digest. When it has no `latest` yet, verify logs a warning and skips steps 4 and 5. The trust root of steps 1 to 3 still applies, and pacman still checks every signature. Any other answer from the registry fails the batch: no answer is not an absence.
+
+### A function that reads a status under `set -e`
+
+⛔ A script that runs `set -e` must not call a function bare if the function
+has a pipeline that can fail before its own check. `errexit` ends the shell
+inside the pipeline, so the function never reaches its own status handling, its
+cleanup, or the status it documents, and the shell ends with the failing
+stage's status instead. `db_records` is the case: a database that does not
+read is tar's 2, not the function's 1, and the temporary directory leaks.
+
+The form is `if ! db_records ...` or `db_records ... || rc=$?`. Both exempt the
+call from `errexit`, and both leave the caller's `errexit` on, which a bare
+call does not. Bash will not let the function fix this itself: `return 1` is
+itself a failing command, so a `set -e` inside the function is undone by its
+own return. So the rule lives at the call site, and each function that reads a
+status says so where a reader of the function will meet it.
+
+### The PowerPC targets
+
+The six PowerPC targets are two repositories per architecture, and neither is named like the Arch ones.
+
+| target | `db_server` | holds |
+| --- | --- | --- |
+| `<arch>-base` | `https://repo.archlinuxpower.org/$repo/$arch` | the packages of that architecture |
+| `<arch>-base-any` | `https://repo.archlinuxpower.org/base/any` | the architecture-independent packages, one database shared by all three architectures |
+
+So `base-any` is at `base/any` and not at `$repo/$arch`, which is why its `db_server` is written out in full. The `*-base` target takes `keyring_from = <arch>-base-any`, because the keyring package lives in `base-any` and not in `base`. The `*-base-any` target names `archpower-keyring` as its `keyring` and takes no indirection: the package is in its own repository.
+
+All six set `db_signed = yes`. ArchPOWER publishes a detached signature for every database, and the `gpgv` check in `plan` (`scripts/lib.sh` `db_sig_ok`) refuses one that does not verify against the keyring the target's image holds. That is the first target group where a database signature is part of the trust root rather than absent: for every other target upstream publishes no `<repo>.db.sig` at all, and `db_signed` stays off.
 
 ### Phases
 

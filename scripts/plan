@@ -340,7 +340,13 @@ plan_target() {
       set_state "$dir" error "$repo_path:latest names $layer_digest and serves $promoted_sha"
       return 0
     fi
-    db_records "$dir/promoted.db" "$dir/promoted.tsv"
+    # `if !`, not a bare call: every script here runs set -e, and a promoted
+    # database that does not read would end this shell inside db_records
+    # instead of putting the target in error with a state file.
+    if ! db_records "$dir/promoted.db" "$dir/promoted.tsv"; then
+      set_state "$dir" error "the promoted database $repo_path:latest does not read as a tar archive"
+      return 0
+    fi
   elif [ "$anon_rc" -eq "$REG_STATUS_ABSENT" ] && [ "$auth_rc" != "$REG_STATUS_ERROR" ]; then
     log "$name: nothing promoted yet in $repo_path"
   else
@@ -696,6 +702,19 @@ plan_target() {
     for s in db files; do
       if [ ! -f "$dir/upstream.$s.sig" ]; then
         set_state "$dir" error "db_signed = yes and $repo.$s.sig answered 404"
+        return 0
+      fi
+    done
+    # The signatures are there. Check them: a .sig that does not verify is
+    # worse than none, because a consumer with DatabaseRequired refuses the
+    # database, and the mirror would be serving bytes it cannot vouch for.
+    if ! keyring_copy "$dir/keyrings" "$conf"; then
+      set_state "$dir" error "db_signed = yes and the keyring files of keyring_image could not be read, so the signature of $repo.db could not be checked"
+      return 0
+    fi
+    for s in db files; do
+      if ! db_sig_ok "$dir" "$repo" "$s"; then
+        set_state "$dir" error "db_signed = yes and $repo.$s.sig does not verify against the keyring files of keyring_image"
         return 0
       fi
     done

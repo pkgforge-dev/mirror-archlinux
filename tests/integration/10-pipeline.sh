@@ -277,7 +277,7 @@ digest_of() {
     tr -d '\r' | awk '$1 ~ /^HTTP/ { ok = ($2 == 200) } ok && tolower($1) == "docker-content-digest:" { print $2 }'
 }
 
-# put_manifest TAG FILE: write a manifest as an attacker with push rights would
+# put_manifest TAG FILE: write a manifest the way any writer with push rights can
 put_manifest() {
   curl -q -fsS --connect-timeout 5 --max-time 20 -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' \
     --data-binary "@$2" -o /dev/null "$BASE/manifests/$1"

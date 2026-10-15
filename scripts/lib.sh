@@ -261,6 +261,51 @@ oras_login() {
 #---------------------------------------------------------------------------#
 # Databases
 #
+# ⛔ A database that tar cannot read whole fails here, loudly. It must never
+# yield a partial record set and exit 0: the records it did read look exactly
+# like a smaller repository, and a mirror that plans from them stages a
+# database that names only part of what upstream published.
+#
+# Why the status is read from tar and not from the last stage of the pipeline.
+# scripts/lib.sh sets `set -E` but not `set -o pipefail`, so in
+#
+#     tar -xOf "$db" --wildcards '*/desc' | tr | sed > out || rc=$?
+#
+# $? is sed's status. tar ending 2 on a truncated database gives records for
+# every package before the cut, rc 0, and no message. Measured 2026-10-15 on
+# the first 40000 bytes of the 724416-byte powerpc64le base.db: 136 records,
+# exit 0, and db_check refused it only because its own member listing failed.
+# PIPESTATUS reads tar's status without turning on pipefail for every caller,
+# which would change the meaning of every other pipeline in the tree.
+#
+# db_tar DB ARGS... -> tar on the database with its own arguments, and its exit
+# status. It names the compression when tar cannot start one, because
+# "Cannot exec: No such file or directory" from a child is not something a
+# reader can act on.
+db_tar() {
+  local db="$1"
+  shift
+  local err rc=0
+  err="$(mktemp)"
+  tar "$@" 2> "$err" || rc=$?
+  if [ "$rc" -ne 0 ] && grep -qE 'Cannot exec|not found' "$err"; then
+    # GNU tar shells out for zstd, bzip2 and lzma. Which one is in the message.
+    local tool
+    tool="$(sed -nE "s/^tar \(child\): ([A-Za-z0-9+_-]+): Cannot exec.*/\1/p" "$err" | sed -n 1p)"
+    if [ -n "$tool" ]; then
+      printf '%s: the database is compressed with %s and the %s program is not installed\n' "$SCRIPT_NAME" "$tool" "$tool" >&2
+      printf '  %s\n' "$(sed -n 1,3p "$err")" >&2
+      printf '  reproduce: tar -tf %s\n' "$db" >&2
+    fi
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf '%s: tar ended %s on %s\n' "$SCRIPT_NAME" "$rc" "$db" >&2
+    sed -n 1,5p "$err" >&2
+  fi
+  rm -f -- "$err"
+  return "$rc"
+}
+
 # db_records DB OUT.tsv
 #
 # One line per package, tab separated:
@@ -276,18 +321,39 @@ oras_login() {
 # bytes are dropped, and a record boundary is restored before %FILENAME%.
 #---------------------------------------------------------------------------#
 db_records() {
-  local db="$1" out="$2" work rc
+  local db="$1" out="$2" work rc=0 _st
   work="$(mktemp -d)"
-  rc=0
-  tar -xOf "$db" --wildcards '*/desc' 2> "$work/tar.err" |
+  # ⛔ A caller under `set -e` must not call this bare. The pipeline below
+  # fails first when the database does not read, and errexit ends the caller's
+  # shell there, before the status is read, so the function exits with tar's 2
+  # instead of its own 1, and the cleanup below does not run. Bash does not let
+  # a function restore the caller's errexit reliably, because `return 1` is
+  # itself a failing command. So the rule is at the call site: `if !` or
+  # `|| rc=$?`, which both exempt this call from errexit. See scripts/plan:489
+  # and scripts/lib.sh:428 for the form, and the caller_documented_status note
+  # in docs/design.md.
+  #
+  # PIPESTATUS, not $?: see the note at the head of this section. The awk that
+  # reads the result is a separate step, so its status is its own.
+  db_tar "$db" -xOf "$db" --wildcards '*/desc' |
     tr -d '\000' |
-    sed 's/%FILENAME%/\n&/g' > "$work/desc.txt" || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    cat "$work/tar.err" >&2
+    sed 's/%FILENAME%/\n&/g' > "$work/desc.txt"
+  # The statuses of the stages, one per stage. ⛔ This must be the very next
+  # command after the pipeline: `local` is a command too, and it resets
+  # PIPESTATUS, so declaring an array here first and reading it after gives
+  # [0] for every input, which is how this check passed a truncated database
+  # the first time it was written.
+  _st="${PIPESTATUS[*]}"
+  local -a st=()
+  read -ra st <<< "$_st"
+  if [ "${st[0]}" -ne 0 ]; then
+    # The partial record set is removed rather than left: a file of 136 records
+    # beside a database of 3735 is what this whole check exists to prevent, and
+    # leaving it is leaving the fault one rename away from being believed.
+    rm -f -- "$out"
     rm -rf "$work"
     return 1
   fi
-  rc=0
   awk '
     function flush() {
       if (fn == "") return
@@ -312,9 +378,19 @@ db_records() {
   return "$rc"
 }
 
-# db_members DB -> how many package directories the archive holds
+# db_members DB -> how many package directories the archive holds. A database
+# tar cannot list gives nothing and a non-zero status, never 0: a count of 0
+# from an unreadable file is the same number as an empty repository.
 db_members() {
-  tar -tf "$1" | awk -F / 'NF >= 2 && $2 == "desc" { n++ } END { print n + 0 }'
+  local rc=0 n _st
+  db_tar "$1" -tf "$1" | awk -F / 'NF >= 2 && $2 == "desc" { n++ } END { print n + 0 }'
+  _st="${PIPESTATUS[*]}"
+  local -a st=()
+  read -ra st <<< "$_st"
+  [ "${st[0]}" -eq 0 ] || rc=1
+  # shellcheck disable=SC2034 # read below
+  n=0
+  return "$rc"
 }
 
 # db_validate RECORDS.tsv -> exit 0, or print every bad line and exit 1
@@ -356,7 +432,8 @@ db_validate() {
 # members. Any other unreadable member refuses the database, as before.
 DB_MAX_NUL_MEMBERS=16
 db_check() {
-  local db="$1" rec="$2" records members unread nonul n f
+  local db="$1" rec="$2" records members unread nonul n f _st
+  local -a nonul_st=() one_st=()
   : > "$rec.nul"
   if ! db_records "$db" "$rec"; then
     echo "it does not read as a tar archive"
@@ -371,7 +448,7 @@ db_check() {
     echo "$(awk 'END { print NR + 0 }' "$rec.bad") record(s) fail their grammar, first: $(sed -n 1p "$rec.bad")"
     return 1
   fi
-  if ! tar -tf "$db" > "$rec.members"; then
+  if ! db_tar "$db" -tf "$db" > "$rec.members"; then
     echo "its member list does not read"
     return 1
   fi
@@ -391,11 +468,19 @@ db_check() {
     fi
     sed 's|$|/desc|' "$rec.unread" > "$rec.unread-desc"
     # One read for all of them; the bytes left once NULs are dropped.
-    nonul="$(tar -xOf "$db" -T "$rec.unread-desc" | tr -d '\000' | wc -c | tr -d ' ')" || nonul=-1
+    # tar's own status decides: a member that could not be read is -1, not a
+    # count of the bytes that were.
+    nonul="$(db_tar "$db" -xOf "$db" -T "$rec.unread-desc" | tr -d '\000' | wc -c | tr -d ' ')"
+    _st="${PIPESTATUS[*]}"
+    read -ra nonul_st <<< "$_st"
+    [ "${nonul_st[0]}" -eq 0 ] || nonul=-1
     if [ "$nonul" != 0 ]; then
       n=0
       while IFS= read -r f; do
-        n="$(tar -xOf "$db" "$f/desc" | tr -d '\000' | wc -c | tr -d ' ')" || n=-1
+        n="$(db_tar "$db" -xOf "$db" "$f/desc" | tr -d '\000' | wc -c | tr -d ' ')"
+        _st="${PIPESTATUS[*]}"
+        read -ra one_st <<< "$_st"
+        [ "${one_st[0]}" -eq 0 ] || n=-1
         if [ "$n" != 0 ]; then
           echo "$f/desc gives no record named after its directory, and holds $n byte(s) that are not NUL"
           return 1
@@ -470,6 +555,94 @@ stale_verdict() {
   else
     echo fresh
   fi
+}
+
+#---------------------------------------------------------------------------#
+# The signature of a signed database
+#
+# A .db.sig that exists is not a .db.sig that verifies. For a target with
+# db_signed = yes, which is all six PowerPC targets, the signature decides
+# whether a consumer with DatabaseRequired can use the database at all. So plan
+# checks it before the snapshot is staged, rather than leaving a consumer to
+# find out.
+#
+# gpgv, not gpg: gpgv verifies and does not import, so the check cannot change
+# the trust store it verified against.
+#---------------------------------------------------------------------------#
+# db_sig_ok DIR REPO WHICH -> 0 when DIR/upstream.WHICH.sig verifies against the
+# keyring files in DIR/keyrings, 1 otherwise with the reason on stderr.
+db_sig_ok() {
+  local dir="$1" repo="$2" which="$3" rc=0 out=""
+  local -a kv=()
+  command -v gpgv > /dev/null || {
+    warn "gpgv is not installed, so the signature of $repo.$which cannot be checked" \
+      "reproduce: gpgv --keyring DIR/$repo.$which.sig $repo.$which"
+    return 1
+  }
+  local f
+  for f in "$dir"/keyrings/*.gpg "$dir"/keyrings/*.kbx; do
+    [ -f "$f" ] || continue
+    kv+=(--keyring "$f")
+  done
+  if [ "${#kv[@]}" -eq 0 ]; then
+    warn "no keyring file under $dir/keyrings, so the signature of $repo.$which cannot be checked" \
+      "reproduce: ls $dir/keyrings"
+    return 1
+  fi
+  out="$(gpgv "${kv[@]}" "$dir/upstream.$which.sig" "$dir/upstream.$which" 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "$repo.$which.sig does not verify against the keyring files (gpgv status $rc)" \
+      "$(printf '%s\n' "$out" | sed -n 1,5p)" \
+      "reproduce: gpgv ${kv[*]} $repo.$which.sig $repo.$which"
+    return 1
+  fi
+  return 0
+}
+
+# keyring_copy DIR CONF: the keyring files of CONF's keyring_image into DIR.
+# create and cp run nothing from the image, so no emulation is needed. This is
+# the same set of files scripts/keyring-files prints, and CI checks those
+# against targets/keyrings.sha256.
+keyring_copy() {
+  local dir="$1" conf="$2" image platform cid="" rc=0
+  image="$(target_get "$conf" keyring_image)"
+  platform="$(target_get "$conf" keyring_platform)"
+  [ -n "$image" ] || return 0
+  mkdir -p "$dir"
+  local runtime="${CONTAINER_RUNTIME:-docker}"
+  command -v "$runtime" > /dev/null || {
+    warn "$runtime is not installed, so the keyring of $image cannot be copied out" \
+      "reproduce: $runtime pull --platform $platform $image"
+    return 1
+  }
+  timeout --kill-after=30 300 "$runtime" pull --platform "$platform" "$image" > "$dir/pull.log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "could not pull $image for $platform (status $rc)" "$(sed -n 1,3p "$dir/pull.log")" \
+      "reproduce: $runtime pull --platform $platform $image"
+    return 1
+  fi
+  cid="$(timeout 120 "$runtime" create --platform "$platform" "$image" true)" || return 1
+  timeout 120 "$runtime" cp "$cid:/usr/share/pacman/keyrings/." "$dir/" > "$dir/cp.log" 2>&1 || rc=$?
+  timeout 60 "$runtime" rm "$cid" > /dev/null || log "could not remove container $cid"
+  [ "$rc" -eq 0 ] || {
+    warn "could not copy /usr/share/pacman/keyrings out of $image (status $rc)" \
+      "reproduce: $runtime create --platform $platform $image true, then $runtime cp ID:/usr/share/pacman/keyrings/. DIR"
+    return 1
+  }
+  # gpgv reads .gpg and .kbx only. A keyring image also ships archlinux-trusted
+  # and archlinux-revoked, which are lists of names and not keyrings.
+  local found=0 f
+  for f in "$dir"/*.gpg "$dir"/*.kbx; do
+    [ -f "$f" ] || continue
+    found=1
+  done
+  if [ "$found" -eq 0 ]; then
+    warn "$image holds no file gpgv can read under /usr/share/pacman/keyrings" \
+      "reproduce: $runtime create --platform $platform $image true, then $runtime cp ID:/usr/share/pacman/keyrings/. DIR"
+    return 1
+  fi
+  return 0
 }
 
 #---------------------------------------------------------------------------#
@@ -937,6 +1110,19 @@ fetch_upstream() {
   if [ -n "${3:-}" ]; then
     max=(--max-time "$3" --retry-max-time "$3")
     limit=(timeout -k 5 "$(($3 + 5))")
+  fi
+  # MIRROR_FETCHER names another reader (fetchers/fetcher.sh): it picks a
+  # client, keeps its own deadlines and states absence with 4, as curl does.
+  # It names the client and the reason in its own log lines, so this path has
+  # no cf-mitigated detail to report: only the curl path below reads that.
+  if [ -n "${MIRROR_FETCHER:-}" ]; then
+    rc=0
+    "${limit[@]}" "$MIRROR_FETCHER" --quiet --expect any "$url" "$outfile" || rc=$?
+    case "$rc" in
+      0) return 0 ;;
+      4) rm -f "$outfile"; return 4 ;;
+      *) rm -f "$outfile"; return 1 ;;
+    esac
   fi
   out="$("${limit[@]}" curl -q --location --silent --show-error --max-redirs 5 \
     --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \

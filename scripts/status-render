@@ -85,8 +85,13 @@ OTHER_DARK = "#6b6a65"
 STATE = {"good": "#0ca30c", "warning": "#fab219",
          "critical": "#d03b3b", "none": "#898781", "unknown": "#898781"}
 
-ARCH_ORDER = ["x86_64", "aarch64", "armv7h", "loong64", "riscv64"]
-REPO_ORDER = ["core", "extra", "multilib", "alarm", "aur"]
+# The architectures and repositories of the tree, in the order they get a
+# fixed colour slot and a fixed place in the tables. An architecture or a
+# repository not named here still appears, after the ones that are, so a new
+# target is visible before anyone adds it here.
+ARCH_ORDER = ["x86_64", "aarch64", "armv7h", "loong64", "riscv64",
+              "powerpc64le", "powerpc64", "powerpc"]
+REPO_ORDER = ["core", "extra", "multilib", "alarm", "aur", "base", "base-any"]
 PATH_ORDER = ["official", "worker", "oci", "oci-serial"]
 PATH_LABEL = {"official": "official mirror", "worker": "Worker, native",
               "oci": "oci wrapper", "oci-serial": "oci wrapper, serial"}
@@ -350,10 +355,54 @@ def arch_slots(arches):
     for i, a in enumerate(ARCH_ORDER):
         slots[a] = i + 1
     nxt = len(ARCH_ORDER) + 1
-    for a in extra:
-        slots[a] = nxt if nxt <= len(SLOTS_LIGHT) else 0
+    # The palette holds one colour per named architecture, so an architecture
+    # outside the list has none. Two of them sharing the grey would make two
+    # series the same colour, so each is given its own grey step instead:
+    # #a3a29c, then lighter or darker by a fixed step, which the dark style
+    # mirrors. A reader can tell them apart, and neither is mistaken for a
+    # named architecture's colour.
+    for i, a in enumerate(extra):
+        if nxt <= len(SLOTS_LIGHT):
+            slots[a] = nxt
+        else:
+            slots[a] = -1 - i          # a grey step of its own, class sxN
+            EXTRA_LIGHT.append(grey_light(i))
+            EXTRA_DARK.append(grey_dark(i))
         nxt += 1
     return known + extra, slots
+
+
+# The grey steps, for architectures outside ARCH_ORDER. Each is the base grey
+# moved further from the background, so the order of the extra architectures is
+# readable, and each is well clear of every palette colour.
+EXTRA_LIGHT = []
+EXTRA_DARK = []
+
+
+def _mix(hex_colour, target, amount):
+    """hex_colour moved `amount` of the way to `target`, as #rrggbb."""
+    out = ""
+    for i in (1, 3, 5):
+        c = int(hex_colour[i:i + 2], 16)
+        t = int(target[i:i + 2], 16)
+        out += "%02x" % round(c + (t - c) * amount)
+    return "#" + out
+
+
+def slot_class(slot):
+    """The CSS class a slot is drawn with. A palette slot is s1..s8, the grey
+    that means "outside the named architectures" is s0, and a grey step of an
+    architecture outside ARCH_ORDER is sx0, sx1 and so on, because a CSS class
+    cannot start with a minus sign."""
+    return "sx%d" % (-slot - 1) if slot < 0 else "s%d" % slot
+
+
+def grey_light(i):
+    return _mix(OTHER_LIGHT, "#5a5954", min(0.12 * (i + 1), 0.72))
+
+
+def grey_dark(i):
+    return _mix(OTHER_DARK, "#cfcec8", min(0.12 * (i + 1), 0.72))
 
 
 def repo_key(repo):
@@ -532,12 +581,19 @@ def chart_style():
     for i, c in enumerate(SLOTS_LIGHT):
         rules.append(".s%d{fill:%s}.l%d{stroke:%s}" % (i + 1, c, i + 1, c))
     rules.append(".s0{fill:%s}.l0{stroke:%s}" % (OTHER_LIGHT, OTHER_LIGHT))
+    # One grey step per architecture outside ARCH_ORDER, so two of them are two
+    # greys and not one grey twice. The list is filled by arch_slots, which
+    # runs before the first chart.
+    for i, c in enumerate(EXTRA_LIGHT):
+        rules.append(".sx%d{fill:%s}.lx%d{stroke:%s}" % (i, c, i, c))
     for k, c in STATE.items():
         rules.append(".st-%s{fill:%s}" % (k, c))
     dark = []
     for i, c in enumerate(SLOTS_DARK):
         dark.append(".s%d{fill:%s}.l%d{stroke:%s}" % (i + 1, c, i + 1, c))
     dark.append(".s0{fill:%s}.l0{stroke:%s}" % (OTHER_DARK, OTHER_DARK))
+    for i, c in enumerate(EXTRA_DARK):
+        dark.append(".sx%d{fill:%s}.lx%d{stroke:%s}" % (i, c, i, c))
     return (
         ".bg{fill:#fcfcfb;stroke:rgba(11,11,11,.10)}"
         "text{font-family:%(f)s}"
@@ -811,7 +867,7 @@ def chart_coverage(ctx, w):
     y = header(svg, "Coverage by repository", fmt_pct(s.get("coverage_files")) if measured(ctx["targets"])
                else "unknown", cap)
     groups = grouped(ctx["targets"], ctx["order"])
-    items = [("box", "s%d" % ctx["slots"][a], a) for a, _ in groups]
+    items = [("box", slot_class(ctx["slots"][a]), a) for a, _ in groups]
     y = legend(svg, y, items + [("box", "track", "upstream only")])
     rows = []
     for a, ts in groups:
@@ -826,7 +882,7 @@ def chart_coverage(ctx, w):
             r = c.get("ratio_files") or 0
             rows.append(Row(
                 "bar", t.get("repo"),
-                [(r * 100, "s%d" % ctx["slots"][a]), ((1 - r) * 100, "track")],
+                [(r * 100, slot_class(ctx["slots"][a])), ((1 - r) * 100, "track")],
                 fmt_pct(r), "%s / %s" % (fmt_int(c["files"]), fmt_int(c["of_files"])),
                 tip="%s: %s of %s files (%s), %s of %s GiB" % (
                     name, fmt_int(c["files"]), fmt_int(c["of_files"]), fmt_pct(r),
@@ -895,7 +951,7 @@ def chart_size(ctx, w):
                % (fmt_gib(s.get("upstream_bytes")), fmt_pct(s.get("coverage_bytes")), scope(ctx["targets"])))
     y = header(svg, "Size by repository", head, cap)
     groups = grouped(ctx["targets"], ctx["order"])
-    items = [("box", "s%d" % ctx["slots"][a], a) for a, _ in groups]
+    items = [("box", slot_class(ctx["slots"][a]), a) for a, _ in groups]
     y = legend(svg, y, items + [("box", "track", "upstream only")])
     gib = 1073741824
     vmax = max([((t.get("coverage") or {}).get("of_bytes") or 0) / gib for t in ctx["targets"]] + [0.001])
@@ -922,7 +978,7 @@ def chart_size(ctx, w):
             mb = (c.get("bytes") or 0) / gib
             nb = (c.get("of_bytes") or 0) / gib
             rows.append(Row("bar", t.get("repo"),
-                            [(mb, "s%d" % ctx["slots"][a]), (max(nb - mb, 0), "track")],
+                            [(mb, slot_class(ctx["slots"][a])), (max(nb - mb, 0), "track")],
                             "%s GiB" % fmt_gib(c.get("bytes")),
                             "of %s" % fmt_gib(c.get("of_bytes")),
                             short=fmt_gib(c.get("of_bytes")),
@@ -1001,7 +1057,7 @@ def time_ticks(x0, x1, plot_w):
 
 def line_chart(svg, y, series, slots, y_ticks, ty, y_fmt, y_label, x0, x1, ref=None):
     """One line per series. ty maps a value to 0..1 up the plot."""
-    items = [("line", "l%d" % slots.get(a, 0), a) for a, _ in series]
+    items = [("line", "l" + slot_class(slots.get(a, 0)), a) for a, _ in series]
     if ref:
         items.append(("line", "ref", ref[1]))
     y = legend(svg, y, items)
@@ -1146,6 +1202,12 @@ def chart_history_age(ctx, w):
         ticks = [t for i, t in enumerate(ticks) if i % 2 == 0 or t == hi]
 
     def ty(v):
+        # lo and hi are the ends of the scale, and they are equal when every
+        # age and twice the interval are under half an hour: a sync interval of
+        # 7.5 minutes or less does that. Then there is no range to divide by,
+        # so every point is at the bottom, which is where the truth is.
+        if hi <= lo:
+            return 0.0
         return (math.log(max(v, lo)) - math.log(lo)) / (math.log(hi) - math.log(lo))
 
     def hours(v, end=False):
@@ -1855,6 +1917,8 @@ def main(argv):
         sys.stderr.write("usage: python3 -I scripts/status-render IN OUT_SITE\n")
         return 2
     src, site = argv[1], argv[2]
+    if not site:
+        die("the site directory is empty", "reproduce: python3 -I scripts/status-render IN SITE")
     status = read_json(os.path.join(src, "status.json"), "scripts/status-collect's output", True)
     if not isinstance(status, dict) or status.get("schema") != 1:
         die("%s/status.json is not schema 1" % src,

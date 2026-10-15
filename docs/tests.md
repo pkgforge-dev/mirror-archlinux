@@ -32,6 +32,7 @@
 | `unit/45-dispatch-overdue.sh` | `scripts/dispatch-overdue` starts a workflow only when it is active and overdue |
 | `unit/60-status.sh` | `status-collect`, `status-render` and `check-staleness` on fixtures, also with one registry read that fails and with no registry read at all; `check-staleness` within `STALENESS_BUDGET` and `status-collect` within `STATUS_BUDGET`, against a local `db_server` that never answers; both against a first `db_server` that is behind the second, and one that answers 200 with an HTML page; the Worker probe through to the signed URL (one that answers 403, a working host outside `githubusercontent.com`), and the database downloaded through the Worker; the synced badge, the times and the one script of the page, and the size table and badges |
 | `unit/62-issues.sh` | the scripts that raise and clear issues, against a stand-in for `gh` (`tests/fixtures/issues/fake-gh`): `check-status-record`, `check-status-site`, `watch-schedules`, and `report` for `refused-<target>` |
+| `unit/80-fetchers.sh` | `fetchers/fetcher.sh` against a curl stand-in and faked curl-impersonate, node and venv-python clients: client selection, the per-host fallback order, the structural, `--sha256`, `--max-bytes`, `--header` and `--referer` checks, the HTML refusal, the retry backoff, the availability cache, the deadline, the dispatch of each client to its own program, `fetchers/self-check.sh`, `fetchers/install.sh --check`, the curl-impersonate asset choice, `fetchers/ci.sh` and `fetchers/drift.sh` |
 | `integration/10-pipeline.sh` | the whole mirror against its own registry and upstream |
 | `integration/20-client.sh` | the wrapper against its own registry, through faulty proxies |
 | `worker/10-node.sh` | `node --test 'worker/test/*.test.js'` |
@@ -201,6 +202,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/40-lib | `db_check` accepts an unreadable member that is not NUL bytes | not ok: `db_check refuses an unreadable member that holds other bytes than NUL, and names it` |
 | unit/40-lib | `db_check` refuses every unreadable member | not ok: `db_check accepts package directories whose desc is NUL bytes or empty, and names them` |
 | unit/40-lib | `db_check` no longer compares records and members | not ok: `db_check refuses a desc that holds two records` |
+| unit/40-lib | `db_records` no longer reads tar's own status: the pipeline keeps `\|\| rc=$?` in a shell without pipefail | not ok: `db_records refuses a database tar cannot read, and writes no record` (`status 0, 0 records`), and `db_check names a database tar cannot read` |
 | unit/40-lib | the `MAX_SHARDS` clamp removed | not ok: `shards: x86_64 extra's seed wants 216 by bytes and gets MAX_SHARDS` |
 | unit/40-lib | batches do not grow to fit `VERIFY_MAX_BATCHES` | not ok: `batches: x86_64 extra's seed wants 54, both limits grow, and it gets 36 to 40` |
 | unit/40-lib | the build date written with no `Z` | not ok: `a build date as ISO 8601 UTC` |
@@ -209,6 +211,24 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/40-lib | the `QQ==` read turned off | not ok: the three `registry:` assertions on the dummy token's 200 and 404 |
 | unit/40-lib | `registry_token_file` returns nothing | not ok: `registry: a second process reads the token the first one cached`, and the two after it |
 | unit/40-lib | a refused cached token is not asked for again | not ok: `registry: a cached token the registry refuses is asked for again, once`, `registry: the cache then holds the new token` |
+| unit/40-lib | the `MIRROR_FETCHER` branch removed from `fetch_upstream` | not ok: the three `fetch_upstream: MIRROR_FETCHER ...` assertions |
+| unit/80-fetchers | `client_run` groups cloak-browser with curl-impersonate and playwright with chromium | not ok: `cloak-browser runs fetch.mjs through node`, `playwright runs fetch.py through its venv python` |
+| unit/80-fetchers | the hard stop removed, so a client that hangs runs to its own end | not ok: `a client that hangs is stopped within --timeout` (the call took over 15 s) |
+| unit/80-fetchers | `--sha256` read but never compared | not ok: `a body with another sha256 is refused` |
+| unit/80-fetchers | `--client` takes a name no build defines | not ok: `an unknown client is refused`, `the refusal makes no request` |
+| unit/80-fetchers | `body_validate any` accepts an HTML document | not ok: `a 200 that is an HTML document is not a body` |
+| unit/80-fetchers | `--max-bytes` read but never compared | not ok: `a body over --max-bytes is refused` |
+| unit/80-fetchers | `retry_delay` never grows | not ok: `retry_delay grows 2, 4, 8 and stops at 30` |
+| unit/80-fetchers | the availability answer is not cached, or `--no-cache` is ignored | not ok: `a client probe is cached for its ttl`, `--no-cache asks the probe again` |
+| unit/80-fetchers | a cached host preference that names no client is used anyway | not ok: `an unknown cached client is ignored` |
+| unit/80-fetchers | `self-check.sh` decides on the manager alone, not on each available client | not ok: `self-check reads the URL through every available client` |
+| unit/80-fetchers | the `body_validate` desc pipeline reads with `grep -q`, so tar ends by SIGPIPE and `pipefail` reads the whole check as failed | not ok: `a database with an early desc member is read`, and the fetcher logged `bad-body: the archive holds no package desc member` |
+| unit/80-fetchers | the host preference is not written after a client reads a host | not ok: `the client that read the host is remembered`, `the next call for that host starts at curl-impersonate` |
+| unit/80-fetchers | a 403 body is taken as an answer | not ok: `a 403 from curl falls back to curl-impersonate` |
+| unit/80-fetchers | `drift.sh` does not read `.tag_name` | not ok: `drift reads the newest release tag`, `drift serves the value from its cache` |
+| unit/80-fetchers | `client_run` drops the headers, so the request carries none | not ok: `an extra header reaches curl` |
+| unit/80-fetchers | `drift.sh` only loads the cached values when the cache is fresh, so a stale cache whose lookup fails moves backwards | not ok: `a lookup that fails keeps the cached value` (rc 1, no value) |
+| unit/80-fetchers | the curl-impersonate asset is the first that matches the architecture, so a musl or libcurl archive can be chosen | not ok: `curl-impersonate picks the CLI gnu asset for this arch` |
 | integration/10-pipeline | the `MAX_SHARDS` clamp removed | not ok: `MAX_SHARDS caps a target's shards`, `the plan logs that the shard cap binds` |
 | integration/10-pipeline | `shard_count` always 1 | not ok: each target gets shards of its own |
 | integration/10-pipeline | the `dev.pkgforge.mirror.upstream` annotation added again | not ok: the package manifest names no upstream server; two writers push byte-identical manifests |
@@ -241,6 +261,8 @@ The tree itself is never changed. An integration fault runs with its own registr
 | integration/10-pipeline | the file-name drift bound used when `FILES_DRIFT_MAX` is not set | 3 not ok: `a files database that lags 12 rebuilt packages of 40 is planned` (got `error`), `the plan names the 12 packages the files database names at an earlier file name`, `the refusal names how many packages the files database names` |
 | integration/10-pipeline | plan no longer compares the sha256 of a file both databases name | not ok: `a files database that names a file of the database with other bytes is refused`, `the refusal names the file` |
 | integration/10-pipeline | every `sig-refused` package excused | not ok: with no `%PGPSIG%`, a layer that is not upstream's `.sig` is not excused |
+| unit/40-lib | `db_records` reads the pipeline's last stage instead of tar's, so a database tar cannot read whole gives records and exit 0 | 6 not ok, among them `not ok: a truncated database gives a non-zero status, not a partial record set` (expected 1, got 0, on the 20 of 40 packages before the cut) and `not ok: a zstd database with no zstd program gives a non-zero status` |
+| unit/40-lib | the gpgv check of a signed database removed, so db_signed = yes accepts any .sig that exists | 9 not ok, among them `not ok: a signature by a key the keyring does not hold is refused` and `not ok: a signature by the key the keyring holds verifies` |
 | integration/10-pipeline | `build-repo` signs on every build | not ok: an update is planned as new files only; `latest` does not move backwards |
 | unit/40-lib | `scripts/lib.sh` of before the anonymous token flow | 11 not ok, among them `registry, anonymous: GHCR refuses QQ== with 401, and the anonymous token reads the manifest` (got `1 1 0`), `registry blob, anonymous: GHCR refuses QQ==, and the anonymous token reads the blob` and `registry_blob: a blob that trickles is given up within REG_BLOB_MAX_TIME, with one request` (status 124 after 30 s) |
 | unit/42-registry-faults | `scripts/lib.sh` and `scripts/stage` of before `REG_LAST_CODE` | not ok: `stage: an anonymous read that answers 503 is asked 5 times` (1 read), `stage: an anonymous read that answers 503 sets error, naming HTTP 503, not private` (state `private`) |
@@ -267,7 +289,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/60-status | `failed_runs` always 1 | not ok: `worker: two failed runs in a row, failing since the first` |
 | unit/60-status | the Location check accepts `http://` | not ok: `worker: a 302 to http fails: the Location must be https` |
 | unit/60-status | the history keeps every line | not ok: `history keeps the last 2000 lines`, `the oldest lines go first and the new one is last` |
-| unit/60-status | a background `<rect>` left unclosed | 18 not ok, among them `site: all 22 SVG files parse as XML, each with a title and its own dark style` |
+| unit/60-status | a background `<rect>` left unclosed | 18 not ok, among them `site: all 34 SVG files parse as XML, each with a title and its own dark style` |
 | unit/60-status | the badge message left empty | 30 not ok: each `<site>: badge <name> carries its text: <words>` |
 | unit/60-status | the narrow `<source>` left out of the page | not ok: `index.html references every chart and badge`, in each of the three sites |
 | unit/60-status | `bucket()` keeps `None` points with no bucketing | not ok: `status-render site3 exits 0` |
@@ -314,6 +336,10 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/60-status | no size badge for the last architecture | 24 not ok, among them `site: a size badge for each architecture (aarch64 loong64 x86_64) parses as XML` |
 | unit/60-status | the size badges of the architectures with no `</svg>` | 31 not ok, among them `site: a size badge for each architecture (aarch64 loong64 x86_64) parses as XML` |
 | unit/60-status | the group labels of `charts/size.svg` with no sum | 5 not ok: `<site>: chart size shows ... x86_64 · 1.6 KiB of 2.4 KiB, 2 of 3 measured ...` |
+| unit/60-status | an architecture outside `ARCH_ORDER` given a named architecture's slot, so two architectures share a swatch | 6 not ok, one per site: `<site>: an architecture outside ARCH_ORDER takes the grey slot 0` |
+| unit/60-status | two architectures outside `ARCH_ORDER` given the same grey swatch | 6 not ok, one per site: `<site>: two architectures outside ARCH_ORDER get two different swatches` |
+| unit/60-status | the log scale of `charts/history-age.svg` guarded so a zero range cannot divide by zero | 448 of 448 pass with the guard, because no fixture has a sync interval under 8 minutes. Reached from a config change: `scripts/cron-tolerance` returns 5 for a `*/5 * * * *` cron, and with an empty history the scale's two ends are both 0.25 h |
+| unit/60-status | the three PowerPC arches and the two PowerPC repositories left out of `ARCH_ORDER` and `REPO_ORDER` | 6 not ok, one per site: `<site>: an architecture outside ARCH_ORDER takes the grey slot 0`, with `powerpc64le` also outside the order |
 
 ### issues
 
@@ -394,6 +420,8 @@ The tree itself is never changed. An integration fault runs with its own registr
 | static/50-workflow-policy | `sync.yml` with no `queue: max`; then with `cancel-in-progress: true` | not ok: `.github/workflows/sync.yml: the group sync queues every pending run, so a dispatch waits its turn`; then also `every concurrency queue is single or max, and max never cancels in progress` |
 | static/20-actionlint | the `queue` ignore removed | not ok: `actionlint .github/workflows/sync.yml` (`unexpected key "queue" for "concurrency" section`) |
 | static/60-targets | a verify image pinned without a tag | not ok: `targets/x86_64-core.conf pins its verify_image as name:tag@sha256` |
+| static/60-targets | the six PowerPC target files deleted, leaving five plan slots and nine keyring lines with no target | two not ok: `sync.yml has one plan slot per enabled target, and no slot without one` (21 slots for 15 targets) and `every keyring line in targets/keyrings.sha256 belongs to an enabled target's keyring_image` (no enabled target pins ppc ppc64 ppc64le). Before these two checks the deletion left both suites green |
+| static/60-targets | `keyring_platform` of one architecture set to another architecture's platform, which still pulls and pulls the wrong keyring files | not ok: `targets/powerpc64le-base.conf: keyring_platform linux/ppc64 is the platform of the ppc64le image`, and the same for an aarch64 target set to `linux/aarch64`. Before the check this passed: the field was only tested for being present |
 | static/70-python | a `#!python3` file with a syntax error | not ok: `python3 -I -m py_compile scripts/status-render` |
 | static/70-python | a data file `scripts/notes.txt` | not ok: `scripts/notes.txt is a shell or a python script` |
 | static/70-python | no python3, with `TESTS_REQUIRE_TOOLS=python3` | not ok: `python3 is on PATH, to compile the python in the tree`; without the variable, `# SKIP python3 is not on PATH` |
@@ -408,6 +436,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | static/75-renovate | `ignorePaths` removed | not ok: `.github/renovate.json sets ignorePaths, and no entry is a tests directory` |
 | static/75-renovate | the keyring images set to automerge, with no `keyrings` job in ci.yml | not ok: `the keyring images merge on their own only behind ci.yml job keyrings` |
 | ci.yml job `keyrings` | one sha256 in `targets/keyrings.sha256` changed | the job fails, prints the diff, and names the file to update |
+| ci.yml job `keyrings` | one hex digit of the `ppc64 archpower.gpg` line changed, the other eight ppc lines as they are | the computed lines and the file differ, so the job fails. Measured 2026-10-15 against the three real `keyring_image`s, pulled with `oras` and their keyring layers extracted: the committed nine ppc lines are identical to what `scripts/keyring-files` computes (`diff` exit 0), and one changed digit is not equal |
 
 ## What the integration suite drives on every run
 

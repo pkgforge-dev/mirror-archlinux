@@ -222,6 +222,62 @@ plan compares `<repo>.files` with `<repo>.db` by package name. A package that bo
 plan refuses a files database that names fewer than half of the packages of the database, and leaves out 16 or more: it is the files database of another repository. It also refuses one that names a file of the database with another sha256. After a refusal, plan reads `<repo>.files` from the next `db_server` that served the same database. When none serves a matching one, the target is in error, and its why says so.
 
 `FILES_DRIFT_MAX`, when set, replaces the package-name rule: plan refuses a files database when more file names than `FILES_DRIFT_MAX` are named by only one of the two databases.
+### Which client reads upstream
+
+`fetchers/fetcher.sh URL OUT` reads one URL and writes the body. The chooser
+runs its clients in a fixed order and takes the first body that passes every
+check asked for:
+
+```
+curl  curl-impersonate  chromium  cloak-browser  playwright
+```
+
+curl is first on purpose. Every origin in this repository that answers curl
+answers it in tens of milliseconds and starts no browser, and a mirror run
+makes thousands of reads. The browser clients are what an origin that refuses
+curl falls back to, not what every read pays for.
+
+| variable | meaning |
+| --- | --- |
+| `FETCHER_CLIENTS` | the order, space separated. The default is the list above. |
+| `FETCHER_AVAILABLE_TTL` | seconds an availability answer is kept, default 300 |
+| `FETCHER_CACHE` | where the per-host preference and the probes are kept |
+| `--client LIST` | try these clients, in this order, and no other |
+| `--require-tool NAME` | try `NAME` first, and refuse to run if it cannot |
+
+A client that is not available is skipped and the summary says `not available`.
+It is never skipped silently, because a run that fails for a missing tool and a
+run that fails for a real fault need different answers. The answer for a client
+is its `available` script, and that answer is cached for
+`FETCHER_AVAILABLE_TTL` because a browser probe starts node or python and costs
+more than the fetch it guards.
+
+A body that fails `--expect`, `--sha256`, `--magic` or the `--signature` check
+does not count as fetched. That client is marked unusable for this URL and the
+next one is tried, because a client that answered 200 with the wrong bytes has
+told you something worth knowing. A 403 is such a body: it is not the file that
+was asked for.
+
+`--signature URL` checks the signature with `gpgv` and not `gpg`, so the check
+cannot change the trust store it verified against, and it derives `URL.sig`
+itself so the signature and the body cannot be two different files. The body is
+written only after the signature verifies.
+
+### When a target cannot be read at all
+
+Two different faults look the same from a run: a target whose `db_server`
+cannot be fetched, and a target whose `db_server` answers but whose files the
+origin will not serve. `scripts/plan` puts the target in error for the run and
+names it, and the next run reads it again. Nothing is deleted and no tag is
+written.
+
+If every client answers 403 for one origin, no client in this tree will fix
+it, because the thing being refused is the address and not the handshake. The
+fix is a self-hosted runner on a network that origin accepts. ⚠ That the
+origins differ in that way is a hypothesis, not a measurement: from the
+network these were last measured on, ArchPOWER answered curl with HTTP 200.
+`fetchers/README.md` says what is measured, what is not, and the single
+workflow run that would settle it.
 
 ## Renovate
 
@@ -232,8 +288,8 @@ plan refuses a files database that names fewer than half of the packages of the 
 - Digest, pin, pinDigest, patch and minor updates of actions and images merge on their own, as a squash, when every check is green.
 - `platformAutomerge` is `false`. `main` has no required checks, so GitHub's own auto-merge would merge a pull request with red checks. Renovate reads the checks itself.
 - ⚠ A major update waits for a person.
-- ⚠ The keyring images (`ghcr.io/pkgforge-dev/archlinux`) are the trust root of the aarch64, armv7h, loong64 and riscv64 targets. They merge on their own only when CI job `keyrings` passes: the keyring files that verify takes from them equal `targets/keyrings.sha256`. Other keys fail the job, and a person reviews them.
-- The 15 `verify_image` lines and the Arch image of the tests move in one pull request. So CI runs pacman in the image the targets will verify with, before it merges.
+- ⚠ The keyring images (`ghcr.io/pkgforge-dev/archlinux`) are the trust root of every target outside x86_64: aarch64, armv7h, loong64, riscv64, powerpc64le, powerpc64 and powerpc. They merge on their own only when CI job `keyrings` passes: the keyring files that verify takes from them equal `targets/keyrings.sha256`. Other keys fail the job, and a person reviews them.
+- The 21 `verify_image` lines and the Arch image of the tests move in one pull request. So CI runs pacman in the image the targets will verify with, before it merges.
 - The node image of `worker.yml` and `ci.yml` moves in one pull request.
 - `ignorePaths` is `["**/node_modules/**"]`. It replaces the preset's list, which ignores `**/tests/**`, so the test images are updated too.
 
@@ -252,6 +308,48 @@ plan refuses a files database that names fewer than half of the packages of the 
 ## Secrets
 
 The repository has no secret. Every job uses the workflow's own `GITHUB_TOKEN`. The Worker is deployed by hand with the maintainer's wrangler login.
+
+## The fetchers
+
+`plan` and `mirror` read upstream through `scripts/lib.sh` `fetch_upstream`.
+⚠ Two reports say ArchPOWER answers a GitHub runner with a 403 interstitial.
+That is not confirmed here: from the address these were measured on, plain curl
+answered 200 for every database, and a sandbox cannot choose its egress
+address. So `fetchers/fetcher.sh` is in place and used when a target needs a
+browser client, and whether it is needed is a question one workflow run
+answers. `fetchers/README.md` says what is measured, what is not, and how to
+settle it. The
+manager is in `fetchers/`; `fetchers/README.md` has the interface, the client
+table and the drift resolver.
+
+Set `MIRROR_FETCHER` to `fetchers/fetcher.sh` and every `fetch_upstream` call
+uses the manager: it tries `curl` first, keeps the client that read each host
+in `FETCHER_CACHE/hosts/`, and falls back to a browser client only when curl
+does not get a body. `4` means the server says the URL is absent, as for curl.
+The installers are `fetchers/install.sh [CLIENT...]`; a client is available
+when its `available` script exits 0, so a host without a browser skips it and
+`--list` says what can run.
+
+A GitHub runner that must read ArchPOWER at plan and mirror time installs
+`curl-impersonate` for the cheap path and `chromium` for the full path:
+
+```yaml
+- run: |
+    fetchers/install.sh curl-impersonate chromium
+    export MIRROR_FETCHER="$PWD/fetchers/fetcher.sh"
+    scripts/plan "$RUNNER_TEMP/plan"
+```
+
+The versions are not pinned: `fetchers/drift.sh` reads each tool's newest
+release and the installers take that tag, so an update is a run, not a commit.
+On a runner, `fetchers/ci.sh [--with-deps] [CLIENT...]` installs the clients,
+requires each one it was asked for to be available, and then runs
+`fetchers/self-check.sh --strict`, which reads a small URL through the manager
+and through every available client. `MIRROR_FETCHER` also carries `--header`
+and `--referer` when an origin needs them.
+`tests/unit/80-fetchers.sh` covers client selection, the fallback order, the
+structural, size, sha256, header and referer checks and the resolver with a
+curl stand-in; a browser client is not started by the tests.
 
 ## Pages
 
@@ -272,6 +370,14 @@ The site at <https://pkgforge-dev.github.io/mirror-archlinux/> holds:
 | `index.html` | the dashboard: one static page, light and dark, with one inline script for local times (below) |
 | `badges/<target>.svg` | coverage and snapshot age of one target |
 | `badges/<arch>.svg` | the same over the targets of one architecture |
+| `badges/size-<arch>.svg` | the bytes of the targets of one architecture |
+
+⚠ Four badge names are reserved and an architecture may not take one of them:
+`all`, `synced`, `size` and `speed` are written for the whole site, so an
+architecture called `size` would have its group badge overwritten by the
+site's own. The tree has no such target, and nothing in the target-file
+grammar stops one, so a new architecture has to pick a name outside those
+four.
 | `badges/all.svg` | the same over every target |
 | `badges/synced.svg` | the time since the mirror last changed (below) |
 | `badges/size.svg` | the bytes that the databases of the latest snapshots name, over every target, for example `369 GiB` or `1.2 TiB` |
