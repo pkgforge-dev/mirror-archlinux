@@ -38,6 +38,24 @@ jobs:
           # The whole history: a target added less than the tolerance ago,
           # with nothing promoted yet, is new, not stale.
           fetch-depth: 0
+      - name: Install curl-impersonate, so the powerpc targets read upstream
+        run: |
+          # check-staleness reads every enabled target's upstream through
+          # scripts/upstream-db, and the powerpc (ArchPOWER) hosts refuse the
+          # runner's own address to raw curl with a 403. curl-impersonate (a
+          # patched curl with one browser's TLS and HTTP/2 profile) reads them,
+          # directly at this low volume or through the api.rv.pkgforge.dev proxy
+          # as its -rv variant: two layers, and a handful of database reads need
+          # no full browser, so chromium is not installed here. Best-effort: a
+          # client-install hiccup leaves MIRROR_FETCHER unset and the powerpc
+          # targets read with curl and go to error on their own, as before.
+          imp=0
+          fetchers/install.sh curl-impersonate || imp=$?
+          if [ "$imp" -eq 0 ]; then
+            echo "MIRROR_FETCHER=$GITHUB_WORKSPACE/fetchers/fetcher.sh" >> "$GITHUB_ENV"
+          else
+            echo "::warning::curl-impersonate did not install (status $imp); powerpc targets read upstream with curl and may go to error"
+          fi
       # scripts/check-staleness ends within STALENESS_BUDGET (600 s). The step
       # limit is above it and below the job's, so the step after this one
       # still runs when this one is stopped. Exit 3 (a target stale or

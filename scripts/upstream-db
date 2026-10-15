@@ -75,9 +75,29 @@ ua="mirror-archlinux (+https://github.com/${GITHUB_REPOSITORY:-pkgforge-dev/mirr
 # (curl's status, or timeout's 124 or 137). As scripts/lib.sh fetch_upstream:
 # --retry-max-time starts no retry after MAX, and timeout(1) ends a retry
 # that started just before it. The status is kept for the caller's record.
+#
+# MIRROR_FETCHER names the fetcher manager (fetchers/fetcher.sh), the same
+# reader scripts/plan and scripts/mirror use: a host that refuses the runner's
+# own address — ArchPOWER behind Cloudflare — is read through a browser-profile
+# client and the api.rv.pkgforge.dev proxy, where raw curl only ever gets a 403.
+# The manager states 0 read, 4 absent, else no client read; this maps that to
+# f_code so the caller's record and down_mark are unchanged, and keeps the outer
+# timeout's 124/137 so a read the share cut short is still seen as a stall, not a
+# down host. Without MIRROR_FETCHER, raw curl, as before.
 fetch() {
   f_code=""
   f_rc=0
+  if [ -n "${MIRROR_FETCHER:-}" ]; then
+    timeout -k 5 "$(($3 + 10))" "$MIRROR_FETCHER" --quiet --retries 1 \
+      --timeout "$3" --expect any "$1" "$2" || f_rc=$?
+    case "$f_rc" in
+      0) f_code=200 ;;
+      4) f_code=404; f_rc=0 ;;
+      124 | 137) ;;
+      *) f_rc=1 ;;
+    esac
+    return 0
+  fi
   f_code="$(timeout -k 5 "$(($3 + 5))" curl -q --location --silent --show-error --max-redirs 5 \
     --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \
     --connect-timeout 20 --speed-limit 4096 --speed-time 60 --max-time "$3" --retry-max-time "$3" \
