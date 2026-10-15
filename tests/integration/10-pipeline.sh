@@ -683,6 +683,27 @@ else
   fail "the refusal names the file" "read out/fconflict.log"
 fi
 
+#---------------------------------------------------------------------------#
+# 1e3. A package the database names but upstream no longer serves: every server
+#      answers 404 for its file. The mirror skips it as absent and still stages
+#      and promotes the target, rather than holding the whole target for one
+#      stale upstream entry. As ArchPOWER's powerpc base names
+#      kwayland-server-debug with the file gone.
+#---------------------------------------------------------------------------#
+build pkg-missing aarch64/port-gone port
+mkdir -p "$work/targets-gone"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/port-gone|; s|/\$arch/\./\$repo$|/$arch/./port-gone|' "$work/targets/aarch64-port.conf" > "$work/targets-gone/aarch64-port.conf"
+TARGETS_DIR="$work/targets-gone" MIRROR_NAMESPACE=it/gone sync gone aarch64-port
+check "a file upstream no longer serves is skipped as absent, and the target stages and promotes" "staged promoted" \
+  "$(state_of gone stage aarch64-port) $(cut -f 2 "$work/out/gone/promote-aarch64-port.tsv" 2> /dev/null)" \
+  "read out/gone/stage-aarch64-port.log out/gone/promote-aarch64-port.log"
+if grep -q 'gone from upstream (404)' "$work/out/gone/stage-aarch64-port.log"; then
+  ok "the stage names the file(s) it skipped as absent"
+else
+  fail "the stage names the file(s) it skipped as absent" "read out/gone/stage-aarch64-port.log"
+fi
+
 # A files database that lags a mass rebuild: 12 of 40 packages at their
 # earlier file names, 24 file names that only one of the two databases names.
 # That is more than the larger of 16 and half the records, and is still the

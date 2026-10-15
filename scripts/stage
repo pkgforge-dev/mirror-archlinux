@@ -352,9 +352,13 @@ stage_target() {
   #-------------------------------------------------------------------------#
   cp "$pdir/records.tsv" "$dir/records.tsv"
   target_keyrings "$conf" > "$work/keyrings.txt"
+  # Canaries are always-present files; a file skipped as absent (404 upstream) is
+  # not one, so it is excluded from both the keyring and the smallest-package
+  # picks, lest verify's canary batch ask the registry for a file not there.
+  awk -F '\t' 'FILENAME == ARGV[1] { a[$1] = 1; next } !($2 in a)' "$dir/absent.txt" "$pdir/records.tsv" > "$work/records-present.tsv"
   {
-    awk -F '\t' 'FILENAME == ARGV[1] { want[$1] = 1; next } ($2 in want) { print $2 }' "$work/keyrings.txt" "$pdir/records.tsv"
-    sort -t $'\t' -k6,6n -k2,2 "$pdir/records.tsv" | awk -F '\t' 'NR == 1 { print $2 }'
+    awk -F '\t' 'FILENAME == ARGV[1] { want[$1] = 1; next } ($2 in want) { print $2 }' "$work/keyrings.txt" "$work/records-present.tsv"
+    sort -t $'\t' -k6,6n -k2,2 "$work/records-present.tsv" | awk -F '\t' 'NR == 1 { print $2 }'
   } | awk '!seen[$0]++' > "$dir/canaries.txt"
   {
     awk -F '\t' 'FILENAME == ARGV[1] { c[$1] = 1; next } ($2 in c) { print $2 "\t" $6 }' "$dir/canaries.txt" "$pdir/records.tsv"

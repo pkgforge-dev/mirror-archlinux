@@ -40,6 +40,10 @@
 #              extra.files names qemu-system-cris 9.1.2-1 (2026-10-15)
 #   port-files-conflict  as port, with port.files of another build of
 #              unsigned 1-1: the same file name with other bytes
+#   pkg-missing  here-1-1, served, and gone-1-2, which the database and files
+#              database name but whose package file and .sig are removed, so
+#              every server answers 404 for it, as ArchPOWER's powerpc base
+#              names kwayland-server-debug with the file gone (2026-10-16)
 #   files-lag  40 packages with no signature, p01 to p40; p01 to p12 rebuilt
 #              at pkgrel 2, and a files database of before that rebuild, as
 #              when the files database lags during a mass rebuild
@@ -272,6 +276,19 @@ case "$state" in
       fi
     done
     tar -tvf "$repo/$db.db.tar.gz"
+    ls -l "$repo"
+    exit 0
+    ;;
+  pkg-missing)
+    # here-1-1 is served; gone-1-1 stays in the database and the files database,
+    # but its package file and .sig are removed, so every server answers 404 for
+    # it: upstream's database names a file it no longer serves, as ArchPOWER's
+    # powerpc base does for kwayland-server-debug. The mirror skips it as absent
+    # and still promotes the target.
+    mkpkg here 1-1 any 1700000000 "a package upstream serves"
+    mkpkg gone 1-2 any 1700000100 "a package upstream no longer serves"
+    repo-add --quiet --include-sigs "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
+    rm -f "$repo/gone-1-2-any.pkg.tar.zst" "$repo/gone-1-2-any.pkg.tar.zst.sig"
     ls -l "$repo"
     exit 0
     ;;
