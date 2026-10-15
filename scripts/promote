@@ -30,7 +30,10 @@
 # writer, cannot roll consumers back. (scripts/plan holds the content floor:
 # no package older than the promoted database.)
 #
-# Environment: MIRROR_NAMESPACE, REGISTRY_USER, REGISTRY_TOKEN.
+# Environment: MIRROR_NAMESPACE, REGISTRY_USER, REGISTRY_TOKEN,
+# PROMOTE_RATE_WAIT (420: the seconds of pauses after a 429 that the tags may
+# take together, below the job's 15 minutes; each pause RATE_PAUSE_MIN to
+# RATE_PAUSE_MAX seconds, lib.sh throttle_pause).
 #
 # Exit status: 0 promoted, or nothing to promote; 1 refused or failed.
 set -euo pipefail
@@ -39,6 +42,10 @@ SCRIPT_NAME=promote
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 need curl jq awk sha256sum timeout
+PROMOTE_RATE_WAIT="${PROMOTE_RATE_WAIT:-420}"
+case "$PROMOTE_RATE_WAIT" in
+  '' | *[!0-9]*) die "PROMOTE_RATE_WAIT must be whole seconds, not '$PROMOTE_RATE_WAIT'" ;;
+esac
 
 stage="${1:-}"
 verify="${2:-}"
@@ -132,20 +139,31 @@ case "$rc" in
 esac
 tags+=("db-$DB_SHA256" "files-$FILES_SHA256" latest)
 
+# A 429 costs no attempt (lib.sh rate_limited, throttle_pause): the shards of
+# other targets push on the same token at the same time. The pauses of all
+# tags add up to at most PROMOTE_RATE_WAIT.
 for t in "${tags[@]}"; do
   ok=0
-  for attempt in 1 2 3; do
+  attempt=0
+  while :; do
     rc=0
-    timeout --kill-after=30 120 "$ORAS" tag "${oargs[@]}" \
+    timeout -k 30 120 "$ORAS" tag "${oargs[@]}" \
       "$MIRROR_REGISTRY/$repo_path@$DIGEST" "$t" > "$work/tag.log" 2>&1 || rc=$?
     if [ "$rc" -eq 0 ]; then
       ok=1
       break
     fi
+    if rate_limited "$work/tag.log"; then
+      throttle_pause "$work" "$PROMOTE_RATE_WAIT" "oras tag $t" || break
+      continue
+    fi
+    attempt=$((attempt + 1))
     warn "oras tag $t, attempt $attempt, ended $rc" "$(tail -n 3 "$work/tag.log")"
+    [ "$attempt" -lt 3 ] || break
     sleep $((attempt * attempt * 5))
   done
-  [ "$ok" -eq 1 ] || die "could not tag $repo_path@$DIGEST as $t: $(tail -n 1 "$work/tag.log")"
+  [ "$ok" -eq 1 ] || die "could not tag $repo_path@$DIGEST as $t: $(tail -n 1 "$work/tag.log")" \
+    "$attempt failed attempt(s), and ${THROTTLE_WAITED}s of 429 pauses of at most PROMOTE_RATE_WAIT=${PROMOTE_RATE_WAIT}s"
 done
 
 #---------------------------------------------------------------------------#

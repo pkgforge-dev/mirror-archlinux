@@ -374,18 +374,22 @@ fake="$work/fake"
 mkdir -p "$fake/bin"
 cat > "$fake/bin/curl" << 'EOF'
 #!/usr/bin/env bash
-# Logs "URL<TAB>AUTH" to $FAKE/calls.log; answers a token request that
+# Logs "URL<TAB>AUTH" to $FAKE/calls.log. Answers a token request that
 # carries a credential (a user line on stdin, --config -) with
-# $FAKE/next-token, one with none with "anon", and a manifest request from
-# $FAKE/answers.tsv: AUTH<TAB>CODE<TAB>BODY-FILE, the first line whose AUTH
-# matches.
-out="" auth="" url="" cred=""
+# $FAKE/next-token, and one with none with "anon"; when $FAKE/token-code
+# exists, every token request gets that HTTP code and no token. Answers a
+# manifest or a blob request from $FAKE/answers.tsv: AUTH<TAB>CODE<TAB>BODY-FILE,
+# the first line whose AUTH matches. With --write-out, prints the HTTP code.
+out="" auth="" url="" cred="" wo="" maxt="" retmax=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --output) out="$2"; shift 2 ;;
     --header) case "$2" in Authorization:*) auth="${2#Authorization: }" ;; esac; shift 2 ;;
     --config) if [ "$2" = - ]; then cred="$(cat)"; fi; shift 2 ;;
-    --write-out | --user | --data-urlencode | --connect-timeout | --max-time | --retry | --retry-delay | \
+    --write-out) wo="$2"; shift 2 ;;
+    --max-time) maxt="$2"; shift 2 ;;
+    --retry-max-time) retmax="$2"; shift 2 ;;
+    --user | --data-urlencode | --connect-timeout | --retry | --retry-delay | \
       --max-filesize | --proto | --proto-redir | --max-redirs | --speed-limit | --speed-time | --user-agent) shift 2 ;;
     -*) shift ;;
     *) url="$1"; shift ;;
@@ -394,31 +398,57 @@ done
 printf '%s\t%s\n' "$url" "$auth" >> "$FAKE/calls.log"
 case "$url" in
   */token)
-    case "$cred" in
-      *'user = '*) printf '{"token":"%s"}' "$(cat "$FAKE/next-token")" > "$out" ;;
-      *) printf '{"token":"anon"}' > "$out" ;;
-    esac
+    # The deadlines a token request was given, and a token endpoint that
+    # stalls when $FAKE/token-stall exists. exec, so the signal of timeout(1)
+    # ends the sleep itself and no child holds the caller's pipe open.
+    printf '%s %s\n' "${maxt:-none}" "${retmax:-none}" > "$FAKE/token-args"
+    if [ -f "$FAKE/token-stall" ]; then
+      exec sleep 60 > /dev/null
+    fi
+    if [ -f "$FAKE/token-code" ]; then
+      printf '{"errors":[{"code":"DENIED"}]}' > "$out"
+      code="$(cat "$FAKE/token-code")"
+    else
+      case "$cred" in
+        *'user = '*) printf '{"token":"%s"}' "$(cat "$FAKE/next-token")" > "$out" ;;
+        *) printf '{"token":"anon"}' > "$out" ;;
+      esac
+      code=200
+    fi
     ;;
-  */manifests/*)
+  */manifests/* | */blobs/*)
     line="$(awk -F '\t' -v a="$auth" '$1 == a && !f { print $2 "\t" $3; f = 1 }' "$FAKE/answers.tsv")"
-    [ -n "$line" ] || { printf '000'; exit 7; }
+    if [ -z "$line" ]; then
+      [ -z "$wo" ] || printf '000'
+      exit 7
+    fi
     cp "$FAKE/${line#*$'\t'}" "$out"
-    printf '%s' "${line%%$'\t'*}"
+    code="${line%%$'\t'*}"
     ;;
 esac
+[ -z "$wo" ] || printf '%s' "$code"
 EOF
 chmod +x "$fake/bin/curl"
 printf '{"schemaVersion":2,"layers":[]}' > "$fake/manifest.json"
 printf '{"errors":[{"code":"MANIFEST_UNKNOWN"}]}' > "$fake/unknown.json"
 printf '{"errors":[{"code":"UNAUTHORIZED"}]}' > "$fake/denied.json"
-# reg NAME ANSWERS [CACHE] -> "STATUS CALLS TOKEN-CALLS", one registry_manifest
+printf 'service unavailable' > "$fake/busy.txt"
+printf 'the bytes of one blob\n' > "$fake/blob.bin"
+BLOB="sha256:$(sha256sum "$fake/blob.bin" | cut -d ' ' -f 1)"
+printf 'other bytes\n' > "$fake/other.bin"
+# reg NAME ANSWERS [CACHE] -> "STATUS CALLS TOKEN-CALLS", one registry_manifest;
+# its REG_LAST_CODE in $fake/last-code. REG_READ=blob reads the blob $BLOB.
 reg() {
   local rc=0
   printf '%b' "$2" > "$fake/answers.tsv"
   : > "$fake/calls.log"
   FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY="${REG_REGISTRY:-ghcr.io}" MIRROR_REGISTRY_AUTH=token MIRROR_REGISTRY_SCHEME=https \
     REGISTRY_TOKEN="${REG_TOKEN-secret}" REGISTRY_TOKEN_CACHE="${3:-}" \
-    in_lib registry_manifest it/repo latest "$fake/out.json" > /dev/null 2> "$fake/err" || rc=$?
+    bash -c '. "$1"; rc=0
+      if [ "$2" = blob ]; then registry_blob it/repo "$5" "$3" || rc=$?
+      else registry_manifest it/repo latest "$3" || rc=$?; fi
+      printf "%s\n" "$REG_LAST_CODE" > "$4"; exit "$rc"' _ "$LIB" "${REG_READ:-manifest}" "$fake/out.json" "$fake/last-code" "$BLOB" \
+    > /dev/null 2> "$fake/err" || rc=$?
   printf '%s %s %s\n' "$rc" "$(awk 'END { print NR + 0 }' "$fake/calls.log")" "$(awk -F '\t' '$1 ~ /\/token$/ { n++ } END { print n + 0 }' "$fake/calls.log")"
 }
 echo tok1 > "$fake/next-token"
@@ -455,6 +485,118 @@ check "registry, another registry: the anonymous read after it asks for a token 
 check "registry, another registry: the anonymous read sent no cached token" "Bearer anon" \
   "$(awk -F '\t' '$1 ~ /manifests/ { print $2 }' "$fake/calls.log")" "cat $fake/calls.log"
 check "registry, another registry: the cache holds only the authenticated token" tok1 "$(cat "$fake"/cache-other/*)" "ls $fake/cache-other"
+
+# GHCR does not document Bearer QQ==. When it refuses it, an anonymous read
+# asks the anonymous token flow once, says so, and reads on. The anonymous
+# token is never cached.
+for c in 401 403; do
+  mkdir -m 0700 "$fake/cache-anon-$c"
+  check "registry, anonymous: GHCR refuses QQ== with $c, and the anonymous token reads the manifest" "0 3 1 200" \
+    "$(REG_TOKEN='' reg "qq$c" "Bearer QQ==\t$c\tdenied.json\nBearer anon\t200\tmanifest.json\n" "$fake/cache-anon-$c") $(cat "$fake/last-code")" \
+    "lib.sh registry_manifest with REGISTRY_TOKEN empty; cat $fake/calls.log $fake/err"
+  if grep -q "GHCR refused Bearer QQ== for it/repo (HTTP $c); the anonymous token flow was used" "$fake/err"; then
+    ok "registry, anonymous: the refusal of QQ== with $c is named in a warning"
+  else
+    fail "registry, anonymous: the refusal of QQ== with $c is named in a warning" "stderr: $(cat "$fake/err")" "lib.sh registry_manifest"
+  fi
+  check "registry, anonymous: the anonymous token is not cached" "" "$(ls "$fake/cache-anon-$c")" "ls $fake/cache-anon-$c"
+done
+check "registry, anonymous: an answer of QQ== other than 401 and 403 is the answer, with no token asked" "1 1 0 503" \
+  "$(REG_TOKEN='' reg qq503 'Bearer QQ==\t503\tbusy.txt\n') $(cat "$fake/last-code")" "lib.sh registry_manifest; cat $fake/calls.log"
+# The token endpoint refuses the anonymous pull scope of a repository GHCR
+# does not show (403, measured): absent, as the 404 of QQ== says today.
+printf '403\n' > "$fake/token-code"
+check "registry, anonymous: a token endpoint that refuses the repository is absent, with its code" "4 2 1 403" \
+  "$(REG_TOKEN='' reg qqdenied 'Bearer QQ==\t401\tdenied.json\n') $(cat "$fake/last-code")" "lib.sh registry_manifest; cat $fake/calls.log $fake/err"
+printf '503\n' > "$fake/token-code"
+check "registry, anonymous: a token endpoint that fails is an error, not an absence" "1 2 1 503" \
+  "$(REG_TOKEN='' reg qqtokenfail 'Bearer QQ==\t401\tdenied.json\n') $(cat "$fake/last-code")" "lib.sh registry_manifest; cat $fake/calls.log $fake/err"
+# Only the measured 403 is an absence. A 401 of the token endpoint is not
+# measured, and is an error.
+printf '401\n' > "$fake/token-code"
+check "registry, anonymous: a token endpoint that answers 401 is an error, not an absence" "1 2 1 401" \
+  "$(REG_TOKEN='' reg qqtoken401 'Bearer QQ==\t401\tdenied.json\n') $(cat "$fake/last-code")" "lib.sh registry_manifest; cat $fake/calls.log $fake/err"
+printf '403\n' > "$fake/token-code"
+check "registry, with a token: a token endpoint that refuses is an error, never an absence" "1 2 1 403" \
+  "$(reg authdenied 'Bearer QQ==\t404\tunknown.json\n') $(cat "$fake/last-code")" \
+  "lib.sh registry_manifest; cat $fake/calls.log $fake/err"
+# registry_token, which status-collect calls: GHCR gives no anonymous token
+# for a repository it does not show, such as a target with no push yet. QQ==
+# is given instead, with which GHCR answers 404, so the target reads as absent.
+# token NAME -> "STATUS TOKEN" of registry_token it/repo pull, anonymous
+token() {
+  local rc=0 t
+  t="$(FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY=ghcr.io MIRROR_REGISTRY_AUTH=token MIRROR_REGISTRY_SCHEME=https \
+    REGISTRY_TOKEN='' in_lib registry_token it/repo pull 2> "$fake/err")" || rc=$?
+  printf '%s %s\n' "$rc" "$t"
+}
+check "registry_token, anonymous: GHCR refuses the repository (403): QQ==, which reads it as absent" "0 QQ==" \
+  "$(token denied)" "bash -c '. scripts/lib.sh; registry_token it/repo pull'; cat $fake/err"
+printf '503\n' > "$fake/token-code"
+check "registry_token, anonymous: a token endpoint that fails gives no token" "1 " \
+  "$(token failing)" "bash -c '. scripts/lib.sh; registry_token it/repo pull'; cat $fake/err"
+printf '401\n' > "$fake/token-code"
+check "registry_token, anonymous: a token endpoint that answers 401 gives no token, not QQ==" "1 " \
+  "$(token unauthorized)" "bash -c '. scripts/lib.sh; registry_token it/repo pull'; cat $fake/err"
+rm -f "$fake/token-code"
+check "registry_token, anonymous: the token endpoint's anonymous token" "0 anon" \
+  "$(token granted)" "bash -c '. scripts/lib.sh; registry_token it/repo pull'; cat $fake/err"
+check "registry_token: the token request gets REG_TOKEN_MAX_TIME, 90 s by default, as --max-time and --retry-max-time" \
+  "90 90" "$(cat "$fake/token-args")" "bash -c '. scripts/lib.sh; registry_token it/repo pull' with curl logging its arguments"
+
+# A token endpoint that stalls. status-collect asks once for every target, so
+# the whole call has to end within REG_TOKEN_MAX_TIME, retries included, and
+# timeout(1) ends it when curl does not.
+touch "$fake/token-stall"
+t_started=$SECONDS
+t_res="$(REG_TOKEN_MAX_TIME=2 token stalled)"
+t_took=$((SECONDS - t_started))
+rm -f "$fake/token-stall"
+check "registry_token: a token endpoint that stalls is given up within REG_TOKEN_MAX_TIME, and gives no token" \
+  "1 , within 15 s" "$t_res, $([ "$t_took" -lt 15 ] && echo 'within 15 s' || echo "after $t_took s")" \
+  "REG_TOKEN_MAX_TIME=2 bash -c '. scripts/lib.sh; registry_token it/repo pull' against a token endpoint that does not answer"
+rc=0
+REG_TOKEN_MAX_TIME=soon FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY=ghcr.io MIRROR_REGISTRY_AUTH=token \
+  MIRROR_REGISTRY_SCHEME=https REGISTRY_TOKEN='' in_lib registry_token it/repo pull > /dev/null 2>&1 || rc=$?
+check "registry_token: a REG_TOKEN_MAX_TIME that is not a number of seconds is refused" "refused" \
+  "$([ "$rc" -ne 0 ] && echo refused || echo "accepted (status $rc)")" "REG_TOKEN_MAX_TIME=soon bash -c '. scripts/lib.sh; registry_token it/repo pull'"
+
+# Blobs: the same on GHCR with no credential; with REGISTRY_TOKEN, the real
+# token at once; a blob whose bytes are not its digest is refused.
+check "registry blob, anonymous: the dummy token's 200 is the answer" "0 1 0" \
+  "$(REG_READ=blob REG_TOKEN='' reg blobqq 'Bearer QQ==\t200\tblob.bin\n')" "lib.sh registry_blob; cat $fake/calls.log"
+check "registry blob, anonymous: GHCR refuses QQ==, and the anonymous token reads the blob" "0 3 1" \
+  "$(REG_READ=blob REG_TOKEN='' reg blob401 'Bearer QQ==\t401\tdenied.json\nBearer anon\t200\tblob.bin\n')" \
+  "lib.sh registry_blob; cat $fake/calls.log $fake/err"
+if grep -q 'GHCR refused Bearer QQ== for it/repo (HTTP 401); the anonymous token flow was used' "$fake/err"; then
+  ok "registry blob, anonymous: the refusal of QQ== is named in a warning"
+else
+  fail "registry blob, anonymous: the refusal of QQ== is named in a warning" "stderr: $(cat "$fake/err")" "lib.sh registry_blob"
+fi
+echo tok1 > "$fake/next-token"
+check "registry blob, with a token: the real token at once" "0 2 1" \
+  "$(REG_READ=blob reg blobauth 'Bearer tok1\t200\tblob.bin\n')" "lib.sh registry_blob; cat $fake/calls.log"
+check "registry blob: bytes that are not the digest are refused, and not left behind" "1 absent" \
+  "$(REG_READ=blob REG_TOKEN='' reg blobbad 'Bearer QQ==\t200\tother.bin\n' | cut -d ' ' -f 1) $([ -e "$fake/out.json" ] && echo present || echo absent)" \
+  "lib.sh registry_blob; cat $fake/err"
+check "registry blob: a 404 is refused" "1" \
+  "$(REG_READ=blob REG_TOKEN='' reg blob404 'Bearer QQ==\t404\tunknown.json\n' | cut -d ' ' -f 1)" "lib.sh registry_blob; cat $fake/err"
+
+#---------------------------------------------------------------------------#
+# A 429, in the registry's words and in oras's own
+#---------------------------------------------------------------------------#
+limited() {
+  local rc=0
+  printf '%s\n' "$2" > "$work/push.log"
+  in_lib rate_limited "$work/push.log" || rc=$?
+  check "rate limit: $1" "$3" "$rc" "bash -c '. scripts/lib.sh; rate_limited LOG' with LOG: $2"
+}
+limited "oras's words for a 429 with no body" \
+  'Error: failed to push: PUT "https://ghcr.io/v2/x/manifests/t": response status code 429: Too Many Requests' 0
+limited "the registry's error code" \
+  'Error: failed to push: toomanyrequests: retry-after: 680.79µs, allowed: 2000/minute' 0
+limited "an error that is not a 429" \
+  'Error: failed to push: PUT "https://ghcr.io/v2/x/manifests/t": response status code 500: Internal Server Error' 1
 
 #---------------------------------------------------------------------------#
 # Servers that failed: asked last, the rest in their own order
@@ -535,6 +677,54 @@ check "re-run: collect takes the promotion of the staged digest" "0 promoted" \
   "$rc $(cut -f 2 "$rr/out2/x86_64-core/state.tsv")" "scripts/report collect x86_64-core STAGE VERIFY PROMOTED OUT; cat $rr/collect.err"
 
 #---------------------------------------------------------------------------#
+# fetch_upstream names an answer that says nothing about the file: its HTTP
+# code, and Cloudflare's cf-mitigated header when there is one. A 404 or a
+# 410 is quiet: mirror-file asks for many .sig files that are not there.
+#---------------------------------------------------------------------------#
+upf="$work/upstream-fake"
+mkdir -p "$upf/bin"
+cat > "$upf/bin/curl" << 'EOF'
+#!/usr/bin/env bash
+# Answers HTTP $UP_CODE with the header cf-mitigated: $UP_CF when it is not
+# empty, and a body; prints --write-out with %{http_code},
+# %header{cf-mitigated} and \t replaced.
+out="" wo=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    --write-out) wo="$2"; shift 2 ;;
+    --proto | --proto-redir | --max-redirs | --connect-timeout | --speed-limit | --speed-time | --max-time | \
+      --retry-max-time | --retry | --retry-delay | --user-agent) shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf 'a body\n' > "$out"
+wo="${wo//%\{http_code\}/$UP_CODE}"
+wo="${wo//%header\{cf-mitigated\}/$UP_CF}"
+printf '%s' "${wo//\\t/$'\t'}"
+EOF
+chmod +x "$upf/bin/curl"
+# upstream CODE CF -> "STATUS LINES", LINES the lines fetch_upstream wrote to
+# stderr, which are in $upf/err
+upstream() {
+  local rc=0
+  UP_CODE="$1" UP_CF="$2" PATH="$upf/bin:$PATH" in_lib fetch_upstream https://db.example/extra/os/loong64/extra.db "$upf/out" 30 \
+    > /dev/null 2> "$upf/err" || rc=$?
+  printf '%s %s\n' "$rc" "$(awk 'END { print NR + 0 }' "$upf/err")"
+}
+UPR="bash -c '. scripts/lib.sh; fetch_upstream URL OUT 30' against a curl that answers"
+check "fetch_upstream: a 403 with a Cloudflare challenge is status 1, with one line" "1 1" "$(upstream 403 challenge)" "$UPR 403"
+check "fetch_upstream: the line names the URL, HTTP 403 and the challenge" \
+  "fetch_upstream: https://db.example/extra/os/loong64/extra.db answered HTTP 403 (cf-mitigated: challenge)" \
+  "$(sed -n 1p "$upf/err" | sed 's/^[^:]*: /fetch_upstream: /')" "$UPR 403; cat $upf/err"
+check "fetch_upstream: a 503 with no cf-mitigated header is named with its code alone" "1 answered HTTP 503" \
+  "$(upstream 503 '' | cut -d ' ' -f 1) $(sed -n 's/^.* \(answered HTTP [0-9]*\)$/\1/p' "$upf/err")" "$UPR 503; cat $upf/err"
+check "fetch_upstream: a 404 is status 4, with no line" "4 0" "$(upstream 404 '')" "$UPR 404"
+check "fetch_upstream: a 410 is status 4, with no line" "4 0" "$(upstream 410 '')" "$UPR 410"
+check "fetch_upstream: a 200 is status 0, with no line, and the body is kept" "0 0 a body" \
+  "$(upstream 200 '') $(cat "$upf/out" 2> /dev/null)" "$UPR 200"
+
+#---------------------------------------------------------------------------#
 # fetch_upstream with MAX_SECONDS ends within it, its retries included: a
 # server that sends 16 KiB/s, above the 4096 B/s stall floor, is asked once.
 # curl gives each retry a new --max-time; without --retry-max-time the call
@@ -579,6 +769,18 @@ EOF
   rc=0
   UPSTREAM_PROTO='=http,https' in_lib fetch_upstream "http://127.0.0.1:$port/big.db" "$work/trickle.out" 3 > /dev/null 2>&1 || rc=$?
   took=$((SECONDS - started))
+  # A blob read from the registry ends within REG_BLOB_MAX_TIME the same way.
+  : > "$work/trickle.blob-hits"
+  cp "$work/trickle.hits" "$work/trickle.upstream-hits"
+  : > "$work/trickle.hits"
+  b_started=$SECONDS
+  b_rc=0
+  # shellcheck disable=SC2016 # the positional parameters of the inner script
+  MIRROR_REGISTRY="127.0.0.1:$port" MIRROR_REGISTRY_SCHEME=http MIRROR_REGISTRY_AUTH=none REG_BLOB_MAX_TIME=3 \
+    timeout 30 bash -c '. "$1"; registry_blob it/repo "$2" "$3" || exit $?' _ "$LIB" "$BLOB" "$work/trickle.blob" > /dev/null 2>&1 || b_rc=$?
+  b_took=$((SECONDS - b_started))
+  cp "$work/trickle.hits" "$work/trickle.blob-hits"
+  cp "$work/trickle.upstream-hits" "$work/trickle.hits"
   kill "$trickle_pid"
   trap 'rm -rf "$work"' EXIT
   # The server ends by the signal (status 143), as it should.
@@ -589,6 +791,10 @@ EOF
     "status 1, 1 request(s), within 8 s" \
     "status $rc, $(awk 'END { print NR + 0 }' "$work/trickle.hits") request(s), $([ "$took" -lt 8 ] && echo 'within 8 s' || echo "after $took s")" \
     "bash -c '. scripts/lib.sh; UPSTREAM_PROTO==http fetch_upstream http://127.0.0.1:$port/big.db /tmp/out 3' against $work/trickle.py ($(cat "$work/trickle.err"))"
+  check "registry_blob: a blob that trickles is given up within REG_BLOB_MAX_TIME, with one request" \
+    "status 1, 1 request(s), within 10 s" \
+    "status $b_rc, $(awk 'END { print NR + 0 }' "$work/trickle.blob-hits") request(s), $([ "$b_took" -lt 10 ] && echo 'within 10 s' || echo "after $b_took s")" \
+    "bash -c '. scripts/lib.sh; registry_blob it/repo $BLOB /tmp/out' with MIRROR_REGISTRY=127.0.0.1:$port MIRROR_REGISTRY_SCHEME=http MIRROR_REGISTRY_AUTH=none REG_BLOB_MAX_TIME=3"
 fi
 
 summary

@@ -1,6 +1,7 @@
 # ghcr-mirror-archlinux-pkgforge: the HTTPS front for the GHCR mirror.
 #
-# Deploy: .github/workflows/worker.yml does it on main. By hand:
+# Deploy by hand (docs/worker.md): .github/workflows/worker.yml only runs the
+# tests, and CI holds no Cloudflare credential.
 #   cd worker && npx wrangler@4.150.0 deploy
 # Check the configuration with no deploy:
 #   cd worker && npx wrangler@4.150.0 deploy --dry-run --outdir "$(mktemp -d)"
@@ -20,7 +21,9 @@ routes = [
 
 # Each answer is at most three cache lookups, two GHCR subrequests and one
 # SHA-256 of a manifest of at most 64 KiB. A package request also fills its
-# .sig entry: at most two more lookups and one more subrequest.
+# .sig entry: at most two more lookups and one more subrequest. When GHCR
+# refuses Bearer QQ==, a subrequest can take a token lookup, a token request
+# and a second try, and one more request when a 403 has no challenge.
 [limits]
 cpu_ms = 50
 

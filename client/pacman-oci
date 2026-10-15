@@ -66,8 +66,8 @@
 #   PACMAN_OCI_SIG=registry  a prefetch reads each package signature from the
 #                            registry's layer, never from %PGPSIG% (default auto)
 #   PACMAN_OCI_NO_DUMMY=1    skip the dummy token GHCR accepts for public
-#                            packages and use the registry's token flow, with no
-#                            prefetch; it exists so that flow runs on schedule
+#                            packages and use the registry's token flow; it
+#                            exists so that flow runs on schedule
 #   PACMAN_OCI_EMPTY_SIG=0   no empty answer for an absent database signature
 #                            under the sandbox of pacman 7.0 and 7.1
 #   PACMAN_OCI_TEST_PROC=DIR for the test suite only: read the parent process
@@ -115,6 +115,8 @@ debug() {
 #   ,down.HOST     HOST failed once its retries were spent
 #   ,absent.FILE   the database manifest of this run has no layer FILE
 #   ,index         FILE<TAB>SHA256<TAB>SIZE of each package the prefetch planned
+#   ,token.HOST.HEX  the anonymous pull token of the repository whose name
+#                  has sha256 HEX, once HOST refused the dummy token (mode 0600)
 #   ,pacver        the version of the parent pacman, asked once per run
 #   ,reaper        the background remover's output
 #   tmp.*          files being written
@@ -902,16 +904,161 @@ find_exe() {
 }
 
 #---------------------------------------------------------------------------#
+# Tokens
+#
+# A public GHCR repository accepts the dummy token Bearer QQ==, which saves a
+# token request on every file. When the registry refuses it (401 or 403), the
+# Bearer challenge names a realm, and the realm gives an anonymous pull token
+# for one repository. That token is kept in the run store as
+# ,token.HOST.SHA256-OF-REPOSITORY, mode 0600, and goes with the store. Every
+# later request of the run for that repository sends it first: the prefetch,
+# and each call of the serial path.
+#---------------------------------------------------------------------------#
+AUTH='Bearer QQ=='
+if [ "${PACMAN_OCI_NO_DUMMY:-0}" = 1 ]; then
+  AUTH=''
+fi
+
+# token_name HOST REPO: the name of the store entry for the token of REPO on
+# HOST, into $_tn
+token_name() {
+  _tn=$(printf '%s' "$2" | sha256sum) || return 1
+  _tn=,token.$1.${_tn%% *}
+}
+
+# token_read HOST REPO: the run's token for REPO on HOST into $_tok; 1 when
+# the run has none
+token_read() {
+  _tok=''
+  [ -n "$key" ] || return 1
+  token_name "$1" "$2" || return 1
+  entry_ok "$_tn" || return 1
+  IFS= read -r _tok < "$store$_tn" || _tok=''
+  [ -n "$_tok" ]
+}
+
+# token_keep HOST REPO TOKEN: keep TOKEN in the run store. mktemp makes the
+# file with mode 0600.
+token_keep() {
+  _af_base=''
+  [ -n "$key" ] || return 0
+  token_name "$1" "$2" || return 0
+  if store_open && _tt=$(mktemp "${store}tmp.XXXXXX") && printf '%s\n' "$3" > "$_tt" && put "$_tn" "$_tt"; then
+    debug "the anonymous token of $1/$2 is kept for this run"
+  else
+    debug "could not keep the anonymous token of $1/$2"
+  fi
+}
+
+# say_refused HOST: one line on stderr, once per call, when the registry
+# refuses the dummy token. With PACMAN_OCI_NO_DUMMY=1 no dummy is sent.
+say_refused() {
+  [ "$AUTH" = 'Bearer QQ==' ] || return 0
+  [ -z "${said_refused:-}" ] || return 0
+  said_refused=1
+  printf 'pacman-oci: %s refused the dummy token Bearer QQ==; the anonymous token flow is used\n' "$1" >&2
+}
+
+# token_from HDR REPO PROTO SCHEME: the anonymous pull token of REPO into
+# $_token, from the Bearer challenge in the headers file HDR. The scope is
+# always REPO's pull scope. An http realm is accepted only for an http
+# registry. The token must be a plain token: it goes into a curl config.
+token_from() {
+  _token=''
+  _www=$(tr -d '\r' < "$1" | sed -n 's/^[Ww][Ww][Ww]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]: *[Bb]earer //p' | sed -n '$p')
+  [ -n "$_www" ] || return 1
+  _realm=$(printf '%s\n' "$_www" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
+  _service=$(printf '%s\n' "$_www" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
+  case $_realm in
+    https://*) ;;
+    http://*) [ "$4" = http ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  need_work
+  _trc=0
+  # shellcheck disable=SC2086 # RETRY is several words on purpose
+  curl -q --silent --show-error --fail --proto "$3" --max-filesize 65536 \
+    --connect-timeout 10 --max-time 15 $RETRY \
+    --user-agent "pacman-oci/$PACMAN_OCI_VERSION" \
+    --get --data-urlencode "service=$_service" --data-urlencode "scope=repository:$2:pull" \
+    --output "$work/token.json" --url "$_realm" || _trc=$?
+  debug "token: GET $_realm service=$_service scope=repository:$2:pull (curl $_trc)"
+  [ "$_trc" -eq 0 ] || return 1
+  json_flat "$work/token.json" > "$work/token.flat" || return 1
+  _token=$(flat_get "$work/token.flat" /token)
+  [ -n "$_token" ] || _token=$(flat_get "$work/token.flat" /access_token)
+  case $_token in
+    '' | *[!A-Za-z0-9._~+/=-]*)
+      _token=''
+      return 1
+      ;;
+  esac
+}
+
+# auth_for BASE: the Authorization value for a request to BASE
+# (scheme://host/v2/repo) into $_auth: the run's token for that repository,
+# else $AUTH. The last answer is kept, since blobs come mostly in runs of one
+# repository; token_keep forgets it.
+auth_for() {
+  if [ -n "${_af_base:-}" ] && [ "$1" = "$_af_base" ]; then
+    _auth=$_af_auth
+    return 0
+  fi
+  _af_host=${1#*://}
+  _af_repo=${_af_host#*/v2/}
+  _af_host=${_af_host%%/*}
+  _auth=$AUTH
+  if token_read "$_af_host" "$_af_repo"; then
+    _auth="Bearer $_tok"
+  fi
+  _af_base=$1
+  _af_auth=$_auth
+}
+
+# anon_token BASE URL HDR CODE: make sure the run keeps a token for BASE's
+# repository, after URL was refused with CODE. HDR holds the headers of that
+# answer, or is empty. With no challenge there, one request with no
+# authorization to URL reads it. Each repository is tried once per call.
+anon_token() {
+  case " ${_anon_ok:-} " in
+    *" $1 "*) return 0 ;;
+  esac
+  case " ${_anon_tried:-} " in
+    *" $1 "*) return 1 ;;
+  esac
+  _anon_tried="${_anon_tried:-} $1"
+  _at_host=${1#*://}
+  _at_repo=${_at_host#*/v2/}
+  _at_host=${_at_host%%/*}
+  if ! token_read "$_at_host" "$_at_repo"; then
+    say_refused "$_at_host"
+  fi
+  proto_for "$1"
+  _at_hdr=$3
+  if [ -z "$_at_hdr" ] || ! grep -qi '^www-authenticate: *bearer ' "$_at_hdr"; then
+    need_work
+    _at_hdr=$work/anon.hdr
+    _arc=0
+    curl -q --silent --show-error --proto "$_p" --max-filesize 65536 \
+      --connect-timeout 10 --max-time 15 --user-agent "pacman-oci/$PACMAN_OCI_VERSION" \
+      --dump-header "$_at_hdr" --output "$work/anon.body" --url "$2" || _arc=$?
+    debug "token: GET $2 with no authorization, for the challenge (curl $_arc, after HTTP $4)"
+  fi
+  if ! token_from "$_at_hdr" "$_at_repo" "$_p" "${1%%://*}"; then
+    debug "no anonymous token for $_at_host/$_at_repo"
+    return 1
+  fi
+  token_keep "$_at_host" "$_at_repo" "$_token"
+  _anon_ok="${_anon_ok:-} $1"
+}
+
+#---------------------------------------------------------------------------#
 # Parallel transfers
 #
 # One curl process runs a whole list with --parallel, from a generated config
 # with one block per transfer. Each block carries its own deadlines and limits,
 # and writes one line when it ends: EXIT<TAB>HTTP<TAB>BYTES<TAB>OUTPUT.
 #---------------------------------------------------------------------------#
-AUTH='Bearer QQ=='
-if [ "${PACMAN_OCI_NO_DUMMY:-0}" = 1 ]; then
-  AUTH=''
-fi
 WRITE_OUT='%{exitcode}\t%{http_code}\t%{size_download}\t%{filename_effective}\n'
 
 # 32 transfers at a time: curl multiplexes them over one HTTP/2 connection per
@@ -933,7 +1080,6 @@ prefetch_allowed() {
   [ -n "$key" ] || return 1
   [ "${PACMAN_OCI_PREFETCH:-1}" != 0 ] || return 1
   [ "$jobs" -gt 1 ] || return 1
-  [ "${PACMAN_OCI_NO_DUMMY:-0}" != 1 ] || return 1
   # The directory goes into curl's config as it is, so it may hold nothing
   # that needs quoting there.
   case $out_dir in
@@ -987,10 +1133,14 @@ block() {
   if [ "$_max" -eq 0 ]; then
     _max=1
   fi
+  _auth=''
+  if [ "$4" = 1 ]; then
+    auth_for "${1%/blobs/*}"
+  fi
   {
     printf 'url = "%s"\noutput = "%s"\n' "$1" "$2"
-    if [ "$4" = 1 ] && [ -n "$AUTH" ]; then
-      printf 'header = "Authorization: %s"\n' "$AUTH"
+    if [ -n "$_auth" ]; then
+      printf 'header = "Authorization: %s"\n' "$_auth"
     fi
     if [ "$5" = 1 ]; then
       printf 'continue-at = "-"\n'
@@ -1053,12 +1203,23 @@ ended() {
   _u=''
   eval "_u=\$u_$3"
   debug "prefetch GET $_u -> $2 (curl $1)"
-  # A time limit goes on in the next pass. No answer at all, a refusal, or a
-  # file over its size: no other pass does better, and the call for that file
-  # decides alone.
+  # A time limit goes on in the next pass. A 401 or 403 goes on once, with
+  # the anonymous token of its repository. No answer at all, another refusal,
+  # or a file over its size: no other pass does better, and the call for that
+  # file decides alone.
   case $1:$2 in
     28:*) ;;
     *:408 | *:429 | *:5??) ;;
+    *:401 | *:403)
+      rm -f -- "$_o"
+      _y=''
+      eval "_y=\${y_$3:-}"
+      if [ -z "$_y" ] && anon_token "${_u%/blobs/*}" "$_u" '' "$2"; then
+        eval "y_$3=1"
+        again "$3" 0
+      fi
+      return 0
+      ;;
     *:000 | 63:* | *:4??)
       rm -f -- "$_o"
       return 0
@@ -1189,21 +1350,23 @@ fetch_blobs() {
   rm -f -- "$tmpbase" "$tmpbase".*
 }
 
-# fetch_manifests LIST: LIST lines are ID<TAB>URL. Each body goes to $work/m.ID,
-# and $work/m.res gets ID<TAB>EXIT<TAB>HTTP lines.
-fetch_manifests() {
+# manifest_pass LIST RES: one parallel run of the manifests of LIST (ID<TAB>URL
+# lines), each with the token of its repository or $AUTH. Each body goes to
+# $work/m.ID and its headers to $work/m.ID.hdr; RES gets ID<TAB>EXIT<TAB>HTTP
+# lines.
+manifest_pass() {
   cfg=$work/m.cfg
   : > "$cfg"
-  : > "$work/m.res"
   while IFS="$TAB" read -r _id _u; do
     if [ -s "$cfg" ]; then
       printf 'next\n' >> "$cfg"
     fi
     proto_for "$_u"
+    auth_for "${_u%/manifests/*}"
     {
-      printf 'url = "%s"\noutput = "%s/m.%s"\n' "$_u" "$work" "$_id"
-      if [ -n "$AUTH" ]; then
-        printf 'header = "Authorization: %s"\n' "$AUTH"
+      printf 'url = "%s"\noutput = "%s/m.%s"\ndump-header = "%s/m.%s.hdr"\n' "$_u" "$work" "$_id" "$work" "$_id"
+      if [ -n "$_auth" ]; then
+        printf 'header = "Authorization: %s"\n' "$_auth"
       fi
       printf 'header = "Accept: application/vnd.oci.image.manifest.v1+json"\n'
       printf 'max-filesize = 65536\nconnect-timeout = 10\nmax-time = 15\nproto = "%s"\n' "$_p"
@@ -1221,9 +1384,39 @@ fetch_manifests() {
       '' | *[!0-9]*) continue ;;
     esac
     debug "prefetch GET manifest $_id -> $_code (curl $_x)"
-    printf '%s\t%s\t%s\n' "$_id" "$_x" "$_code" >> "$work/m.res"
+    printf '%s\t%s\t%s\n' "$_id" "$_x" "$_code" >> "$2"
   done < "$work/m.out"
   debug "prefetch: manifests done, curl ended $rc"
+}
+
+# fetch_manifests LIST: the manifests of LIST, ID<TAB>URL lines; $work/m.res
+# gets ID<TAB>EXIT<TAB>HTTP lines. A manifest the registry refuses (401 or
+# 403) is asked again once, with the anonymous token of its repository.
+fetch_manifests() {
+  : > "$work/m.first"
+  : > "$work/m.again"
+  : > "$work/m.res"
+  manifest_pass "$1" "$work/m.first"
+  while IFS="$TAB" read -r _id _x _code; do
+    case $_code in
+      401 | 403)
+        _u=''
+        while IFS="$TAB" read -r _mi _mu; do
+          if [ "$_mi" = "$_id" ]; then
+            _u=$_mu
+          fi
+        done < "$1"
+        if [ -n "$_u" ] && anon_token "${_u%/manifests/*}" "$_u" "$work/m.$_id.hdr" "$_code"; then
+          printf '%s\t%s\n' "$_id" "$_u" >> "$work/m.again"
+          continue
+        fi
+        ;;
+    esac
+    printf '%s\t%s\t%s\n' "$_id" "$_x" "$_code" >> "$work/m.res"
+  done < "$work/m.first"
+  if [ -s "$work/m.again" ]; then
+    manifest_pass "$work/m.again" "$work/m.res"
+  fi
 }
 
 # say_summary START FILES BYTES: one line, on a terminal
@@ -1840,6 +2033,13 @@ work_hdr="$work/headers"
 work_json="$work/body.json"
 work_flat="$work/body.flat"
 
+# A token that an earlier call of this run got for this repository is sent
+# first: the dummy token would be refused again.
+if token_read "$host" "$repo"; then
+  AUTH="Bearer $_tok"
+  debug "the run's anonymous token for $host/$repo"
+fi
+
 #---------------------------------------------------------------------------#
 # Requests
 #
@@ -1880,32 +2080,12 @@ get() {
   debug "GET $1 -> $code (curl $get_rc)"
 }
 
-# The anonymous pull token named by the Bearer challenge in $work_hdr. The
-# scope asked for is always this repository's pull scope.
+# The anonymous pull token named by the Bearer challenge in $work_hdr, for
+# this repository's pull scope. It is kept for the rest of the run.
 challenge() {
-  _www=$(tr -d '\r' < "$work_hdr" | sed -n 's/^[Ww][Ww][Ww]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]: *[Bb]earer //p' | sed -n '$p')
-  [ -n "$_www" ] || return 1
-  _realm=$(printf '%s\n' "$_www" | sed -n 's/.*realm="\([^"]*\)".*/\1/p')
-  _service=$(printf '%s\n' "$_www" | sed -n 's/.*service="\([^"]*\)".*/\1/p')
-  case $_realm in
-    https://*) ;;
-    http://*) [ "$scheme" = http ] || return 1 ;;
-    *) return 1 ;;
-  esac
-  _trc=0
-  # shellcheck disable=SC2086 # RETRY is several words on purpose
-  curl -q --silent --show-error --fail --proto "$PROTO" --max-filesize 65536 \
-    --connect-timeout 10 --max-time 15 $RETRY \
-    --user-agent "pacman-oci/$PACMAN_OCI_VERSION" \
-    --get --data-urlencode "service=$_service" --data-urlencode "scope=repository:$repo:pull" \
-    --output "$work_json" --url "$_realm" || _trc=$?
-  debug "GET $_realm service=$_service scope=repository:$repo:pull -> token (curl $_trc)"
-  [ "$_trc" -eq 0 ] || return 1
-  json_flat "$work_json" > "$work_flat" || return 1
-  _token=$(flat_get "$work_flat" /token)
-  [ -n "$_token" ] || _token=$(flat_get "$work_flat" /access_token)
-  [ -n "$_token" ] || return 1
+  token_from "$work_hdr" "$repo" "$PROTO" "$scheme" || return 1
   AUTH="Bearer $_token"
+  token_keep "$host" "$repo" "$_token"
   return 0
 }
 
@@ -1918,6 +2098,7 @@ fetch_manifest() {
     401 | 403)
       if [ "${tried_challenge:-0}" = 0 ]; then
         tried_challenge=1
+        say_refused "$host"
         if [ "$code" = 403 ]; then
           AUTH=''
           get "$base/manifests/$1" "$work_json"

@@ -35,9 +35,11 @@
 # of the server that served the package and of no other. Without %PGPSIG% the
 # detached .sig is downloaded from the target's servers in their own order,
 # the db_servers first, as scripts/verify-batch reads it: the layer is the
-# signature verify compares it with. It is absent only when every server
-# answers 404 for it, and then the file is mirrored unsigned, as upstream
-# ships it.
+# signature verify compares it with. It is absent only when no server answers
+# with a signature, every db_server answers 404 for it, and every other
+# server answers 404 or gives no answer that decides. Then the file is
+# mirrored unsigned, as upstream ships it, and the result names each server
+# that gave no answer that decides.
 #
 # The package file comes from the servers in an order rotated by shard, so
 # shards spread across mirrors. A server that fails (lib.sh down_mark) is
@@ -53,7 +55,8 @@
 # (bytes per second a push may not fall below; default 2097152). A push
 # attempt gets 300 s plus the time at that rate, and never more than 600 s,
 # GHCR's limit for one upload. MIRROR_RATE_WAIT (seconds; default 1800) bounds
-# the pauses one file takes after a 429 from the registry (below).
+# the pauses one file takes after a 429 from the registry (below), each of
+# RATE_PAUSE_MIN to RATE_PAUSE_MAX seconds (20 to 60; lib.sh throttle_pause).
 #
 # Exit status: 0 pushed or present, 1 anything else.
 set -euo pipefail
@@ -131,11 +134,17 @@ failed() {
 }
 
 # fetch_sig: the detached signature, from every server in the target's order.
-# Sets sig_sha, or unsigned=1 when every one answers 404; returns 1 when a
-# server failed some other way, because an error is not an absence.
+# Sets sig_sha. With no signature anywhere, sets unsigned=1 when every
+# db_server answers 404 and the servers that gave no answer that decides are
+# plain servers only; sig_note then names them. Returns 1 when a db_server
+# gave no answer that decides, because an error is not an absence. A plain
+# server that is down does not hold the file: plan asks for the .sig of a file
+# mirrored unsigned again on each run.
 unsigned=0
+sig_note=""
+mapfile -t db_servers < <(target_all "$conf" db_server)
 fetch_sig() {
-  local server size rc missing=0 errors=0 sig_order=()
+  local server size rc missing=0 why db_failed="" plain_failed="" sig_order=()
   mapfile -t sig_order < <(down_last "$down_dir" "${servers[@]}")
   for server in "${sig_order[@]}"; do
     rc=0
@@ -149,18 +158,31 @@ fetch_sig() {
         size="$(wc -c < "$dir/$file.sig" | tr -d ' ')"
         warn "$file.sig from $server is not an OpenPGP signature packet ($size bytes)"
         rm -f -- "$dir/$file.sig"
-        errors=$((errors + 1))
+        why="$(url_host "$server") answered with $size bytes that are not a signature"
         ;;
-      4) missing=$((missing + 1)) ;;
+      4)
+        missing=$((missing + 1))
+        continue
+        ;;
       *)
         failed "$server" "$rc"
-        errors=$((errors + 1))
+        why="no answer from $(url_host "$server") (status $rc)"
         ;;
     esac
+    if in_list "$server" "${db_servers[@]}"; then
+      db_failed="$db_failed; $why"
+    else
+      plain_failed="$plain_failed; $why"
+    fi
   done
-  if [ "$errors" -gt 0 ]; then
-    sig_error="$errors server(s) failed, $missing answered 404"
+  if [ -n "$db_failed" ]; then
+    sig_error="a db_server gave no answer that decides: ${db_failed#; }${plain_failed}; $missing answered 404"
     return 1
+  fi
+  if [ -n "$plain_failed" ]; then
+    sig_note="; ${plain_failed#; }"
+    warn "$file.sig: every db_server answers 404, and plain servers gave no answer that decides; the file is mirrored unsigned" \
+      "${plain_failed#; }"
   fi
   unsigned=1
   return 0
@@ -216,7 +238,7 @@ case "$decision" in
     ;;
   needsig)
     # Only reached with no signature known: upstream publishes none for it.
-    result present "unsigned: $ref holds it with no signature, and upstream publishes none for it"
+    result present "unsigned: $ref holds it with no signature, and upstream publishes none for it$sig_note"
     exit 0
     ;;
 esac
@@ -254,7 +276,7 @@ if [ -z "$got_from" ]; then
 fi
 
 if [ "$unsigned" -eq 1 ]; then
-  warn "$file has no %PGPSIG% and every server answers 404 for $file.sig; it is mirrored unsigned, as upstream ships it"
+  warn "$file has no %PGPSIG% and every db_server answers 404 for $file.sig; it is mirrored unsigned, as upstream ships it$sig_note"
 fi
 
 #---------------------------------------------------------------------------#
@@ -287,47 +309,22 @@ fi
 
 pushed=0
 push_started="$(date -u +%s)"
-# GHCR limits the requests of one token (measured: "toomanyrequests ...
-# allowed: 2000/minute", run 38570044665), and every push of every job shares
-# the workflow's token. A 429 costs no attempt. The first push of the shard
-# that meets one writes $WORK/throttle, the time its pause ends, and every
-# push of the shard waits for that time first. The pauses of one file may
-# add up to MIRROR_RATE_WAIT seconds (default 1800).
+# A 429 costs no attempt (lib.sh rate_limited, throttle_pause). The first push
+# of the shard that meets one writes $WORK/throttle, the time its pause ends,
+# and every push of the shard waits for that time first. The pauses of one
+# file may add up to MIRROR_RATE_WAIT seconds (default 1800).
 RATE_WAIT="${MIRROR_RATE_WAIT:-1800}"
-throttle_wait() {
-  local until now
-  [ -f "$WORK/throttle" ] || return 0
-  until="$(cat "$WORK/throttle")"
-  now="$(date -u +%s)"
-  case "$until" in
-    '' | *[!0-9]*) return 0 ;;
-  esac
-  if [ "$until" -gt "$now" ]; then
-    sleep "$((until - now))"
-  fi
-}
 attempt=0
-waited=0
 while :; do
-  throttle_wait
+  throttle_wait "$WORK"
   rc=0
-  (cd -- "$dir" && timeout --kill-after=30 "$deadline" "$ORAS" "${push_args[@]}" > "$dir/push.log" 2>&1) || rc=$?
+  (cd -- "$dir" && timeout -k 30 "$deadline" "$ORAS" "${push_args[@]}" > "$dir/push.log" 2>&1) || rc=$?
   if [ "$rc" -eq 0 ]; then
     pushed=1
     break
   fi
-  if grep -qiE 'toomanyrequests|429 Too Many' "$dir/push.log"; then
-    pause=$((20 + RANDOM % 41))
-    waited=$((waited + pause))
-    if [ "$waited" -gt "$RATE_WAIT" ]; then
-      warn "$file: the registry still limits pushes after ${waited}s of pauses"
-      break
-    fi
-    tmp="$(mktemp "$WORK/.throttle.XXXXXX")"
-    printf '%s\n' "$(($(date -u +%s) + pause))" > "$tmp"
-    mv -f -- "$tmp" "$WORK/throttle"
-    log "$file: the registry limits pushes (429); every push of the shard waits ${pause}s"
-    sleep "$pause"
+  if rate_limited "$dir/push.log"; then
+    throttle_pause "$WORK" "$RATE_WAIT" "$file: push; every push of the shard waits" || break
     continue
   fi
   attempt=$((attempt + 1))
@@ -336,7 +333,7 @@ while :; do
   sleep $((attempt * attempt * 5))
 done
 if [ "$pushed" -ne 1 ]; then
-  result failed "oras push failed ($attempt attempt(s), ${waited}s of 429 pauses), last: $(tail -n 1 "$dir/push.log")"
+  result failed "oras push failed ($attempt attempt(s), ${THROTTLE_WAITED}s of 429 pauses), last: $(tail -n 1 "$dir/push.log")"
   exit 1
 fi
 push_seconds=$(($(date -u +%s) - push_started))
@@ -360,7 +357,7 @@ for attempt in 1 2 3 4 5; do
   # Pushed unsigned on purpose, the tag reads back as "needs a signature",
   # which for a file upstream signs nowhere is what present means.
   if [ "$unsigned" -eq 1 ] && [ "$got_decision" = needsig ]; then
-    result pushed "unsigned: from $got_from, pushed in ${push_seconds}s ($((rate / 1024)) KiB/s) with no signature, read back on try $attempt"
+    result pushed "unsigned: from $got_from, pushed in ${push_seconds}s ($((rate / 1024)) KiB/s) with no signature, read back on try $attempt$sig_note"
     exit 0
   fi
   sleep $((attempt + 1))

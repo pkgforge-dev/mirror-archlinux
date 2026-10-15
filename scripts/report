@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Say what one sync run did, per target, and keep the two issues that do not
-# heal by themselves in step with it.
+# Say what one sync run did, per target, and keep the issues that need a
+# person in step with it.
 #
 #   scripts/report collect TARGET STAGE VERIFY PROMOTED OUT
 #   scripts/report PLAN SUMMARIES
@@ -40,6 +40,14 @@
 #                        token; cleared once a run reads it anonymously
 #   replaced-<target>    raised when a file's tag holds other bytes; cleared once
 #                        the target stages or is current again
+#   refused-<target>     raised when the chain collected more upstream-refused
+#                        files than REFUSED_ISSUE_MIN (default 16). Cleared
+#                        when the target stages, is promoted or is current
+#                        with that many or fewer. The mirror serves upstream's
+#                        bytes and promotes them, which is right. But one key
+#                        signs every package of a port. A key that upstream
+#                        revoked or rotated refuses most new files for every
+#                        consumer, and a person must be told.
 # A target that is held, behind or in error raises nothing here: a run that
 # fails once is ordinary, and scripts/check-staleness (watchdog.yml) raises
 # stale-<target> when the mirror has really stopped following upstream.
@@ -148,6 +156,10 @@ fi
 plan="$1"
 summaries="$2"
 summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+REFUSED_ISSUE_MIN="${REFUSED_ISSUE_MIN:-16}"
+case "$REFUSED_ISSUE_MIN" in
+  '' | *[!0-9]*) die "REFUSED_ISSUE_MIN must be a whole number, not '$REFUSED_ISSUE_MIN'" ;;
+esac
 run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}/actions/runs/${GITHUB_RUN_ID:-0}"
 
 if [ ! -f "$plan/summary.tsv" ]; then
@@ -284,6 +296,30 @@ while IFS=$'\t' read -r target state why; do
       printf 'A person decides: wait for upstream to publish a new filename, or accept the new bytes under a new tag (docs/design.md, rules).\n\nRun: %s\n' "$run_url"
     } > "$work/body.md"
     track "replaced-$target" raise "$target: a package tag would have to change" "$work/body.md"
+  fi
+  refused_n=0
+  if [ -n "$d" ] && [ -f "$d/refused.tsv" ]; then
+    refused_n="$(awk 'END { print NR + 0 }' "$d/refused.tsv")"
+  fi
+  if [ "$refused_n" -gt "$REFUSED_ISSUE_MIN" ]; then
+    # shellcheck disable=SC2016 # Markdown backticks, not command substitution
+    {
+      printf 'pacman refused %s new file(s) of `%s` for a reason in their signature, more than %s.\n\n' \
+        "$refused_n" "$target" "$REFUSED_ISSUE_MIN"
+      printf 'Each one is upstream-refused: the registry holds upstream'"'"'s exact bytes and signature, and pacman refuses the file from upstream too. The target is not held for them (docs/design.md, Upstream-refused). But a consumer cannot install them either.\n\n'
+      printf 'One key made every signature of the 8 Arch Linux ARM targets, and one key every signature of riscv64 (docs/measurements.md). A person must check whether upstream revoked or rotated that key, and whether the keyring package or `keyring_image` of the target needs an update.\n\n'
+      printf 'The first 50, file and reason:\n\n```\n'
+      sed -n 1,50p "$d/refused.tsv"
+      printf '```\n\nState of the target: %s. Measured: %s\n\nRun: %s\n\n' "$state" "$why" "$run_url"
+      printf 'This issue closes itself when the target stages, is promoted or is current with %s or fewer upstream-refused files.\n' "$REFUSED_ISSUE_MIN"
+    } > "$work/body.md"
+    track "refused-$target" raise "$target: $refused_n new files are refused by pacman, from upstream too" "$work/body.md"
+  else
+    case "$state" in
+      staged | promoted | current)
+        track "refused-$target" clear "" "\`$target\` had $refused_n upstream-refused file(s) in $run_url, $REFUSED_ISSUE_MIN or fewer."
+        ;;
+    esac
   fi
 done < "$work/states.tsv"
 

@@ -17,8 +17,8 @@ This document tells what runs by itself, which issues the automation raises and 
 
 | job | does |
 | --- | --- |
-| `staleness` | `scripts/check-staleness`; raises or clears `stale-<target>` |
-| `schedules` | `scripts/keep-schedules-enabled`, `scripts/check-schedules-fired`, and on `main` `dispatch-overdue` for sync and status |
+| `staleness` | `scripts/check-staleness` within `STALENESS_BUDGET`, in a step of 15 minutes; then a step with `always()` raises or clears `stale-<target>` for each state the check wrote; then, also with `always()`, `scripts/check-status-site`: `status-down` and `pages-stale` |
+| `schedules` | `scripts/watch-schedules`: `keep-schedules-enabled`, `check-schedules-fired`, and the issue `schedules-stopped`; then on `main` `dispatch-overdue` for sync and status |
 
 ### The jobs of the status workflow
 
@@ -29,9 +29,13 @@ This document tells what runs by itself, which issues the automation raises and 
 | `bench` | `scripts/bench-consumer`, when `decide` says yes |
 | `build` | `scripts/status-collect`, then `scripts/status-render`; on `main` it pushes branch `status` and uploads the Pages artifact |
 | `deploy` | on `main`, when `build` passed and Pages takes a workflow build: `actions/deploy-pages` |
-| `worker` | on `main`, when `build` passed: reads `status.json` from branch `status`; raises or clears `worker-down` |
+| `worker` | on `main`, whatever `build` did: `scripts/check-status-record` reads `status.json` from branch `status`; raises or clears `status-down` and `worker-down` |
 
-`build` runs when `decide` passed, also when `bench` was skipped or failed. `deploy` and `worker` name the result of `build` in their `if`. An `if` with no status function gets an implicit `success()` over every job before it. `bench` is skipped in most runs, so that implicit check would skip `deploy` and `worker` too.
+`build` runs when `decide` passed, also when `bench` was skipped or failed. `deploy` names the result of `build` in its `if`. An `if` with no status function gets an implicit `success()` over every job before it. `bench` is skipped in most runs, so that implicit check would skip `deploy` too.
+
+⛔ `worker` runs whatever `build` did: its `if` is `!cancelled()` on `main`. A `build` that fails pushes no record. So `worker` raises `status-down` with the run and the result of `build`, and the status page that stops changing is an issue, not only a red run. `tests/static/55-issue-steps.sh` checks this `if`.
+
+⛔ `scripts/status-collect` ends its upstream reads within `STATUS_BUDGET` seconds (default 900). The `build` job has 30 minutes, so time is left for the render and the push. Each target gets what is left of the budget, divided by the targets not yet read. `scripts/upstream-db` reads the `db_server` hosts within that share, as for the staleness check (below). A host that fails is asked last by each later target. A target whose reads do not fit is still in `status.json`: its `upstream.error` names `STATUS_BUDGET`. The read of the mirror's database gets `REG_BLOB_MAX_TIME` (120 s), and its token request `REG_TOKEN_MAX_TIME` (30 s).
 
 The Pages artifact of `build` is named `github-pages-<run attempt>`. `deploy` reads that name from the outputs of `build`. A re-run that runs `build` again uploads a second artifact into the same run, and `deploy-pages` refuses a name that two artifacts share. Each `upload-artifact` step sets `overwrite: true` for the same reason. `tests/static/50-workflow-policy.sh` checks both.
 
@@ -75,11 +79,22 @@ The restart steps in `sync.yml` and `watchdog.yml` run with `always()`. So a sch
 
 `scripts/check-schedules-fired` checks each scheduled workflow against its own cron. It fails when a schedule has not fired within its tolerance. It runs in `sync.yml` and in `watchdog.yml`, so each one sees the other stop.
 
+⛔ A schedule that stops leaves no run behind to fail, and a red step reaches only the person who reads the run. So both jobs run `scripts/watch-schedules`. It runs `keep-schedules-enabled`, then `check-schedules-fired`, each to the end, and prints what each said. It raises `schedules-stopped` when a schedule has stopped, or when a person disabled a workflow. The body holds the line of each workflow and how to reproduce it. A schedule that stopped still makes the step red (exit 3). A workflow disabled by hand raises the issue and keeps the step green.
+
 ⚠ Neither check sees every schedule stop at once. Then no run is left to notice. Start `sync.yml` or `watchdog.yml` by hand to get the answer.
 
 ## Staleness
 
 `scripts/check-staleness` reads the database that `latest` serves, through the wrapper's token flow (`PACMAN_OCI_NO_DUMMY=1`). So that path runs against GHCR on schedule too. It also reads upstream's current database from the target's `db_server` hosts.
+
+⛔ Upstream is never only the first `db_server` that answers. `scripts/upstream-db` takes upstream the way `scripts/plan` does, for `check-staleness` and for `status-collect`:
+
+1. It reads every `db_server`.
+2. It refuses an answer that is not a whole, well-formed database (`lib.sh` `db_check`), for example an error page that answers 200.
+3. It drops a database that is behind another: some package in it was built before the same package in the other (`lib.sh` `behind`).
+4. It takes the first database left, in `db_server` order.
+
+So a first `db_server` that lags or is stuck cannot hide a mirror that stopped, and an error page cannot make a quiet repository stale. When every database is behind another, the target is `unknown`. The issue body and `upstream.tried` in `status.json` name each `db_server` and its result. A result is `ok`, `behind by N package(s)`, `refused` and why, an HTTP code, or a curl status.
 
 | verdict | when |
 | --- | --- |
@@ -87,7 +102,7 @@ The restart steps in `sync.yml` and `watchdog.yml` run with `always()`. So a sch
 | `fresh` | they differ, and the promoted snapshot was fetched within the tolerance |
 | `new` | there is no `latest`, and git added or enabled the target file within the tolerance |
 | `stale` | they differ for longer than the tolerance, or there is no `latest` for longer |
-| `unknown` | upstream could not be read |
+| `unknown` | upstream could not be read, or a read did not fit the share of `STALENESS_BUDGET` (below) |
 
 The tolerance comes from `scripts/cron-tolerance`: the largest gap in days of the cron, times 2, plus 1. The 3-hour cron of `sync.yml` gives a gap of 1 day and a tolerance of 3 days. ⚠ The tolerance is in days. A sub-daily cron gets the tolerance of a daily one, so a stop shows later than it could.
 
@@ -95,20 +110,46 @@ The date a target file was added is the date of the commit that brought it to th
 
 ⚠ When git cannot tell when a target file was added (no git, a shallow clone, an untracked file), the target is stale, never new. The `staleness` job checks out the whole history for this.
 
+### The budget of the staleness check
+
+⛔ `scripts/check-staleness` ends within `STALENESS_BUDGET` seconds (default 600). The job has 20 minutes, and the step that runs the check has 15.
+
+- Each target gets a share: what is left of the budget, divided by the targets not yet read.
+- `scripts/upstream-db` reads the `db_server` hosts within the share. Each read ends within 60 s, or sooner when the share is short. Then it gets 1/(n + 1) of what is left of the share, with n the hosts not yet asked.
+- The two registry reads of the target run under `timeout` with what is left of the share: the `latest` manifest gets half, the wrapper the rest.
+- A host that fails is asked last by each later target of the run, and only when no other `db_server` answers. So a host that stalls costs one deadline per run, not one per target.
+- A target whose reads do not fit its share is `unknown`. Its issue body names `STALENESS_BUDGET` and the read that was cut short.
+
+The check writes the state of each target as soon as it is decided. The step that raises and clears `stale-<target>` runs with `always()`. So a check that fails or is stopped still raises or clears the issue of each target it decided.
+
 ## Issues the automation raises and clears
 
 `scripts/track-issue` keeps one issue per problem. `raise` opens the issue the first time and only rewrites its body after that. `clear` comments, closes, and does nothing when no issue is open. The key is in the body as an HTML comment. The script finds an issue by listing the open issues, never by search.
 
 | issue | raised when | cleared when | by |
 | --- | --- | --- | --- |
-| `visibility-<target>` | the package reads with the workflow's token and not without one | a run reads the target anonymously | `scripts/report`, on `main` |
+| `visibility-<target>` | the package reads with the workflow's token, and the registry refuses the read without one (401, 403 or 404) | a run reads the target anonymously | `scripts/report`, on `main` |
 | `replaced-<target>` | a package tag holds other bytes than the database names | the target stages or is current again | `scripts/report`, on `main` |
+| `refused-<target>` | the chain collected more upstream-refused files than `REFUSED_ISSUE_MIN` (16) | the target stages, is promoted or is current with 16 or fewer | `scripts/report`, on `main` |
 | `stale-<target>` | `check-staleness` says `stale` or `unknown` | it says anything else | `watchdog.yml` job `staleness` |
 | `worker-down` | the Worker failed its probe in 2 status runs in a row, over 50 minutes or more | a status run records a probe that passes | `status.yml` job `worker` |
+| `status-down` | `build` of `status.yml` did not succeed, or the record on branch `status` is more than 3 hours old (`status.yml` job `worker`); the record is more than 6 hours old, or there is none (`watchdog.yml` job `staleness`) | a `build` succeeds and its record is at most 3 hours old | `scripts/check-status-record`, `scripts/check-status-site` |
+| `pages-stale` | the copy of `status.json` on Pages does not answer with a record, or it trails the record on branch `status` by more than 3 hours | the copy answers and trails by 3 hours or less | `scripts/check-status-site`, in `watchdog.yml` job `staleness` |
+| `schedules-stopped` | `check-schedules-fired` says a schedule has stopped, or `keep-schedules-enabled` names a workflow that a person disabled | both checks ran, every schedule fires, and no workflow is disabled by hand | `scripts/watch-schedules`, in `watchdog.yml` job `schedules` and `sync.yml` job `keepalive` |
 
 A target that is held, behind or in error raises nothing in the report. A run that fails once is ordinary. `stale-<target>` opens when the mirror has stopped following upstream.
 
-The `worker` job of `status.yml` reads the record that `build` pushed to branch `status` in the same run. The job fails when that record is more than 3 hours old.
+stage reads each staged snapshot again with no credential. Only a 401, a 403 or a 404 to that read raises `visibility-<target>`. Another answer, such as a 5xx or no answer in 5 tries, puts the target in error for the run, and its row names the HTTP code.
+
+The `worker` job of `status.yml` reads the record that `build` pushed to branch `status` in the same run. When that record is more than 3 hours old, the job raises `status-down` and fails, and judges no Worker probe: an old record says nothing about now. A record of at most 3 hours still gives the `worker-down` decision, also after a `build` that failed.
+
+The watchdog sees `status.yml` from outside. When `status.yml` stops running at all, no `worker` job runs to say so. So the `staleness` job reads `status.json` from branch `status` (`git fetch origin status`), and raises `status-down` when it is more than 6 hours old. Only the `worker` job of `status.yml` clears `status-down`, when it sees a `build` that succeeded with a fresh record. The same step reads `https://<owner>.github.io/<name>/status.json` and raises `pages-stale` when the deploy no longer reaches Pages. The README badges come from Pages, so they then show an old state.
+
+A Worker probe fails in each of these cases. [worker.md](worker.md#monitoring) has each probe.
+
+- The Worker gives a wrong answer.
+- The signed URL of its 302 does not answer the status runner with 206 or 200 for one byte.
+- The smallest database, downloaded through the Worker once per run, is not the one `latest` names.
 
 Status runs are not an hour apart. The cron runs `status.yml` at minute 47 of each hour, and `sync.yml` starts it after each sync, so two runs can be minutes apart. So `scripts/status-collect` sets `worker.down` in `status.json` only when two conditions are true. The probes failed in 2 runs in a row. The first of these failures is 3000 s (50 minutes) or more before this run. The `worker` job raises `worker-down` on `worker.down`. A Worker or GHCR fault of a few minutes opens no issue.
 
@@ -116,6 +157,8 @@ Status runs are not an hour apart. The cron runs `status.yml` at minute 47 of ea
 
 - **A private package.** GitHub may create a package private, and has no API to change that. Open the settings link in `visibility-<target>`, and make the package public.
 - **A replaced file.** Arch does not publish a filename again with new bytes. So `replaced-<target>` means something unusual upstream or on the registry. The issue names the file and both digests. Wait for upstream to publish a new filename, or accept the new bytes under a new tag.
+- **Many upstream-refused files.** The mirror serves upstream's bytes and promotes them, so the target is not held. But pacman refuses them from upstream too, and one key signs every package of an Arch Linux ARM target or of riscv64. `refused-<target>` names the first 50 files and reasons. Check whether upstream revoked or rotated its key, and whether the target's keyring package or `keyring_image` needs an update.
+- **A keyring package that does not install.** The verdict names the package and pacman's error line. Fix the `keyring` line of the target file (below).
 - **Renovate.** Merge the major updates, and the keyring image updates that fail CI job `keyrings`. For new keys, check the change, run `scripts/keyring-files OUT`, and write its lines into `targets/keyrings.sha256`.
 - **Pages.** Enable Pages once (below).
 - **The Worker.** Deploy a change to `worker/` by hand, after `worker.yml` passes (`docs/worker.md`).
@@ -142,6 +185,43 @@ A sync run can be run again from its page. The two choices do not do the same th
 ### The plan's budget
 
 The plan job reads every target's databases from upstream, one target after another, in one job of 30 minutes. `scripts/plan` ends its upstream reads within `PLAN_BUDGET` seconds (1200). Each target gets what is left of the budget, divided by the targets not yet read. A target whose upstream does not answer in time is in error for that run, and its row in the run's table names `PLAN_BUDGET`. The next run reads it again. A target that stays in error raises `stale-<target>` after the tolerance.
+
+### An upstream that blocks
+
+Each upstream read that gets an answer other than 200, 404 and 410 logs one line: `<url> answered HTTP <code>`. When the answer has Cloudflare's `cf-mitigated` header, the line ends with it, for example `(cf-mitigated: challenge)`. A block or a challenge then shows as what it is, not as a server that did not answer.
+
+⚠ Both loong64 targets have one `db_server`, `loongarchlinux.lcpu.dev`, and Cloudflare is in front of it. When it blocks the runners, the plan log shows that line for `core.db` and `extra.db`, and both targets are in error. After the tolerance, `stale-loong64-core` and `stale-loong64-extra` open.
+
+### A keyring package that does not install
+
+A verdict that says `the keyring package(s) ... did not install` holds the target on every run. The cause is a keyring package that upstream renamed, split, or signed with a new key. Read pacman's line in the verdict, then fix the `keyring` line of the target file.
+
+### The verify image
+
+⚠ Docker Hub limits anonymous pulls per address, and runners share addresses. When it refuses the verify image, verify pulls the same digest from `mirror.gcr.io`, then from `public.ecr.aws`, and the log of the batch names the source it used. Nothing waits on a person. When every source fails, the verdict of each batch names the sources and `toomanyrequests`, the target is not promoted for that run, and the next run tries again. Set `VERIFY_IMAGE_MIRRORS` to change the list of mirrors, for example on another host.
+
+### GHCR and the dummy token
+
+⚠ GHCR does not document `Bearer QQ==`. When GHCR refuses it, each anonymous read logs the warning `GHCR refused Bearer QQ== for <repository> (HTTP <code>); the anonymous token flow was used`, and goes on with that flow. Each read then costs three requests in place of one. The mirror keeps working, and the warning tells a person that GHCR changed. The Worker and the wrapper use the same flow ([worker.md](worker.md#ghcr-tokens), [client.md](client.md#tokens)).
+
+### Detached signatures that upstream makes again
+
+A file with no `%PGPSIG%` in its database has its signature only in the detached `.sig` (riscv64 extra: 14636 of 14716 files, [measurements.md](measurements.md)). A new `.sig` does not change the database. So each run of `scripts/plan` compares `SIGCHECK_SAMPLE` (64) of these files: the `.sig` that upstream serves, against the signature layer of the file's tag. The sample starts at another file on each 3-hour run. For riscv64 extra, every file is compared once in 229 runs, about 29 days.
+
+- A file whose `.sig` differs is planned again. mirror-file pushes it again with the same package blob, and verify checks it. The plan log names the file, and the target's why says `K detached signature(s) changed upstream`.
+- When more than `SIGCHECK_ESCALATE` (8) files of one sample differ, the plan warns `upstream signed N of M sampled files again; every detached signature is checked this run`. It plans every file with a detached signature only. mirror-file pushes again only the files whose `.sig` differs.
+- ⚠ Verify then reads every planned file: a run after a new signing key downloads the whole target.
+- These reads count in the target's share of `PLAN_BUDGET`, and stop when half of what was left is used. A server that fails is not asked again in that sample. A file whose tag or `.sig` does not read waits for a later run.
+
+The same check repairs a signature layer that was changed on the registry: the next sample that holds the file plans it again.
+
+### A files database that lags
+
+plan compares `<repo>.files` with `<repo>.db` by package name. A package that both name at other file names shows that the files database lags, for example during a mass rebuild. plan names these packages in a warning, as it names the packages that only one of the two names, and goes on. A lagging files database never holds a target.
+
+plan refuses a files database that names fewer than half of the packages of the database, and leaves out 16 or more: it is the files database of another repository. It also refuses one that names a file of the database with another sha256. After a refusal, plan reads `<repo>.files` from the next `db_server` that served the same database. When none serves a matching one, the target is in error, and its why says so.
+
+`FILES_DRIFT_MAX`, when set, replaces the package-name rule: plan refuses a files database when more file names than `FILES_DRIFT_MAX` are named by only one of the two databases.
 
 ## Renovate
 
@@ -183,7 +263,7 @@ The site is published with a workflow build: `actions/upload-pages-artifact` in 
 gh api -X POST repos/pkgforge-dev/mirror-archlinux/pages -f build_type=workflow
 ```
 
-Until then, `deploy` shows a notice and deploys nothing.
+Until then, `deploy` shows a notice and deploys nothing. ⚠ The notice does not make the run red. So the watchdog raises `pages-stale` when the copy on Pages trails the record on branch `status` by more than 3 hours. This also shows a change of the Pages source by a person.
 
 The site at <https://pkgforge-dev.github.io/mirror-archlinux/> holds:
 
@@ -206,7 +286,7 @@ The site at <https://pkgforge-dev.github.io/mirror-archlinux/> holds:
 | `charts/narrow/<chart>.svg` | each chart at 420 px, for a phone |
 | `status.json`, `history.json`, `bench.json` | the data behind the page |
 
-`status.json` has schema 1. The header of `scripts/status-collect` describes each field.
+`status.json` has schema 1. The header of `scripts/status-collect` describes each field. The table of repositories on `index.html` names, under the upstream server, each `db_server` not taken and its result.
 
 A target has a coverage only when a run reads both upstream and the registry. A sum over the targets counts only those, and the page says so:
 
@@ -260,6 +340,6 @@ On `main`, job `build` pushes branch `status` as one orphan commit, with force, 
 | `bench.json` | the newest bench |
 | `bench/<date>.json` | each daily bench |
 
-The next status run reads `history.jsonl` and the bench from the branch. The `worker` job of `status.yml` reads `status.json` and `worker.md` from it. ⚠ The branch is the only copy of the history. A run that fails to push leaves the previous branch in place, so no history is lost.
+The next status run reads `history.jsonl` and the bench from the branch. The `worker` job of `status.yml` reads `status.json` and `worker.md` from it. The `staleness` job of `watchdog.yml` reads `status.json` from it. ⚠ The branch is the only copy of the history. A run that fails to push leaves the previous branch in place, so no history is lost.
 
 The pushes to `status` start no CI run: the push trigger of `ci.yml` covers `main` only, and its pull request trigger leaves out `status`.

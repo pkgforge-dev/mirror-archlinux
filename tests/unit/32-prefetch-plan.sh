@@ -115,8 +115,9 @@ PACMAN_OCI_PREFETCH=0 run -Su
 check "no print run: PACMAN_OCI_PREFETCH=0" "no print run" "$(rewritten)" "PACMAN_OCI_PREFETCH=0 ..."
 PACMAN_OCI_JOBS=1 run -Su
 check "no print run: PACMAN_OCI_JOBS=1" "no print run" "$(rewritten)" "PACMAN_OCI_JOBS=1 ..."
+# With no dummy token the prefetch still runs: it starts with the token flow.
 PACMAN_OCI_NO_DUMMY=1 run -Su
-check "no print run: PACMAN_OCI_NO_DUMMY=1" "no print run" "$(rewritten)" "PACMAN_OCI_NO_DUMMY=1 ..."
+check "a print run with PACMAN_OCI_NO_DUMMY=1" "-Su " "$(rewritten)" "PACMAN_OCI_NO_DUMMY=1 ..."
 run -Su
 first="$(rewritten)"
 rm -f "$work/args"

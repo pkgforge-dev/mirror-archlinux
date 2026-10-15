@@ -7,16 +7,22 @@
 #
 # With no target file, every enabled target in targets/ is measured. For each
 # target:
-#   upstream  <repo>.db from the first db_server that answers 200, in order
+#   upstream  <repo>.db through scripts/upstream-db, within the target's share
+#             of STATUS_BUDGET: every db_server is read, a database that is
+#             not whole or that is behind another is dropped, and the first
+#             one left, in db_server order, is upstream
 #   mirror    the latest manifest and the database it names, read with no
-#             credential (Bearer QQ== on GHCR), the way a consumer reads
+#             credential (the anonymous token flow), the way a consumer reads
 #   coverage  upstream (filename, sha256) pairs that the mirror database also
 #             names, by count and by bytes; the first 20 missing file names
 #   age       now minus the snapshot's fetched time
 #   lag       upstream newest build date minus the mirror's newest build date
 #   worker    GET <worker>/<arch>/<repo>/<repo>.db and one package, with no
-#             redirect followed: 302 to https://*.githubusercontent.com when
-#             latest exists, 404 when it does not
+#             redirect followed: 302 to an https URL when latest exists, 404
+#             when it does not. The signed URL of a 302 must answer one byte
+#             to the runner, with no credential (probe, below). Once per run,
+#             the smallest promoted database is downloaded through the
+#             Worker, redirects followed, and must have latest's sha256
 #   ghcr      the time of the direct latest manifest GET
 #
 # Writes:
@@ -52,11 +58,17 @@
 #             from failing_since to this run. down is true when failed_runs
 #             and failing_seconds both reach down_after: status.yml raises
 #             worker-down then. Runs are not an hour apart: sync.yml also
-#             starts a status run when it ends.
+#             starts a status run when it ends. probes and failures count
+#             the download too; median_seconds leaves it out, because it
+#             moves a whole file.
 #   ghcr      {median_manifest_seconds}
 #   targets[] {target, arch, repo, repository,
 #     upstream {ok, server, sha256, files, bytes, newest_builddate, tried[]
-#               {server, result}, error},
+#               {server, result}, error}; tried has one entry per db_server,
+#               in db_server order, and result is ok, behind by N
+#               package(s) (against which server), refused (and why),
+#               HTTP <code>, curl <status>, not read (no time left of the
+#               share), or not asked (and why),
 #     mirror   {state promoted|absent|error, error, manifest_code,
 #               manifest_seconds, fetched, created, run, db_sha256, files,
 #               bytes, newest_builddate}; created is the latest manifest's
@@ -67,8 +79,15 @@
 #               missing, missing_names[]} or null when upstream or the
 #               registry is unread (mirror state error),
 #     age_seconds, lag_seconds,
-#     worker   {db, package}, each {url, code, expect, seconds, location, ok,
-#               error} or null}
+#     worker   {db, package, download}, each a probe or null: {url, code,
+#               expect, seconds, location (the host of a redirect), ok,
+#               error, signed_code (the signed URL's answer to one byte),
+#               location_unexpected (true: a host outside
+#               *.githubusercontent.com whose signed URL works), cache and
+#               blob_host (the Worker's x-mirror-cache and
+#               x-mirror-blob-host headers, or null)}. download is on one
+#               target per run, with sha256 and want_sha256 in place of the
+#               last four}
 #
 # history.jsonl, one object per line:
 #   {"t": generated, "w": {"ok", "f": failed_runs, "s": failing_since, "ms"},
@@ -79,6 +98,15 @@
 # line that has them, with "k": 1. So a read that fails once does not move
 # the coverage history of its architecture. With no such line they are null.
 #
+# ⛔ The upstream reads end within STATUS_BUDGET seconds (default 900), below
+# the build job's 30 minutes, with room for the render and the push. Each
+# target gets a share: what is left of the budget, divided by the targets not
+# yet read. scripts/upstream-db reads the db_servers within the share. A host
+# that fails is asked last by every later target, so a stalled db_server costs
+# one deadline per run. A target whose reads do not fit is a measurement: its
+# upstream.error names STATUS_BUDGET. The read of the mirror's database gets
+# REG_BLOB_MAX_TIME (120 s), which lib.sh registry_blob reads.
+#
 # Environment:
 #   MIRROR_NAMESPACE      owner/name, default from GITHUB_REPOSITORY
 #   MIRROR_REGISTRY       default ghcr.io
@@ -86,6 +114,7 @@
 #                         empty: no Worker probe
 #   STATUS_SITE_URL       default https://<owner>.github.io/<name>/
 #   STATUS_HISTORY_LINES  default 2000
+#   STATUS_BUDGET         default 900 (seconds)
 #   MIRROR_NOW            seconds; pins the clock, for the test suite only
 #
 # ⚠ db_records reads the database with GNU tar (--wildcards). busybox tar
@@ -98,7 +127,7 @@ SCRIPT_NAME=status-collect
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-need curl jq awk sha256sum tar sort
+need curl jq awk sha256sum tar sort timeout
 
 out="${1:-}"
 [ -n "$out" ] || die "usage: scripts/status-collect OUT [TARGET.conf ...]"
@@ -106,8 +135,21 @@ shift
 [ -n "$MIRROR_NAMESPACE" ] || die "MIRROR_NAMESPACE is not set" \
   "set it to owner/name, or set GITHUB_REPOSITORY"
 mkdir -p "$out"
+STATUS_BUDGET="${STATUS_BUDGET:-900}"
+case "$STATUS_BUDGET" in
+  '' | *[!0-9]* | 0) die "STATUS_BUDGET must be a positive integer, not '$STATUS_BUDGET'" ;;
+esac
+run_deadline=$((SECONDS + STATUS_BUDGET))
+# The whole read of one database blob of the mirror, retries included.
+export REG_BLOB_MAX_TIME="${REG_BLOB_MAX_TIME:-120}"
+# The whole token request of one target, retries included. It is asked once
+# per target, so a token endpoint that stalls costs at most 15 x 35 s here,
+# inside the 30 minutes of the job, not 15 x 250 s.
+export REG_TOKEN_MAX_TIME="${REG_TOKEN_MAX_TIME:-30}"
 
-# Anonymous, the way a consumer reads: registry_token answers QQ== on GHCR.
+# Anonymous, the way a consumer reads: with REGISTRY_TOKEN empty, lib.sh
+# registry_token asks the token endpoint with no credential, and gives what
+# an anonymous reader gets.
 REGISTRY_TOKEN=''
 WORKER_URL="${STATUS_WORKER_URL-https://ghcr.mirror.archlinux.pkgforge.dev}"
 WORKER_URL="${WORKER_URL%/}"
@@ -149,7 +191,8 @@ mkdir -p "$work/t"
 #---------------------------------------------------------------------------#
 # get URL OUT [HEADER ...] -> "CODE SECONDS LOCATION" on stdout, curl's status
 # as the return. Redirects are not followed: a probe measures the answer it
-# gets. The body is kept in OUT, so an error body can be quoted.
+# gets. The body is kept in OUT, so an error body can be quoted, and the
+# response headers in OUT.h.
 #---------------------------------------------------------------------------#
 get() {
   local url="$1" body="$2" args=() h rc=0 res
@@ -157,24 +200,22 @@ get() {
   for h in "$@"; do
     args+=(--header "$h")
   done
+  : > "$body.h"
   res="$(curl -q --silent --show-error --connect-timeout 10 --max-time 30 \
-    --proto '=http,https' --user-agent "$UA" "${args[@]}" \
+    --proto '=http,https' --user-agent "$UA" "${args[@]}" --dump-header "$body.h" \
     --output "$body" --write-out '%{http_code} %{time_total} %{redirect_url}' "$url")" || rc=$?
   printf '%s\n' "$res"
   return "$rc"
 }
 
-# A database from upstream: redirects followed, a stall deadline rather than a
-# fixed one, as scripts/plan reads it.
-get_db() {
-  local url="$1" body="$2" rc=0 res
-  res="$(curl -q --location --silent --show-error --max-redirs 5 \
-    --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \
-    --connect-timeout 20 --speed-limit 4096 --speed-time 60 \
-    --retry 2 --retry-connrefused --retry-delay 2 --user-agent "$UA" \
-    --output "$body" --write-out '%{http_code} %{time_total}' "$url")" || rc=$?
-  printf '%s\n' "$res"
-  return "$rc"
+# header_of FILE NAME -> the value of the response header NAME in FILE, any
+# case, or nothing
+header_of() {
+  awk -v want="$2" '
+    { line = $0; sub(/\r$/, "", line); i = index(line, ":") }
+    i > 0 && tolower(substr(line, 1, i - 1)) == want { v = substr(line, i + 1); sub(/^[ \t]+/, "", v) }
+    END { print v }
+  ' "$1"
 }
 
 # num VALUE -> VALUE when it is a JSON number, else null
@@ -208,8 +249,17 @@ records_stats() {
 # EXPECT is the code the Worker must answer: 302 when latest exists, 404 when
 # it does not, empty when the registry could not be read. With no EXPECT only
 # no answer or a 5xx fails; any other answer is measured and not judged.
+#
+# ⛔ A 302 is followed once, the way a consumer follows it. A GET of the
+# Location from the runner must answer 206 or 200. It sends no credential,
+# and Range: bytes=0-0. The Worker gets the signed URL from a Cloudflare address
+# and hands it to another client. A URL bound to the asker, or one the blob
+# host refuses, fails every download through the Worker while the 302 looks
+# right. The Location must be https. A host outside *.githubusercontent.com
+# whose signed URL works is recorded as location_unexpected, and passes.
 probe() {
   local label="$1" url="$2" expect="$3" dir="$4" rc=0 res code secs loc host ok err
+  local s_rc=0 s_code="" unexpected=false cache blob_host
   res="$(get "$url" "$dir/$label.body")" || rc=$?
   read -r code secs loc <<< "$res"
   code="$(http_code "${code:-}")"
@@ -218,6 +268,8 @@ probe() {
     host="${loc#*://}"
     host="${host%%[/?#]*}"
   fi
+  cache="$(header_of "$dir/$label.body.h" x-mirror-cache)"
+  blob_host="$(header_of "$dir/$label.body.h" x-mirror-blob-host)"
   ok=null
   err=""
   if [ "$rc" -ne 0 ]; then
@@ -226,8 +278,20 @@ probe() {
     if [ "$code" -ge 500 ]; then err="HTTP $code"; fi
   elif [ "$code" != "$expect" ]; then
     err="HTTP $code, expected $expect"
-  elif [ "$expect" = 302 ] && ! [[ "${loc:-}" =~ ^https://[^/?#]*\.githubusercontent\.com/ ]]; then
-    err="302 to '${host:-nothing}', not to https://*.githubusercontent.com"
+  elif [ "$expect" = 302 ] && ! [[ "${loc:-}" =~ ^https://[^/?#]+/ ]]; then
+    err="302 to '${host:-nothing}', not to an https URL"
+  elif [ "$expect" = 302 ]; then
+    res="$(get "$loc" "$dir/$label.signed" 'Range: bytes=0-0')" || s_rc=$?
+    read -r s_code _ _ <<< "$res"
+    s_code="$(http_code "${s_code:-}")"
+    if [ "$s_rc" -ne 0 ]; then
+      err="the signed URL did not answer (curl $s_rc)"
+    elif [ "$s_code" != 206 ] && [ "$s_code" != 200 ]; then
+      err="the signed URL answered $s_code"
+    elif ! [[ "$loc" =~ ^https://[^/?#]*\.githubusercontent\.com/ ]]; then
+      unexpected=true
+      log "worker probe $url: 302 to '$host', outside *.githubusercontent.com; its signed URL answered $s_code"
+    fi
   fi
   if [ -n "$err" ]; then
     ok=false
@@ -237,16 +301,50 @@ probe() {
   [ -z "$err" ] || log "worker probe $url: $err"
   jq -nc --arg url "$url" --argjson code "$code" --arg expect "$expect" \
     --argjson secs "$(num "${secs:-}")" --arg host "$host" --argjson ok "$ok" --arg err "$err" \
-    '{url: $url, code: $code, expect: (if $expect == "" then null else ($expect | tonumber) end),
-      seconds: $secs, location: (if $host == "" then null else $host end), ok: $ok,
-      error: (if $err == "" then null else $err end)}'
+    --arg s_code "$s_code" --argjson unexpected "$unexpected" --arg cache "$cache" --arg blob_host "$blob_host" \
+    'def nul: if . == "" then null else . end;
+     {url: $url, code: $code, expect: (if $expect == "" then null else ($expect | tonumber) end),
+      seconds: $secs, location: ($host | nul), ok: $ok, error: ($err | nul),
+      signed_code: (if $s_code == "" then null else ($s_code | tonumber) end),
+      location_unexpected: $unexpected, cache: ($cache | nul), blob_host: ($blob_host | nul)}'
+}
+
+# download URL WANT DIR -> one probe object, as JSON, on stdout: the whole
+# file through the Worker, redirects followed as pacman follows them, within
+# 60 s. Its sha256 must be WANT.
+download() {
+  local url="$1" want="$2" dir="$3" rc=0 res code secs got="" ok=true err=""
+  res="$(curl -q --silent --show-error --location --max-redirs 3 --proto '=https' --proto-redir '=https' \
+    --connect-timeout 10 --max-time 60 --user-agent "$UA" \
+    --output "$dir/download.body" --write-out '%{http_code} %{time_total}' "$url")" || rc=$?
+  read -r code secs <<< "$res"
+  code="$(http_code "${code:-}")"
+  if [ -f "$dir/download.body" ]; then
+    got="$(sha256sum "$dir/download.body" | cut -d ' ' -f 1)"
+  fi
+  if [ "$rc" -ne 0 ]; then
+    err="curl $rc: no whole answer within 60 s, or the connection failed"
+  elif [ "$code" != 200 ]; then
+    err="HTTP $code at the end of the redirects, expected 200"
+  elif [ "$got" != "$want" ]; then
+    err="the file has sha256 $got, and latest names $want"
+  fi
+  if [ -n "$err" ]; then
+    ok=false
+    log "worker download $url: $err"
+  fi
+  jq -nc --arg url "$url" --argjson code "$code" --argjson secs "$(num "${secs:-}")" --argjson ok "$ok" \
+    --arg err "$err" --arg got "$got" --arg want "$want" \
+    'def nul: if . == "" then null else . end;
+     {url: $url, code: $code, expect: 200, seconds: $secs, location: null, ok: $ok, error: ($err | nul),
+      sha256: ($got | nul), want_sha256: $want}'
 }
 
 #---------------------------------------------------------------------------#
 # One target
 #---------------------------------------------------------------------------#
 collect_target() {
-  local conf="$1" arch repo name repo_path tw
+  local conf="$1" share="$2" arch repo name repo_path tw
   target_check "$conf"
   arch="$(target_get "$conf" arch)"
   repo="$(target_get "$conf" repo)"
@@ -256,38 +354,30 @@ collect_target() {
   mkdir -p "$tw"
 
   #-------------------------------------------------------------------------#
-  # Upstream, from the first db_server that answers 200
+  # Upstream, within the target's share of STATUS_BUDGET
   #-------------------------------------------------------------------------#
-  local server rc res code up_server="" up_err="" tried="[]" why
-  while IFS= read -r server; do
-    [ -n "$server" ] || continue
-    rc=0
-    res="$(get_db "$server/$repo.db" "$tw/up.db")" || rc=$?
-    read -r code _ <<< "$res"
-    if [ "$rc" -eq 0 ] && [ "${code:-}" = 200 ]; then
-      up_server="$server"
-      break
-    fi
-    if [ "$rc" -ne 0 ]; then why="curl $rc"; else why="HTTP ${code:-000}"; fi
-    log "$name: $server/$repo.db: $why"
-    tried="$(jq -c --arg s "$server" --arg r "$why" '. + [{server: $s, result: $r}]' <<< "$tried")"
-  done <<< "$(target_all "$conf" db_server)"
-
+  local rc res up_server="" up_err="" tried
+  rc=0
+  "$REPO_ROOT/scripts/upstream-db" "$conf" "$share" "$work/down" "$tw/up" STATUS_BUDGET || rc=$?
   local up_ok=false up_sha="" up_n="" up_b="" up_nb=""
-  if [ -z "$up_server" ]; then
-    up_err="no db_server answered 200 for $repo.db"
-  else
-    up_sha="$(sha256sum "$tw/up.db" | cut -d ' ' -f 1)"
-    rc=0
-    db_records "$tw/up.db" "$tw/up.tsv" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-      up_err="$up_server/$repo.db does not read as a database (db_records ended $rc)"
-      log "$name: $up_err"
-    else
+  case "$rc" in
+    0)
+      # A whole database, not behind another db_server's (scripts/upstream-db)
+      up_server="$(cat "$tw/up/server")"
+      mv -f "$tw/up/upstream.db" "$tw/up.db"
+      mv -f "$tw/up/upstream.tsv" "$tw/up.tsv"
+      up_sha="$(sha256sum "$tw/up.db" | cut -d ' ' -f 1)"
       up_ok=true
       read -r up_n up_b up_nb <<< "$(records_stats "$tw/up.tsv")"
-    fi
-  fi
+      ;;
+    3)
+      up_err="$(cat "$tw/up/why")"
+      log "$name: $up_err"
+      ;;
+    *) die "scripts/upstream-db could not read $name (exit $rc)" "reproduce: scripts/upstream-db $conf $share DOWN OUT" ;;
+  esac
+  # One {server, result} per db_server, in db_server order
+  tried="$(jq -R -s -c 'split("\n") | map(select(. != "") | split("\t") | {server: .[0], result: .[1]})' "$tw/up/tried.tsv")"
 
   #-------------------------------------------------------------------------#
   # The mirror's latest, anonymously
@@ -442,9 +532,40 @@ collect_target() {
     "$(jq -r '[.worker.db, .worker.package] | map(select(. != null) | "\(.code)\(if .ok == false then "!" else "" end)") | join(",") | if . == "" then "-" else . end' "$work/t/$name.json")" >&2
 }
 
+left="$#"
 for conf in "$@"; do
-  collect_target "$conf"
+  share=$(((run_deadline - SECONDS) / left))
+  if [ "$share" -lt 0 ]; then
+    share=0
+  fi
+  left=$((left - 1))
+  collect_target "$conf" "$share"
 done
+log "the targets took $((SECONDS + STATUS_BUDGET - run_deadline))s; STATUS_BUDGET=${STATUS_BUDGET}s bounds their upstream reads"
+
+#---------------------------------------------------------------------------#
+# Once per run, the whole file a consumer gets: the smallest database of a
+# target with latest, downloaded through the Worker. It must be the database
+# latest names. The result is that target's worker.download probe.
+#---------------------------------------------------------------------------#
+if [ -n "$WORKER_URL" ]; then
+  best="" best_size="" best_arch="" best_repo="" best_sha=""
+  for f in "$work"/t/*.json; do
+    read -r t_name t_arch t_repo t_sha <<< "$(jq -r 'select(.mirror.state == "promoted" and .mirror.db_sha256 != null)
+      | "\(.target) \(.arch) \(.repo) \(.mirror.db_sha256)"' "$f")"
+    [ -n "${t_sha:-}" ] || continue
+    size="$(wc -c < "$work/$t_name/mirror.db" | tr -d ' ')"
+    if [ -z "$best" ] || [ "$size" -lt "$best_size" ]; then
+      best="$t_name" best_size="$size" best_arch="$t_arch" best_repo="$t_repo" best_sha="$t_sha"
+    fi
+  done
+  if [ -n "$best" ]; then
+    d="$(download "$WORKER_URL/$best_arch/$best_repo/$best_repo.db" "$best_sha" "$work/$best")"
+    jq -c --argjson d "$d" '.worker.download = $d' "$work/t/$best.json" > "$work/t/$best.json.new"
+    mv -f "$work/t/$best.json.new" "$work/t/$best.json"
+    log "worker download of $best_repo.db of $best ($best_size bytes): $(jq -r 'if .ok then "ok" else .error end' <<< "$d")"
+  fi
+fi
 
 #---------------------------------------------------------------------------#
 # The Worker's failure streak, from the previous run's line
@@ -481,7 +602,7 @@ jq -s \
   # A sum over the measured targets; null when none was measured, not 0.
   def total(f): if length == 0 then null else map(f // 0) | add end;
   . as $t
-  | ([$t[] | .worker.db, .worker.package | select(. != null)]) as $probes
+  | ([$t[] | .worker.db, .worker.package, .worker.download | select(. != null)]) as $probes
   | ([$probes[] | select(.ok == false)] | length) as $fail
   | (if ($probes | length) == 0 then null
      elif $fail > 0 then false
@@ -533,7 +654,8 @@ jq -s \
         failing_seconds: $f_secs,
         down: ($wok == false and $f_runs >= $down_runs and $f_secs >= $down_secs),
         down_after: {runs: $down_runs, seconds: $down_secs},
-        median_seconds: ([$probes[] | .seconds | select(. != null)] | median)
+        # The answers of the Worker only: a download also moves the file.
+        median_seconds: ([$probes[] | select(.want_sha256 == null) | .seconds | select(. != null)] | median)
       },
       ghcr: {median_manifest_seconds: ([$t[] | .mirror.manifest_seconds | select(. != null)] | median)},
       targets: ($t | sort_by(.target))
@@ -597,16 +719,21 @@ jq -r '
    elif .worker.ok == true then "The Worker passes every probe."
    else "The Worker was not probed, or no probe could be judged." end),
   "",
-  "Worker: \(.worker_url // "not set"). Each probe is a GET with no redirect followed. A target with `latest` must answer 302 to https://*.githubusercontent.com. A target with no `latest` must answer 404.",
+  "Worker: \(.worker_url // "not set"). Each probe is a GET with no redirect followed. A target with `latest` must answer 302 to an https URL, and that signed URL must answer a GET of one byte (`Range: bytes=0-0`), with no credential, with 206 or 200. A target with no `latest` must answer 404. Once per run, the smallest database of a target with `latest` is downloaded through the Worker, redirects followed: it must have the sha256 that `latest` names.",
   "",
-  "| target | probe | HTTP | expected | seconds | result |",
-  "| --- | --- | --- | --- | --- | --- |",
-  (.targets[] as $t | [["db", $t.worker.db], ["package", $t.worker.package]][]
+  "| target | probe | HTTP | expected | signed URL | seconds | result |",
+  "| --- | --- | --- | --- | --- | --- | --- |",
+  (.targets[] as $t | [["db", $t.worker.db], ["package", $t.worker.package], ["download", $t.worker.download]][]
     | select(.[1] != null)
-    | "| \($t.target) | \(.[0]) | \(.[1].code) | \(.[1].expect | cell) | \(.[1].seconds | cell) | \(if .[1].ok == true then "ok" elif .[1].ok == false then .[1].error else "not judged" end) |"),
+    | "| \($t.target) | \(.[0]) | \(.[1].code) | \(.[1].expect | cell) | \(.[1].signed_code | cell) | \(.[1].seconds | cell) | \(if .[1].ok == true then "ok" elif .[1].ok == false then .[1].error else "not judged" end) |"),
   "",
-  ([.targets[] | .worker.db, .worker.package | select(. != null and .ok == false)] | first // null
-   | if . == null then empty else
+  ([.targets[] | .worker.db, .worker.package, .worker.download | select(. != null and .ok == false)] | first // null
+   | if . == null then empty
+     elif .want_sha256 != null then
+       "reproduce:\n\n```bash\ncurl --connect-timeout 10 --max-time 60 -sSL \"\(.url)\" | sha256sum\n```\n"
+     elif (.error // "") | startswith("the signed URL") then
+       "reproduce:\n\n```bash\nloc=\"$(curl --connect-timeout 10 --max-time 30 -sS -o /dev/null -w \"%{redirect_url}\" \"\(.url)\")\"\ncurl --connect-timeout 10 --max-time 30 -sS -o /dev/null -r 0-0 -w \"%{http_code}\\n\" \"$loc\"\n```\n"
+     else
        "reproduce:\n\n```bash\ncurl --connect-timeout 10 --max-time 30 -sS -o /dev/null -w \"%{http_code} %{redirect_url}\\n\" \"\(.url)\"\n```\n"
      end),
   "This issue closes itself when the Worker passes its probes again."

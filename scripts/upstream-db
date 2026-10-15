@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+#
+# Read one target's database from upstream, within a deadline, for the
+# watchdogs: scripts/check-staleness and scripts/status-collect.
+#
+#   scripts/upstream-db CONF SECONDS DOWN OUT [BUDGET]
+#
+# CONF is the target file, SECONDS the time this call may take, DOWN a
+# directory of hosts that failed earlier in the run (scripts/lib.sh
+# down_mark), OUT the directory for the result. BUDGET names the budget that
+# SECONDS is a share of, for the messages (default "the budget").
+#
+# Every db_server is asked for <repo>.db, the way scripts/plan reads it:
+#
+#   1. Each answer must be a whole, well-formed database (lib.sh db_check).
+#      One that is not, an error page that answers 200 for one, is refused.
+#   2. A database is dropped when it is behind another: some package in it
+#      was built before the same package in the other (lib.sh behind). So a
+#      db_server that lags or is stuck cannot stand for upstream.
+#   3. The first database left, in db_server order, is upstream. When every
+#      database is behind another, none is taken: the db_servers disagree.
+#
+# ⛔ Every read ends within its own deadline: DB_MAX_TIME (60 s), or less.
+# With n the db_servers not yet asked, a read gets at most what is left of
+# SECONDS divided by n + 1. So a db_server that stalls leaves time for the
+# next one, and a part of SECONDS is left for the caller's own reads. A read
+# that cannot get
+# 1 s is not made. A host that fails is marked in DOWN: no answer in time, a
+# connection that failed, or an HTTP status other than 200, 404 and 410. Each
+# later target of the run asks it last, and only when no other db_server gave
+# a whole database. So a host that stalls costs one deadline per run, not one
+# per target.
+#
+# OUT/upstream.db   the database taken, byte for byte
+# OUT/upstream.tsv  its records (lib.sh db_records)
+# OUT/server        the db_server that served it
+# OUT/tried.tsv     server<TAB>result, one line per db_server, in db_server
+#                   order. result is one of: ok; behind by N package(s),
+#                   against <server>; refused: <why>; HTTP <code>;
+#                   curl <status>; not read (no time left); not asked (why)
+# OUT/why           one line: why no database was taken
+#
+# Environment: UPSTREAM_PROTO (scripts/lib.sh).
+#
+# Exit status: 0 a database was taken, 3 none was, 1 the call could not run.
+set -euo pipefail
+SCRIPT_NAME="upstream-db"
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+need curl timeout tar awk
+
+[ "$#" -ge 4 ] && [ "$#" -le 5 ] || die "usage: scripts/upstream-db CONF SECONDS DOWN OUT [BUDGET]"
+conf="$1"
+seconds="$2"
+down="$3"
+out="$4"
+budget="${5:-the budget}"
+case "$seconds" in
+  '' | *[!0-9]*) die "SECONDS must be a whole number of seconds, not '$seconds'" ;;
+esac
+target_check "$conf"
+repo="$(target_get "$conf" repo)"
+name="$(target_get "$conf" arch)-$repo"
+mkdir -p "$down" "$out"
+rm -f "$out"/upstream.* "$out"/c[0-9]* "$out/server" "$out/why"
+: > "$out/tried.tsv"
+
+# The deadline of one database read when SECONDS allows it.
+DB_MAX_TIME=60
+deadline=$((SECONDS + seconds))
+ua="mirror-archlinux (+https://github.com/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux})"
+
+# fetch URL OUT MAX -> sets f_code (the HTTP status, or empty) and f_rc
+# (curl's status, or timeout's 124 or 137). As scripts/lib.sh fetch_upstream:
+# --retry-max-time starts no retry after MAX, and timeout(1) ends a retry
+# that started just before it. The status is kept for the caller's record.
+fetch() {
+  f_code=""
+  f_rc=0
+  f_code="$(timeout -k 5 "$(($3 + 5))" curl -q --location --silent --show-error --max-redirs 5 \
+    --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \
+    --connect-timeout 20 --speed-limit 4096 --speed-time 60 --max-time "$3" --retry-max-time "$3" \
+    --retry 2 --retry-connrefused --retry-delay 2 --user-agent "$ua" \
+    --output "$2" --write-out '%{http_code}' "$1")" || f_rc=$?
+}
+
+mapfile -t servers < <(target_all "$conf" db_server)
+# The indexes into servers, those whose host is not in DOWN first
+order=()
+for pass in up down; do
+  for i in "${!servers[@]}"; do
+    if [ -e "$down/$(down_key "${servers[$i]}")" ]; then
+      [ "$pass" = down ] || continue
+    else
+      [ "$pass" = up ] || continue
+    fi
+    order+=("$i")
+  done
+done
+
+#---------------------------------------------------------------------------#
+# 1. Read each db_server; keep each whole, well-formed database
+#---------------------------------------------------------------------------#
+result=()
+cands=()
+n="${#order[@]}"
+cut=0
+for i in "${order[@]}"; do
+  n=$((n - 1))
+  server="${servers[$i]}"
+  if [ -e "$down/$(down_key "$server")" ] && [ "${#cands[@]}" -gt 0 ]; then
+    result[i]="not asked: it failed earlier in this run, and another db_server gave a whole database"
+    continue
+  fi
+  part=$(((deadline - SECONDS) / (n + 2)))
+  if [ "$part" -gt "$DB_MAX_TIME" ]; then
+    part="$DB_MAX_TIME"
+  fi
+  if [ "$part" -lt 1 ]; then
+    cut=1
+    result[i]="not read: nothing is left of the share (${seconds}s) of $budget"
+    log "$name: $server/$repo.db: ${result[i]}"
+    continue
+  fi
+  fetch "$server/$repo.db" "$out/c$i.db" "$part"
+  if [ "$f_rc" -eq 0 ] && [ "$f_code" = 200 ]; then
+    rc=0
+    why="$(db_check "$out/c$i.db" "$out/c$i.tsv")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      result[i]="refused: $why"
+      warn "$name: refused the database from $server: $why" \
+        "reproduce: curl -fsSLO $server/$repo.db && bash -c '. scripts/lib.sh; db_check $repo.db /tmp/records.tsv'"
+      continue
+    fi
+    result[i]=ok
+    cands+=("$i")
+    continue
+  fi
+  rm -f "$out/c$i.db"
+  case "$f_rc" in
+    0) result[i]="HTTP ${f_code:-000}" ;;
+    28 | 124 | 137)
+      result[i]="curl $f_rc: no whole answer within ${part}s"
+      if [ "$part" -lt "$DB_MAX_TIME" ]; then
+        cut=1
+      fi
+      ;;
+    *) result[i]="curl $f_rc" ;;
+  esac
+  case "$f_rc:$f_code" in
+    0:404 | 0:410) ;;
+    *) down_mark "$down" "$server" ;;
+  esac
+  log "$name: $server/$repo.db: ${result[i]}"
+done
+
+#---------------------------------------------------------------------------#
+# 2. Drop each database that is behind another; 3. take the first one left
+#---------------------------------------------------------------------------#
+taken=""
+for c in "${cands[@]}"; do
+  for o in "${cands[@]}"; do
+    [ "$o" != "$c" ] || continue
+    read -r _ older <<< "$(behind "$out/c$o.tsv" "$out/c$c.tsv")"
+    if [ "$older" -gt 0 ]; then
+      result[c]="behind by $older package(s), against ${servers[$o]}"
+      log "$name: ${servers[$c]}/$repo.db: ${result[c]}"
+      break
+    fi
+  done
+  if [ "${result[c]}" = ok ] && { [ -z "$taken" ] || [ "$c" -lt "$taken" ]; }; then
+    taken="$c"
+  fi
+done
+
+for i in "${!servers[@]}"; do
+  printf '%s\t%s\n' "${servers[$i]}" "${result[i]:-not asked}" >> "$out/tried.tsv"
+done
+
+if [ -n "$taken" ]; then
+  mv -f "$out/c$taken.db" "$out/upstream.db"
+  mv -f "$out/c$taken.tsv" "$out/upstream.tsv"
+  printf '%s\n' "${servers[$taken]}" > "$out/server"
+fi
+rm -f "$out"/c[0-9]*
+if [ -z "$taken" ]; then
+  if [ "${#cands[@]}" -gt 0 ]; then
+    why="the db_servers disagree: each answered a database with some package older than another's"
+  else
+    why="no db_server answered 200 with a whole database for $repo.db"
+    if [ "$cut" -eq 1 ]; then
+      why="$why; a read had less time than its own deadline, to fit the share (${seconds}s) of $budget"
+    fi
+  fi
+  printf '%s\n' "$why" > "$out/why"
+  exit 3
+fi
+exit 0

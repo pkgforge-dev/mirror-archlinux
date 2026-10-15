@@ -39,6 +39,7 @@ Source: pacman v7.1.0 (commit 5683f847), read from source. Also pacman 7.1.0.r9.
 | pacman 7.1 checks a package against `%PGPSIG%`, and still asks for its `.sig` and stores it unread | 2026-10-14 | pacman against the promoted x86_64 core |
 | pacman 7.1 takes an expired primary key for a missing key: it asks a keyserver, then says "required key missing from keyring" | 2026-10-14 | the integration suite and loong64 extra |
 | pacman 7.1 under an `XferCommand` names no file when a package's `.sig` cannot be served: only "failed to retrieve some files" | 2026-10-14 | the integration suite |
+| GnuPG 2.4.9 in `archlinux:base`, after `pacman-key --init` and the keyserver `hkp://127.0.0.1:9`: `gpg --locate-external-keys eworm@archlinux.org` reads the key by WKD in 1.3 s. With `auto-key-locate clear,local`, or `clear,nodefault`, in `gpg.conf` and `disable-http`, `disable-ldap` in `dirmngr.conf`, it still does. With `disable-dirmngr` in `gpg.conf` it fails in 0.01 s ("No dirmngr"), and so does `--recv-keys` | 2026-10-15 | podman in the WSL VM, default network |
 
 ## GHCR
 
@@ -48,6 +49,7 @@ Source: pacman v7.1.0 (commit 5683f847), read from source. Also pacman 7.1.0.r9.
 | no Authorization header gives 401 with a Bearer challenge | 2026-10-14 | curl against ghcr.io |
 | an unknown bearer gives 403 with no challenge | 2026-10-13 | curl against ghcr.io |
 | `Bearer QQ==` for a repository that does not exist gives 404 `MANIFEST_UNKNOWN` | 2026-10-14 | curl against ghcr.io |
+| the token endpoint with no credential, `service=ghcr.io` and a pull scope: 200 and `{"token": ...}` for a public repository, and that token reads its manifest and blob; 403 `DENIED` for a repository that does not exist | 2026-10-15 | curl 8.21.0 against ghcr.io |
 | a blob GET gives 307 to a signed URL on `pkg-containers.githubusercontent.com`; that URL needs no Authorization | 2026-10-13 | curl against ghcr.io |
 | a Range request on a blob gives 206; a resumed download was byte-identical | 2026-10-14 | curl against ghcr.io, a 199 MiB blob |
 | blobs are scoped per repository: another repository's blob gives 404 | 2026-10-13 | curl against ghcr.io |
@@ -155,6 +157,8 @@ Source: each database downloaded from a `db_server` and read with `scripts/lib.s
 | --- | --- | --- |
 | 15 targets: 71,422 upstream files, 395,704,667,230 bytes (368.5 GiB) | 2026-10-14 | `scripts/status-collect`, live |
 | no target publishes `<repo>.db.sig` or `<repo>.files.sig`: 404 on every server tried | 2026-10-14 | curl on each `db_server` |
+| `loongarchlinux.lcpu.dev`, the one `db_server` of both loong64 targets, answers `core.db` with 200, `Server: cloudflare` and a `CF-RAY` header | 2026-10-15 | curl `-I` from the Windows host in Nepal |
+| curl 8.21 writes `%header{cf-mitigated}` empty when the answer has no such header | 2026-10-15 | curl `--write-out` against a Cloudflare host |
 | 98 of 98 `db_server` and `server` URLs answered 200 for `<repo>.db` | 2026-10-14 | curl on each URL |
 | aarch64 extra `findnewest-0.3-4/desc`: a GNU sparse member of 1271 NUL bytes; pacman lists it with every field None and cannot download it | 2026-10-14 | the database on every mirror; pacman 7.1 in the aarch64 image |
 | riscv64 extra `ntk-1.3.1001-4/desc`: a GNU sparse member of 576 NUL bytes, on every current mirror | 2026-10-14 | the database on each mirror |
@@ -238,6 +242,8 @@ Each case uses `ParallelDownloads = 5` and `SigLevel = Required DatabaseNever`. 
 | ShellCheck 0.11.0, actionlint 1.7.12, jq 1.8.2: release checksum lists and GitHub asset digests agreed | 2026-10-13 | `scripts/install-test-tools` |
 | curl 8.22.0 (stunnel/static-curl), musl static: the GitHub asset digest, the release notes and `SHA256SUMS` agreed | 2026-10-14 | `scripts/install-test-tools` |
 | bash 5.2.21-2ubuntu4 (Ubuntu noble `bash-static`, release pocket): the Packages index and Launchpad agreed | 2026-10-14 | `scripts/install-test-tools` |
+| the verify image `archlinux:base@sha256:3c64b538...47a0` pulled by its digest for `linux/amd64` from `mirror.gcr.io/library/archlinux` (8 s) and from `public.ecr.aws/docker/library/archlinux`: both image ID `5a30b4acc83f`, pacman 7.1.0 and the three `archlinux` keyring files inside | 2026-10-15 | podman 5.8.6 in the WSL VM, a storage of its own |
+| Docker Hub documents a limit of 100 anonymous pulls per 6 hours per IPv4 address or IPv6 /64, and no exemption for GitHub-hosted runners | 2026-10-15 | docs.docker.com/docker-hub/usage (documented) |
 | `docker.io/library/node:24-alpine` is `lts-alpine`, digest `sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1`, node v24.21.0 | 2026-10-14 | Docker Hub |
 | `node --test worker/test/` fails on node 26.7.0; the quoted glob works on node 22, 24 and 26 | 2026-10-14 | node in containers |
 | the integration suite `10-pipeline.sh`: 98 of 98 in 314 to 490 s, in a 10-vCPU WSL VM with podman | 2026-10-14 | `tests/run.sh integration` |

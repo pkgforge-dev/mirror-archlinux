@@ -12,6 +12,15 @@
 # derives from sync.yml's own cron. Equal databases are current however old the
 # snapshot is: an upstream that does not move is not a mirror that stopped.
 #
+# ⛔ Upstream is never the first db_server that answers. scripts/upstream-db
+# reads every db_server. It refuses a body that is not a whole database, such
+# as an error page that answers 200. It drops a database that is behind
+# another, as scripts/plan step 3 does. It takes the first one left. So a
+# first db_server that lags or is stuck cannot hide a mirror that stopped, and
+# an error page cannot make a quiet repository stale. When every database is
+# behind another, the target is unknown. The issue body names each db_server
+# and its result.
+#
 # ⭐ This measures the outcome, not the runs. A schedule that stopped firing, a
 # run that is green and promotes nothing, a target held run after run by one
 # bad file: each ends here, as a database that has stopped following upstream.
@@ -24,10 +33,22 @@
 # track), it is stale: an unknown age is never a grace period. watchdog.yml
 # checks out the whole history for this.
 #
-# OUT/<target>.state   current fresh new stale unknown
+# ⛔ The check ends within STALENESS_BUDGET seconds (default 600), below the
+# staleness job's timeout-minutes (20). Each target gets a share: what is left
+# of the budget, divided by the targets not yet read. scripts/upstream-db
+# reads the db_servers within the share, and leaves a part of it for the
+# registry reads, which run under timeout(1) with what is left. A host that
+# fails is asked last by every later target (lib.sh down_mark), so a stalled
+# db_server costs one deadline per run. A target whose reads do not fit is
+# unknown, and its issue body names STALENESS_BUDGET.
+#
+# OUT/<target>.state   current fresh new stale unknown, written as soon as
+#                      the target is decided, so a check that is stopped
+#                      leaves the states it reached
 # OUT/<target>.md      the issue body for a stale or unknown target
 #
-# Environment: MIRROR_NOW (seconds) pins the clock, for the test suite only.
+# Environment: STALENESS_BUDGET (600 s). MIRROR_NOW (seconds) pins the clock,
+# for the test suite only.
 #
 # Exit status: 0 nothing stale, 3 at least one target stale or unknown, 1 the
 # check could not run.
@@ -36,12 +57,17 @@ SCRIPT_NAME=check-staleness
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-need curl jq awk sha256sum
+need curl jq awk sha256sum timeout tar
 
 out="${1:-}"
 [ -n "$out" ] || die "usage: scripts/check-staleness OUT [TARGET.conf ...]"
 shift
 [ -n "$MIRROR_NAMESPACE" ] || die "MIRROR_NAMESPACE is not set"
+STALENESS_BUDGET="${STALENESS_BUDGET:-600}"
+case "$STALENESS_BUDGET" in
+  '' | *[!0-9]* | 0) die "STALENESS_BUDGET must be a positive integer, not '$STALENESS_BUDGET'" ;;
+esac
+run_deadline=$((SECONDS + STALENESS_BUDGET))
 mkdir -p "$out"
 
 if [ "$#" -eq 0 ]; then
@@ -92,44 +118,89 @@ added_date() {
   printf '%s\n' "$added" "$enabled" | awk 'NF' | sort | tail -n 1
 }
 
+# The most one registry read of a target may take, when the share allows it.
+REG_MAX_TIME=300
+
+# in_time SECONDS CMD... -> the status of CMD, run under timeout(1): 124 or
+# 137 when it did not end within SECONDS. With less than 1 s, 124 at once.
+in_time() {
+  local t="$1" rc=0
+  shift
+  if [ "$t" -lt 1 ]; then
+    return 124
+  fi
+  if [ "$t" -gt "$REG_MAX_TIME" ]; then
+    t="$REG_MAX_TIME"
+  fi
+  timeout -k 5 "$t" "$@" || rc=$?
+  return "$rc"
+}
+
 worst=0
+left="$#"
 for conf in "$@"; do
   target_check "$conf"
   repo="$(target_get "$conf" repo)"
   name="$(target_get "$conf" arch)-$repo"
   repo_path="$(target_repository "$conf")"
-  rm -f "$out/$name.md"
+  rm -f "$out/$name.md" "$out/$name.state"
+  share=$(((run_deadline - SECONDS) / left))
+  if [ "$share" -lt 0 ]; then
+    share=0
+  fi
+  share_deadline=$((SECONDS + share))
+  left=$((left - 1))
+  cut=""
 
-  # What latest serves, through the wrapper's token flow
+  # What upstream serves now, within the share; a part of it is left for the
+  # registry reads below
+  upstream=""
+  up_dir="$work/$name.up"
+  rc=0
+  "$REPO_ROOT/scripts/upstream-db" "$conf" "$share" "$work/down" "$up_dir" STALENESS_BUDGET || rc=$?
+  case "$rc" in
+    0) upstream="$(sha256sum "$up_dir/upstream.db" | cut -d ' ' -f 1)" ;;
+    3)
+      if grep -q STALENESS_BUDGET "$up_dir/why"; then
+        cut="the db_server reads"
+      fi
+      ;;
+    *) die "scripts/upstream-db could not read $name (exit $rc)" "reproduce: scripts/upstream-db $conf $share DOWN OUT" ;;
+  esac
+
+  # What latest serves, with what is left of the share: the manifest gets
+  # half, the wrapper the rest
   promoted=""
   fetched=""
-  rc=0
-  REGISTRY_TOKEN='' PACMAN_OCI_NO_DUMMY=1 "$WRAPPER" "$work/$name.db.part" "$OCI_SCHEME://$MIRROR_REGISTRY/$repo_path/$repo.db" || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    promoted="$(sha256sum "$work/$name.db.part" | cut -d ' ' -f 1)"
-  fi
-  rc=0
-  REGISTRY_TOKEN='' registry_manifest "$repo_path" latest "$work/$name.json" || rc=$?
   latest_absent=0
-  if [ "$rc" -eq "$REG_STATUS_OK" ]; then
-    fetched="$(jq -r '.annotations["dev.pkgforge.mirror.fetched"] // empty' "$work/$name.json")"
-  elif [ "$rc" -eq "$REG_STATUS_ABSENT" ]; then
-    latest_absent=1
-  fi
-
-  # What upstream serves now
-  upstream=""
-  while IFS= read -r server; do
-    [ -n "$server" ] || continue
+  rc=0
+  # lib.sh registry_manifest in a shell of its own, so timeout(1) can end it
+  # shellcheck disable=SC2016 # expanded by that shell
+  in_time "$(((share_deadline - SECONDS) / 2))" env SCRIPT_NAME="$SCRIPT_NAME" REGISTRY_TOKEN='' \
+    bash -c 'set -euo pipefail; . "$1"; rc=0; registry_manifest "$2" latest "$3" || rc=$?; exit "$rc"' \
+    _ "$REPO_ROOT/scripts/lib.sh" "$repo_path" "$work/$name.json" || rc=$?
+  case "$rc" in
+    "$REG_STATUS_OK") fetched="$(jq -r '.annotations["dev.pkgforge.mirror.fetched"] // empty' "$work/$name.json")" ;;
+    "$REG_STATUS_ABSENT") latest_absent=1 ;;
+    124 | 137) cut="${cut:+$cut and }the read of $repo_path:latest" ;;
+  esac
+  # Through the wrapper's token flow, as a consumer reads it
+  if [ "$latest_absent" -eq 0 ]; then
     rc=0
-    fetch_upstream "$server/$repo.db" "$work/$name.up" || rc=$?
-    if [ "$rc" -eq 0 ]; then
-      upstream="$(sha256sum "$work/$name.up" | cut -d ' ' -f 1)"
-      break
-    fi
-  done <<< "$(target_all "$conf" db_server)"
+    in_time "$((share_deadline - SECONDS))" env REGISTRY_TOKEN='' PACMAN_OCI_NO_DUMMY=1 \
+      "$WRAPPER" "$work/$name.db.part" "$OCI_SCHEME://$MIRROR_REGISTRY/$repo_path/$repo.db" || rc=$?
+    case "$rc" in
+      0) promoted="$(sha256sum "$work/$name.db.part" | cut -d ' ' -f 1)" ;;
+      124 | 137) cut="${cut:+$cut and }the wrapper's read of $repo.db" ;;
+    esac
+  fi
 
   verdict="$(stale_verdict "$promoted" "$upstream" "$fetched" "$today" "$tolerance")"
+  # A read that the share cut short says nothing about the mirror: unknown,
+  # unless what was read already shows latest serves upstream's database.
+  if [ -n "$cut" ] && [ "$verdict" != current ]; then
+    verdict=unknown
+  fi
   added=""
   if [ "$verdict" = stale ] && [ "$latest_absent" -eq 1 ]; then
     added="$(added_date "$conf")"
@@ -137,33 +208,51 @@ for conf in "$@"; do
       verdict=new
     fi
   fi
-  printf '%s\n' "$verdict" > "$out/$name.state"
-  printf '%-24s %-8s promoted %s, fetched %s, upstream %s, tolerance %s day(s)%s\n' \
+  printf '%-24s %-8s promoted %s, fetched %s, upstream %s, tolerance %s day(s)%s%s\n' \
     "$name" "$verdict" "${promoted:-none}" "${fetched:-never}" "${upstream:-unreadable}" "$tolerance" \
-    "${added:+, target added or enabled $added}"
+    "${added:+, target added or enabled $added}" "${cut:+, cut short by STALENESS_BUDGET: $cut}"
 
   case "$verdict" in
-    current | fresh | new) continue ;;
+    current | fresh | new)
+      printf '%s\n' "$verdict" > "$out/$name.state"
+      continue
+      ;;
   esac
   worst=3
+  # The body first, then the state: a check that is stopped between the two
+  # leaves no state without its body.
   # shellcheck disable=SC2016 # Markdown backticks, not command substitution
   {
     printf '<!-- reported by scripts/check-staleness on %s -->\n' "$today"
-    printf '`%s` has stopped following upstream.\n\n' "$repo_path"
+    if [ "$verdict" = unknown ] && [ -z "$upstream" ] && [ -s "$up_dir/why" ]; then
+      printf 'Nothing can be said of `%s`: %s.\n\n' "$repo_path" "$(cat "$up_dir/why")"
+    elif [ "$verdict" = unknown ]; then
+      printf 'Nothing can be said of `%s`: %s did not end within the share of STALENESS_BUDGET.\n\n' "$repo_path" "$cut"
+    else
+      printf '`%s` has stopped following upstream.\n\n' "$repo_path"
+    fi
     printf '| | |\n| --- | --- |\n'
     printf '| verdict | %s |\n' "$verdict"
     printf '| `latest` serves | `%s` |\n' "${promoted:-nothing readable}"
     printf '| fetched | %s |\n' "${fetched:-never}"
-    printf '| upstream now | `%s` |\n' "${upstream:-no db_server answered}"
+    printf '| upstream now | `%s`%s |\n' "${upstream:-no db_server answered}" \
+      "$(if [ -s "$up_dir/server" ]; then printf ', from %s' "$(cat "$up_dir/server")"; fi)"
     if [ "$latest_absent" -eq 1 ]; then
       printf '| target file added or enabled | %s |\n' "${added:-unknown to git}"
     fi
-    printf '| tolerance | %s day(s), from sync.yml'"'"'s cron |\n\n' "$tolerance"
-    printf 'The latest sync runs and their summaries: %s\n\n' "$run_url"
+    printf '| tolerance | %s day(s), from sync.yml'"'"'s cron |\n' "$tolerance"
+    if [ -n "$cut" ]; then
+      printf '| cut short | %s, to fit the share (%ss) of STALENESS_BUDGET=%ss |\n' "$cut" "$share" "$STALENESS_BUDGET"
+    fi
+    printf '\n| db_server | result |\n| --- | --- |\n'
+    awk -F '\t' '{ gsub(/\|/, "\\|", $2); printf "| %s | %s |\n", $1, $2 }' "$up_dir/tried.tsv"
+    printf '\nThe latest sync runs and their summaries: %s\n\n' "$run_url"
     printf 'Each run'"'"'s summary names the state of every target (held, replaced, private, behind, error) and the files at fault.\n\n'
     printf 'reproduce:\n\n```bash\nPACMAN_OCI_NO_DUMMY=1 client/pacman-oci /tmp/%s.db.part oci://%s/%s/%s.db && sha256sum /tmp/%s.db.part\n```\n\n' \
       "$repo" "$MIRROR_REGISTRY" "$repo_path" "$repo" "$repo"
     printf 'This issue closes itself when the mirror follows upstream again.\n'
   } > "$out/$name.md"
+  printf '%s\n' "$verdict" > "$out/$name.state"
 done
+log "the reads took $((SECONDS + STALENESS_BUDGET - run_deadline))s of STALENESS_BUDGET=${STALENESS_BUDGET}s"
 exit "$worst"

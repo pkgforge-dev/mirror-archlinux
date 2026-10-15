@@ -9,7 +9,7 @@
 // Every response body that the stand-in returns is tracked. w.unusedBodies()
 // lists the ones the Worker neither read nor cancelled.
 
-import worker from '../src/index.js';
+import worker, { resetIsolate } from '../src/index.js';
 
 export const HOST = 'ghcr.mirror.example.test';
 export const REGISTRY = 'https://ghcr.io/v2/pkgforge-dev/mirror-archlinux';
@@ -108,6 +108,8 @@ class CacheStub {
 }
 
 export function world() {
+  // Each test starts in a new isolate.
+  resetIsolate();
   const clock = { now: T0 };
   const cache = new CacheStub(clock);
   const saved = {

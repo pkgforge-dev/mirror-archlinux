@@ -25,6 +25,7 @@ Keep these conventions in every change. The static suite enforces most of them.
 - Capture an exit status as `rc=0; cmd || rc=$?`, then act on it.
 - Give every curl call `--connect-timeout`, and `--max-time` or `--speed-time`, on its own command line.
 - Run every oras call under `timeout`.
+- Give `timeout` its kill delay as `-k N`, not `--kill-after=N`. The busybox unit leg runs the scripts, and busybox `timeout` refuses the long form.
 
 `tests/static/30-failures-stay-visible.sh` checks these rules in the shipped scripts and the workflows. It checks the oras rule in `scripts/` only. It does not check the `rc=0` form.
 

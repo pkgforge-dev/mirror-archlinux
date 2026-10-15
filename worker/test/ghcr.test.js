@@ -3,6 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { inWorld, REGISTRY, MANIFEST_TYPE, PKG, D, digest, hex, manifestJson, sha256hex } from './world.js';
+import { resetIsolate } from '../src/index.js';
 
 function assert502(res, w) {
   assert.equal(res.status, 502);
@@ -99,21 +100,19 @@ test('a blob that GHCR answers with 200 gets 502: the Worker never sends the byt
     };
     const res = await w.get(`/x86_64/core/${PKG}`);
     assert502(res, w);
+    assert.match(await res.text(), /^GHCR now answers blobs with 200; this Worker sends redirects only/);
     const blobBody = w.bodies.find((b) => isBlob(b.url));
     assert.equal(blobBody.read, false, 'the blob body is not read');
     assert.equal(blobBody.cancelled, true, 'the blob body is cancelled');
     assert.equal(w.cache.ofKind('loc').length, 0);
   }));
 
-test('the Location must be https and its host must end in .githubusercontent.com', () =>
+test('a Location that is not https, or not a URL, gets 502 and is not stored', () =>
   inWorld(async (w) => {
     const se = encodeURIComponent(new Date(w.clock.now + 400000).toISOString());
     const bad = [
       `http://pkg-containers.githubusercontent.com/b?se=${se}`,
-      `https://evil.example/b?se=${se}`,
-      `https://pkg-containers.githubusercontent.com.evil.example/b?se=${se}`,
-      `https://githubusercontent.com/b?se=${se}`,
-      `https://xgithubusercontent.com/b?se=${se}`,
+      `http://blobs.example.net/b?se=${se}`,
       `ftp://pkg-containers.githubusercontent.com/b?se=${se}`,
       '/relative/b',
       'not a url',
@@ -135,6 +134,33 @@ test('the Location must be https and its host must end in .githubusercontent.com
     const ok = await w.get(`/x86_64/core/${PKG}`);
     assert.equal(ok.status, 302);
     assert.equal(ok.headers.get('location'), `https://objects.githubusercontent.com/b?se=${se}`);
+    assert.equal(ok.headers.get('x-mirror-blob-host'), null, 'a host on *.githubusercontent.com is not marked');
+  }));
+
+test('a Location on an https host outside *.githubusercontent.com is served, marked, and logged once', () =>
+  inWorld(async (w) => {
+    const se = encodeURIComponent(new Date(w.clock.now + 400000).toISOString());
+    const hosts = ['blobs.example.net', 'pkg-containers.githubusercontent.com.evil.example', 'githubusercontent.com', 'xgithubusercontent.com'];
+    for (const [i, host] of hosts.entries()) {
+      const location = `https://${host}/x?se=${se}`;
+      const repo = `t${i}`;
+      w.manifest(`x86_64/${repo}:latest`, [
+        [`${repo}.db`, D.db],
+        [`${repo}.files`, D.files],
+      ]);
+      w.intercept = (url) => {
+        if (isBlob(url)) return w.response(307, '', { location }, { url });
+      };
+      // Two files, so two blob answers, then one of them again from the cache.
+      for (const file of [`${repo}.db`, `${repo}.files`, `${repo}.db`]) {
+        const res = await w.get(`/x86_64/${repo}/${file}`);
+        assert.equal(res.status, 302, `${host} ${file}`);
+        assert.equal(res.headers.get('location'), location);
+        assert.equal(res.headers.get('x-mirror-blob-host'), 'unexpected', `${host} ${file}`);
+      }
+    }
+    assert.equal(w.errors.length, 1, 'one console.error in this isolate');
+    assert.match(w.errors[0][0].error, /to blobs\.example\.net, not to a host on \*\.githubusercontent\.com/);
   }));
 
 test('a blob answer that is not a redirect gets 502, even with a Location', () =>
@@ -295,11 +321,134 @@ test('console.error is called on 5xx answers only', () =>
     assert.equal(w.errors[0][0].path, '/x86_64/core/other-1-1-any.pkg.tar.zst');
   }));
 
+// A GHCR that refuses the dummy token. A request with Bearer QQ== gets STATUS,
+// with a Bearer challenge for REALM when CHALLENGE is true; a request with
+// no authorization always gets 401 with the challenge. The realm answers
+// TOKEN, and the world's manifests and blobs answer only Bearer TOKEN.
+// w.tokenRequests lists the URLs asked of the realm's host.
+function refuseDummy(w, { status = 401, challenge = true, realm = 'https://ghcr.io/token', token = 'anon', expiresIn = 300 } = {}) {
+  w.tokenRequests = [];
+  const realmUrl = new URL(realm);
+  const www = { 'www-authenticate': `Bearer realm="${realm}",service="ghcr.io",scope="repository:user/image:pull"` };
+  w.intercept = (url, init) => {
+    const u = new URL(url);
+    if (u.host === realmUrl.host && u.pathname === realmUrl.pathname) {
+      w.tokenRequests.push(url);
+      const body = expiresIn === null ? { token } : { token, expires_in: expiresIn };
+      return w.response(200, JSON.stringify(body), { 'content-type': 'application/json' }, { url });
+    }
+    if (!url.startsWith(`${REGISTRY}/`)) return undefined;
+    const auth = init.headers?.authorization;
+    if (auth === `Bearer ${token}`) return undefined;
+    if (auth === undefined) return w.response(401, '{"errors":[{"code":"UNAUTHORIZED"}]}', www, { url });
+    return w.response(status, '{"errors":[{"code":"DENIED"}]}', challenge ? www : {}, { url });
+  };
+}
+
+const auths = (w) => w.requests.filter((r) => r.url.startsWith(`${REGISTRY}/`)).map((r) => r.init.headers?.authorization ?? 'none');
+
+test('GHCR refuses Bearer QQ==: one token request, then every file reads with that token', () =>
+  inWorld(async (w) => {
+    refuseDummy(w);
+    const db = await w.get('/x86_64/core/core.db');
+    assert.equal(db.status, 302);
+    assert.equal(new URL(db.headers.get('location')).pathname, `/ghcrblobs10/blobs/${D.db}`);
+    assert.equal(w.tokenRequests.length, 1, 'one token request');
+    const t = new URL(w.tokenRequests[0]);
+    assert.equal(t.searchParams.get('service'), 'ghcr.io');
+    assert.equal(t.searchParams.get('scope'), 'repository:pkgforge-dev/mirror-archlinux/x86_64/core:pull');
+    assert.deepEqual(auths(w), ['Bearer QQ==', 'Bearer anon', 'Bearer anon']);
+    assert.equal(w.errors.length, 1, 'the refusal is logged once');
+    assert.match(w.errors[0][0].error, /GHCR refused Bearer QQ==; the anonymous token flow is used/);
+    assert.equal(w.cache.ofKind('token').length, 1);
+    assert.equal(w.cache.ofKind('token')[0].ttl, 270, 'expires_in 300 less 30 s');
+    // A second request while the token lasts makes no token request, and
+    // sends the token at once.
+    const before = w.requests.length;
+    const pkg = await w.get(`/x86_64/core/${PKG}`);
+    assert.equal(pkg.status, 302);
+    assert.equal(w.tokenRequests.length, 1, 'no second token request');
+    assert.ok(auths({ requests: w.since(before) }).every((a) => a === 'Bearer anon'), JSON.stringify(auths({ requests: w.since(before) })));
+    assert.equal(w.errors.length, 1);
+  }));
+
+test('a new isolate reads the token from the cache: no token request', () =>
+  inWorld(async (w) => {
+    refuseDummy(w, { expiresIn: null });
+    await w.get('/x86_64/core/core.db');
+    assert.equal(w.cache.ofKind('token')[0].ttl, 240, 'no expires_in: 240 s');
+    resetIsolate();
+    const res = await w.get(`/x86_64/core/${PKG}`);
+    assert.equal(res.status, 302);
+    assert.equal(w.tokenRequests.length, 1);
+  }));
+
+test('a 403 with no challenge: one request with no authorization reads the challenge', () =>
+  inWorld(async (w) => {
+    refuseDummy(w, { status: 403, challenge: false });
+    const res = await w.get('/x86_64/core/core.db');
+    assert.equal(res.status, 302);
+    assert.equal(w.tokenRequests.length, 1);
+    assert.deepEqual(auths(w), ['Bearer QQ==', 'none', 'Bearer anon', 'Bearer anon']);
+  }));
+
+test('a kept token that GHCR refuses is replaced once; with no new token the 502 names the kept token', () =>
+  inWorld(async (w) => {
+    refuseDummy(w);
+    await w.get('/x86_64/core/core.db');
+    // GHCR now refuses anon, and the realm gives anon2.
+    const tokens = [];
+    w.intercept = (url, init) => {
+      const u = new URL(url);
+      if (u.host === 'ghcr.io' && u.pathname === '/token') {
+        tokens.push(url);
+        return w.response(200, '{"token":"anon2","expires_in":300}', {}, { url });
+      }
+      if (init.headers?.authorization === 'Bearer anon2') return undefined;
+      return w.response(401, '{}', { 'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io"' }, { url });
+    };
+    const before = w.requests.length;
+    const res = await w.get(`/x86_64/core/${PKG}`);
+    assert.equal(res.status, 302);
+    assert.equal(tokens.length, 1, 'one new token');
+    assert.deepEqual(auths({ requests: w.since(before) }).slice(0, 2), ['Bearer anon', 'Bearer anon2']);
+    // The realm stops answering: the refusal of the kept token is a 502 that
+    // names it.
+    w.intercept = (url) => {
+      if (new URL(url).pathname === '/token') return w.response(503, '', {}, { url });
+      return w.response(401, '{}', { 'www-authenticate': 'Bearer realm="https://ghcr.io/token",service="ghcr.io"' }, { url });
+    };
+    w.errors.length = 0;
+    const bad = await w.get('/x86_64/core/core.files');
+    assert502(bad, w);
+    // The latest manifest is still in the cache, so the blob is what GHCR refuses.
+    assert.match(await bad.text(), /GHCR answered 401 for the blob sha256:b{64} to the kept token, and the token request to https:\/\/ghcr\.io\/token answered 503/);
+  }));
+
+test('a realm that is not https on ghcr.io gets 502, and is never asked', () =>
+  inWorld(async (w) => {
+    for (const realm of ['https://evil.example/token', 'http://ghcr.io/token', 'https://ghcr.io.evil.example/token']) {
+      w.errors.length = 0;
+      resetIsolate();
+      refuseDummy(w, { realm });
+      const res = await w.get('/x86_64/extra/extra.db');
+      assert502(res, w);
+      assert.match(await res.text(), /not https on ghcr\.io/);
+      assert.equal(w.tokenRequests.length, 0, realm);
+    }
+    assert.equal(w.cache.ofKind('token').length, 0);
+  }));
+
 test('an unexpected error inside the Worker gets 502 with retry-after, not an error page', () =>
   inWorld(async (w) => {
+    // The status reads once inside the subrequest's own try, then breaks
+    // where nothing but the outermost handler catches it.
+    let reads = 0;
     w.intercept = () => ({
       get status() {
-        throw new Error('broken status');
+        reads += 1;
+        if (reads > 1) throw new Error('broken status');
+        return 200;
       },
       headers: new Headers(),
       body: null,

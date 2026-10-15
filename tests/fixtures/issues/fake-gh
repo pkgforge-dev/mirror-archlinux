@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# A stand-in for gh, for the unit tests of the scripts that raise and clear
+# issues through scripts/track-issue, and of the schedule checks. It makes no
+# network request.
+#
+#   PATH=<dir holding this file as gh>:$PATH FAKE_GH_DIR=DIR scripts/...
+#
+# Each answer comes from FAKE_GH_DIR:
+#   api repos/O/R/issues?state=open...            open.json, or [] when absent
+#   api repos/O/R/labels/L                        {}
+#   api -X POST repos/O/R/issues ...              {"number": 101}
+#   api -X PATCH repos/O/R/issues/N ...           {}
+#   api -X POST repos/O/R/issues/N/comments ...   {}
+#   api repos/O/R/actions/workflows?...           workflows.json
+#   api -X PUT repos/O/R/actions/workflows/ID/enable   nothing
+#   api repos/O/R/actions/workflows/F/runs?...    runs-F.json; absent: HTTP 404
+#   api repos/O/R/actions/workflows/F             workflow-F.json; absent: HTTP 404
+# --jq EXPR is applied to the answer. Any other call fails, and says so.
+#
+# FAKE_GH_DIR/calls.log gets one line for each call that changes something:
+#   open KEY        a new issue whose body carries <!-- track: KEY -->
+#   update N KEY    issue N, its body rewritten
+#   comment N       a comment on issue N
+#   close N         issue N closed
+#   enable ID       workflow ID enabled
+# The body of each open and update goes to FAKE_GH_DIR/body-KEY.md.
+set -euo pipefail
+
+dir="${FAKE_GH_DIR:?FAKE_GH_DIR is not set}"
+if [ "${1:-}" != api ]; then
+  echo "fake-gh: only gh api is answered, not: gh $*" >&2
+  exit 1
+fi
+shift
+method=GET
+path=""
+jq_expr=""
+body=""
+state=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -X | --method) method="$2"; shift 2 ;;
+    --jq | -q) jq_expr="$2"; shift 2 ;;
+    -f | -F | --raw-field | --field)
+      case "$2" in
+        body=*) body="${2#body=}" ;;
+        state=*) state="${2#state=}" ;;
+      esac
+      shift 2
+      ;;
+    -*) shift ;;
+    *) path="${1#/}"; shift ;;
+  esac
+done
+
+answer() {
+  if [ -n "$jq_expr" ]; then
+    jq -r "$jq_expr"
+  else
+    cat
+  fi
+}
+
+# from FILE: FILE's bytes as the answer, or HTTP 404 when there is no FILE
+from() {
+  if [ -f "$1" ]; then
+    answer < "$1"
+  else
+    echo "gh: Not Found (HTTP 404)"
+    exit 1
+  fi
+}
+
+key_of() {
+  printf '%s\n' "$1" | sed -n 's/^<!-- track: \([a-z0-9._-]*\) -->$/\1/p' | sed -n 1p
+}
+
+keep_body() {
+  local k
+  k="$(key_of "$body")"
+  printf '%s\n' "$body" > "$dir/body-${k:-none}.md"
+  printf '%s\n' "${k:-none}"
+}
+
+route="${path%%\?*}"
+case "$method $route" in
+  "GET repos/"*/*/issues)
+    if [ -f "$dir/open.json" ]; then answer < "$dir/open.json"; else echo '[]' | answer; fi
+    ;;
+  "GET repos/"*/*/labels/*) echo '{}' | answer ;;
+  "POST repos/"*/*/issues)
+    printf 'open %s\n' "$(keep_body)" >> "$dir/calls.log"
+    echo '{"number": 101}' | answer
+    ;;
+  "PATCH repos/"*/*/issues/[0-9]*)
+    n="${route##*/}"
+    if [ -n "$state" ]; then
+      printf 'close %s\n' "$n" >> "$dir/calls.log"
+    else
+      printf 'update %s %s\n' "$n" "$(keep_body)" >> "$dir/calls.log"
+    fi
+    echo '{}' | answer
+    ;;
+  "POST repos/"*/*/issues/[0-9]*/comments)
+    n="${route%/comments}"
+    printf 'comment %s\n' "${n##*/}" >> "$dir/calls.log"
+    echo '{}' | answer
+    ;;
+  "GET repos/"*/*/actions/workflows) from "$dir/workflows.json" ;;
+  "PUT repos/"*/*/actions/workflows/*/enable)
+    id="${route%/enable}"
+    printf 'enable %s\n' "${id##*/}" >> "$dir/calls.log"
+    ;;
+  "GET repos/"*/*/actions/workflows/*/runs)
+    f="${route%/runs}"
+    from "$dir/runs-${f##*/}.json"
+    ;;
+  "GET repos/"*/*/actions/workflows/*) from "$dir/workflow-${route##*/}.json" ;;
+  *)
+    echo "fake-gh: no answer for: $method $path" >&2
+    exit 1
+    ;;
+esac

@@ -10,7 +10,9 @@
 #           branch status as one orphan commit, and the site to Pages as an
 #           artifact
 #   deploy  actions/deploy-pages, on main, when Pages takes a workflow build
-#   worker  on main: raises or clears worker-down from the record build pushed
+#   worker  on main, whatever build did: scripts/check-status-record raises
+#           or clears status-down and worker-down from the record on the
+#           branch status
 #
 # ⚠ A person enables Pages once, with an admin token. GITHUB_TOKEN cannot:
 #   gh api -X POST repos/pkgforge-dev/mirror-archlinux/pages -f build_type=workflow
@@ -302,9 +304,13 @@ jobs:
   # The Worker check reads the record build has just pushed to the status
   # branch. Here, not in watchdog.yml: an hourly cron there would cancel a
   # pending daily run, which shares its concurrency group.
+  #
+  # ⛔ It runs whatever build did. A build that fails pushes no record, and
+  # then this job raises status-down: a status page that stops changing is an
+  # issue, not only a red run.
   worker:
     needs: build
-    if: ${{ !cancelled() && needs.build.result == 'success' && github.ref == 'refs/heads/main' }}
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -314,43 +320,32 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Raise worker-down after failed probes in 2 runs in a row, over 50 minutes
+      - name: Raise status-down or worker-down from the record on the status branch
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build.result }}
         run: |
           # status.yml probes the Worker each hour, and once more after each
           # sync, so two runs can be minutes apart. scripts/status-collect
           # counts the runs in a row with a failed probe and the time since
-          # the first; it sets worker.down when both reach its limits. This
-          # reads its last record from the status branch.
+          # the first; it sets worker.down when both reach its limits.
+          # scripts/check-status-record reads that record, and raises
+          # status-down when build failed or the record is too old.
           rc=0
           git ls-remote --exit-code --heads origin status > "$RUNNER_TEMP/heads.txt" || rc=$?
           case "$rc" in
-            0) ;;
-            2)
-              echo "::notice::no status branch yet: status.yml has recorded no Worker probe"
-              exit 0
+            0)
+              git fetch --quiet --depth 1 origin status
+              for f in status.json worker.md; do
+                if git cat-file -e "FETCH_HEAD:$f"; then
+                  git show "FETCH_HEAD:$f" > "$RUNNER_TEMP/$f"
+                fi
+              done
               ;;
+            2) echo "::notice::no status branch yet: status.yml has recorded nothing" ;;
             *)
               echo "::error::git ls-remote origin status ended $rc"
               exit "$rc"
               ;;
           esac
-          git fetch --quiet --depth 1 origin status
-          git show FETCH_HEAD:status.json > "$RUNNER_TEMP/status.json"
-          git show FETCH_HEAD:worker.md > "$RUNNER_TEMP/worker.md"
-          read -r generated age failed ok down span <<< "$(jq -r '[.generated, (now - .generated_epoch | floor), .worker.failed_runs, .worker.ok, .worker.down, .worker.failing_seconds] | map(tostring) | join(" ")' "$RUNNER_TEMP/status.json")"
-          echo "status.json from $generated, $age s ago: Worker ok $ok, failed $failed run(s) in a row over $span s, down $down"
-          # Three status runs missed: the record says nothing about now.
-          if [ "$age" -gt 10800 ]; then
-            echo "::error::the last Worker probe is from $generated, $age s ago; status.yml has stopped recording"
-            echo "  reproduce: git fetch origin status && git show FETCH_HEAD:status.json | jq '{generated, worker}'"
-            exit 1
-          fi
-          if [ "$ok" = true ]; then
-            scripts/track-issue clear worker-down "The Worker passes its probes again, measured $generated: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/status/worker.md"
-          elif [ "$down" = true ]; then
-            scripts/track-issue raise worker-down "The Worker fails its probe" "$RUNNER_TEMP/worker.md"
-          else
-            echo "nothing to raise or clear: worker-down opens at failed probes in 2 runs in a row over 50 minutes or more (status.json .worker.down_after)"
-          fi
+          scripts/check-status-record "$BUILD_RESULT" "$RUNNER_TEMP/status.json" "$RUNNER_TEMP/worker.md"

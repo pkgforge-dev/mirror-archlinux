@@ -7,9 +7,11 @@
 //
 // The Worker sends no package bytes. It finds the blob digest of the file in
 // the manifest, asks GHCR for that blob, and returns GHCR's redirect to the
-// signed blob URL. A GHCR answer that holds the bytes gets 502. pacman checks
-// the sha256 of each file against the database and each signature against the
-// keyring, as for every mirror.
+// signed blob URL. A GHCR answer that holds the bytes gets 502, and so does a
+// redirect that is not https. A redirect to a host outside
+// *.githubusercontent.com is sent with x-mirror-blob-host: unexpected. pacman
+// checks the sha256 of each file against the database and each signature
+// against the keyring, as for every mirror.
 //
 // Paths:
 //   /                            this usage text
@@ -26,7 +28,8 @@
 //
 // Answers: 302 to the signed URL; 404 when the mirror does not hold the file;
 // 502 with retry-after: 30 when GHCR fails or answers something unexpected.
-// HEAD gets the same answer as GET, with no body.
+// HEAD gets the same answer as GET, with no body. Every 302 and 404 has
+// x-mirror-cache: hit (from its loc entry), miss (stored now) or nostore.
 //
 // Cache: the Cache API, one cache per data centre. Every key is on the zone
 // host under /__cache/v1, so a change of entry format only needs a new version.
@@ -39,15 +42,27 @@
 //         with FILE and FILE.sig 6 h, without the .sig 60 s; latest 30 s;
 //         a 404 60 s.
 //   blob  one key per (repository, digest): the signed URL, TTL as for loc.
+//   token one key per repository: a pull token, used only after GHCR refused
+//         Bearer QQ==. TTL: expires_in less 30 s, at most 300 s; 240 s with
+//         no expires_in.
 // A package request also fills the loc entry of its .sig (ctx.waitUntil).
 //
-// Logs: console.error on every 5xx path and on every cache failure. Nothing
+// GHCR token: every subrequest sends the dummy token Bearer QQ==. When GHCR
+// answers it with 401 or 403, the Worker reads the Bearer challenge, asks its
+// realm (https on ghcr.io only) for a pull token, and sends the subrequest
+// again with it. From then on the isolate sends the kept token first.
+//
+// Logs: console.error on every 5xx path and on every cache failure, and once
+// per isolate when GHCR refuses Bearer QQ==, redirects a blob to a host
+// outside *.githubusercontent.com, or signs a URL with no usable se. Nothing
 // else is logged.
 //
 // Tests: tests/worker/10-node.sh runs worker/test/*.test.js. tests/worker/live.sh
 // checks the deployed Worker when WORKER_LIVE=1.
 
-const REGISTRY = 'https://ghcr.io/v2/pkgforge-dev/mirror-archlinux';
+const REGISTRY_HOST = 'ghcr.io';
+const NAMESPACE = 'pkgforge-dev/mirror-archlinux';
+const REGISTRY = `https://${REGISTRY_HOST}/v2/${NAMESPACE}`;
 const AUTH = 'Bearer QQ==';
 const MANIFEST_TYPE = 'application/vnd.oci.image.manifest.v1+json';
 const TITLE = 'org.opencontainers.image.title';
@@ -70,7 +85,24 @@ export const TTL = Object.freeze({
   urlMax: 600,
   urlMin: 30,
   urlMargin: 120,
+  tokenMax: 300,
+  tokenMargin: 30,
+  tokenDefault: 240,
 });
+
+// What one isolate keeps between its requests. The runtime starts and ends
+// isolates as it likes, so each value is a shortcut and never the only copy.
+//   dummyRefused  GHCR refused Bearer QQ== in this isolate
+//   tokens        repository path -> { token, expires }, as in the cache
+//   said          the keys of the messages logged once per isolate
+const isolate = { dummyRefused: false, tokens: new Map(), said: new Set() };
+
+// The state of a new isolate. The tests call it before each test.
+export function resetIsolate() {
+  isolate.dummyRefused = false;
+  isolate.tokens.clear();
+  isolate.said.clear();
+}
 
 // The URL before the file name is decoded. ARCH and REPO are the GHCR path
 // names; a reference is a tag or a pin. FILE is printable ASCII with no /,
@@ -170,10 +202,20 @@ async function readCapped(job, res, max) {
   return out;
 }
 
-// One GHCR subrequest: anonymous token, no redirect followed, 10 s deadline.
-function ghcr(url, headers = {}) {
+// console.error once per isolate for each KEY.
+function logOnce(job, key, status, error) {
+  if (isolate.said.has(key)) return;
+  isolate.said.add(key);
+  logError(job, status, error);
+}
+
+// One subrequest: AUTHORIZATION (none when null), no redirect followed, 10 s
+// deadline.
+function send(url, authorization, headers = {}) {
+  const h = { ...headers };
+  if (authorization !== null) h.authorization = authorization;
   return fetch(url, {
-    headers: { authorization: AUTH, ...headers },
+    headers: h,
     redirect: 'manual',
     signal: AbortSignal.timeout(LIMITS.subrequestMs),
   });
@@ -227,6 +269,110 @@ function store(job, key, entry, ttl) {
 
 function secondsLeft(expires) {
   return Math.floor((expires - Date.now()) / 1000);
+}
+
+//---------------------------------------------------------------------------//
+// GHCR subrequests. Every public package accepts the dummy token Bearer QQ==,
+// which saves the token request. When GHCR refuses it (401 or 403), the
+// Worker uses the registry's own anonymous flow: the Bearer challenge names a
+// realm, which must be https on ghcr.io, and the realm gives a pull token for
+// the repository. The token is kept in this isolate and in the cache, for
+// expires_in less 30 s, at most 300 s (240 s with no expires_in), and each
+// later subrequest for the repository sends it first. A subrequest makes at
+// most one token request.
+//---------------------------------------------------------------------------//
+
+// The realm of a Bearer challenge, or null.
+function bearerRealm(www) {
+  if (typeof www !== 'string' || !/^\s*bearer\s/i.test(www)) return null;
+  const m = /\brealm="([^"]*)"/i.exec(www);
+  return m ? m[1] : null;
+}
+
+// A pull token for REPOPATH that this isolate or the cache holds, or null.
+async function tokenKept(job, repoPath) {
+  const mem = isolate.tokens.get(repoPath);
+  if (mem && mem.expires > Date.now()) return mem.token;
+  const hit = await cacheGet(job, cacheKey(job.host, 'token', [repoPath]));
+  if (!hit || typeof hit.token !== 'string' || hit.token === '') return null;
+  isolate.tokens.set(repoPath, hit);
+  return hit.token;
+}
+
+// A new pull token for REPOPATH from the realm of GHCR's Bearer challenge.
+// REFUSED is the status of the answer that refused USED (the dummy token or
+// the kept token), and WWW its www-authenticate header. Throws with the
+// reason when there is no token.
+async function tokenNew(job, repoPath, url, what, used, refused, www) {
+  const why = `GHCR answered ${refused} for ${what} to ${used}`;
+  let realm = bearerRealm(www);
+  if (realm === null && refused === 403) {
+    // GHCR answers 403 with no challenge; a request with no authorization
+    // gets 401 with one.
+    const bare = await send(url, null);
+    realm = bearerRealm(bare.headers.get('www-authenticate'));
+    await discard(job, bare);
+  }
+  if (realm === null) throw new Error(`${why}, and sent no Bearer challenge`);
+  let u;
+  try {
+    u = new URL(realm);
+  } catch {
+    throw new Error(`${why}, and its Bearer challenge names the realm ${realm}, which is not a URL`);
+  }
+  if (u.protocol !== 'https:' || u.hostname !== REGISTRY_HOST) {
+    throw new Error(`${why}, and its Bearer challenge names the realm ${realm}, not https on ${REGISTRY_HOST}`);
+  }
+  u.searchParams.set('service', REGISTRY_HOST);
+  u.searchParams.set('scope', `repository:${NAMESPACE}/${repoPath}:pull`);
+  const res = await send(u.href, null);
+  if (res.status !== 200) {
+    await discard(job, res);
+    throw new Error(`${why}, and the token request to ${u.origin}${u.pathname} answered ${res.status}`);
+  }
+  const bytes = await readCapped(job, res, LIMITS.manifestBytes);
+  if (bytes === null) throw new Error(`${why}, and the token answer is over ${LIMITS.manifestBytes} bytes`);
+  let body;
+  try {
+    body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  } catch (e) {
+    throw new Error(`${why}, and the token answer is not JSON: ${e}`);
+  }
+  const token = [body?.token, body?.access_token].find((t) => typeof t === 'string' && t !== '');
+  if (token === undefined) throw new Error(`${why}, and the token answer holds no token`);
+  const ttl = Number.isFinite(body.expires_in) ? Math.min(body.expires_in - TTL.tokenMargin, TTL.tokenMax) : TTL.tokenDefault;
+  if (ttl >= 1) {
+    const entry = { token, expires: Date.now() + ttl * 1000 };
+    isolate.tokens.set(repoPath, entry);
+    store(job, cacheKey(job.host, 'token', [repoPath]), entry, ttl);
+  }
+  return token;
+}
+
+// One GHCR subrequest for REPOPATH, with the kept token once GHCR refused the
+// dummy token in this isolate, else with the dummy token. A 401 or 403 is
+// asked again once with a pull token: the kept one, else a new one. WHAT
+// names the object in messages. Throws when no token can be had.
+async function ghcr(job, repoPath, url, what, headers = {}) {
+  const kept = isolate.dummyRefused ? await tokenKept(job, repoPath) : null;
+  const first = await send(url, kept === null ? AUTH : `Bearer ${kept}`, headers);
+  const refused = first.status;
+  if (refused !== 401 && refused !== 403) return first;
+  const www = first.headers.get('www-authenticate');
+  await discard(job, first);
+  let token = null;
+  if (kept === null) {
+    isolate.dummyRefused = true;
+    logOnce(job, 'dummy', refused, `GHCR refused ${AUTH}; the anonymous token flow is used`);
+    token = await tokenKept(job, repoPath);
+  } else {
+    // GHCR refused the kept token: it is not used again.
+    isolate.tokens.delete(repoPath);
+  }
+  if (token === null) {
+    token = await tokenNew(job, repoPath, url, what, kept === null ? AUTH : 'the kept token', refused, www);
+  }
+  return send(url, `Bearer ${token}`, headers);
 }
 
 //---------------------------------------------------------------------------//
@@ -288,7 +434,9 @@ async function manifestOf(job, r) {
   if (hit) return hit;
   let up;
   try {
-    up = await ghcr(`${REGISTRY}/${r.repoPath}/manifests/${r.ref}`, { accept: MANIFEST_TYPE });
+    up = await ghcr(job, r.repoPath, `${REGISTRY}/${r.repoPath}/manifests/${r.ref}`, `the manifest ${r.repoRef}`, {
+      accept: MANIFEST_TYPE,
+    });
   } catch (e) {
     return fail(job, `the GHCR request for the manifest ${r.repoRef} failed: ${e}`);
   }
@@ -341,14 +489,16 @@ async function blobOf(job, r, digest) {
   if (hit) return hit;
   let up;
   try {
-    up = await ghcr(`${REGISTRY}/${r.repoPath}/blobs/${digest}`);
+    up = await ghcr(job, r.repoPath, `${REGISTRY}/${r.repoPath}/blobs/${digest}`, `the blob ${digest}`);
   } catch (e) {
     return fail(job, `the GHCR request for the blob ${digest} of ${r.repoPath} failed: ${e}`);
   }
   // The Worker never reads a blob body: it sends redirects only.
   await discard(job, up);
-  if (up.status === 404) return text(404, `GHCR has no blob ${digest} in ${r.repoPath}`);
-  if (up.status === 200) return fail(job, `GHCR answered 200 with the bytes of ${digest}; this Worker sends redirects only`);
+  if (up.status === 404) return text(404, `GHCR has no blob ${digest} in ${r.repoPath}`, { 'x-mirror-cache': 'nostore' });
+  if (up.status === 200) {
+    return fail(job, `GHCR now answers blobs with 200; this Worker sends redirects only (${digest} of ${r.repoPath})`);
+  }
   if (up.status < 300 || up.status > 399) return fail(job, `GHCR answered ${up.status} for the blob ${digest}`);
   const location = up.headers.get('location');
   let u;
@@ -357,33 +507,51 @@ async function blobOf(job, r, digest) {
   } catch {
     return fail(job, `GHCR answered ${up.status} for the blob ${digest} with no valid Location`);
   }
-  if (u.protocol !== 'https:' || !u.hostname.endsWith(BLOB_HOST_SUFFIX)) {
-    return fail(job, `GHCR redirected the blob ${digest} to ${u.protocol}//${u.hostname}, not https on *${BLOB_HOST_SUFFIX}`);
+  if (u.protocol !== 'https:') {
+    return fail(job, `GHCR redirected the blob ${digest} to ${u.protocol}//${u.hostname}, not https`);
+  }
+  // GitHub moves its download hosts. pacman checks every sha256 and every
+  // signature, and the Location comes from GHCR over TLS, so a host outside
+  // *.githubusercontent.com is still served, marked and logged.
+  const unexpected = !u.hostname.endsWith(BLOB_HOST_SUFFIX);
+  if (unexpected) {
+    logOnce(job, 'blob-host', 302, `GHCR redirected the blob ${digest} to ${u.hostname}, not to a host on *${BLOB_HOST_SUFFIX}; it is served with x-mirror-blob-host: unexpected`);
   }
   const now = Date.now();
   const se = Date.parse(u.searchParams.get('se') || '');
   const expires = Number.isFinite(se) ? Math.min(se - TTL.urlMargin * 1000, now + TTL.urlMax * 1000) : now;
-  const entry = { location, expires };
+  const entry = { location, expires, unexpected };
   const ttl = secondsLeft(expires);
-  if (ttl >= TTL.urlMin) store(job, key, entry, ttl);
+  if (ttl >= TTL.urlMin) {
+    store(job, key, entry, ttl);
+  } else {
+    // Each request for this file then asks GHCR again. The Worker does not
+    // guess a time to live from other parameters.
+    logOnce(job, 'no-se', 302, `signed URL without a usable se; not cached (the blob ${digest} of ${r.repoPath}, se ${u.searchParams.get('se') ?? 'absent'})`);
+  }
   return entry;
 }
 
-function respond(answer) {
+// The answer as a Response. CACHE says where it stands with its loc entry:
+// hit (read from it), miss (stored now) or nostore (not stored).
+function respond(answer, cache) {
   if (answer.status === 302) {
-    return new Response(null, { status: 302, headers: { location: answer.location, 'cache-control': 'no-store' } });
+    const headers = { location: answer.location, 'cache-control': 'no-store', 'x-mirror-cache': cache };
+    if (answer.unexpected === true) headers['x-mirror-blob-host'] = 'unexpected';
+    return new Response(null, { status: 302, headers });
   }
-  return text(404, answer.message);
+  return text(404, answer.message, { 'x-mirror-cache': cache });
 }
 
-// Stores the final answer under the loc key until answer.expires. A redirect
-// is not stored when its signed URL has less than 30 s left before se minus
-// 120 s (urlExpires).
+// Stores the final answer under the loc key until answer.expires, and says
+// whether it did. A redirect is not stored when its signed URL has less than
+// 30 s left before se minus 120 s (urlExpires).
 function storeAnswer(job, key, answer, urlExpires) {
   const ttl = secondsLeft(answer.expires);
-  if (ttl < 1) return;
-  if (answer.status === 302 && secondsLeft(urlExpires) < TTL.urlMin) return;
+  if (ttl < 1) return false;
+  if (answer.status === 302 && secondsLeft(urlExpires) < TTL.urlMin) return false;
   store(job, key, answer, ttl);
+  return true;
 }
 
 // The answer for FILE from the manifest entry MAN.
@@ -391,8 +559,7 @@ async function answerFrom(job, r, man, file) {
   const key = cacheKey(job.host, 'loc', [r.arch, r.repo, r.ref, file]);
   const missing = (message) => {
     const answer = { status: 404, message, expires: Math.min(man.expires, Date.now() + TTL.missing * 1000) };
-    storeAnswer(job, key, answer);
-    return respond(answer);
+    return respond(answer, storeAnswer(job, key, answer) ? 'miss' : 'nostore');
   };
   if (!man.found) return missing(`GHCR has no ${r.repoRef}`);
   const hits = man.layers.filter(([t]) => t === file);
@@ -403,9 +570,8 @@ async function answerFrom(job, r, man, file) {
   }
   const blob = await blobOf(job, r, digest);
   if (blob instanceof Response) return blob;
-  const answer = { status: 302, location: blob.location, expires: Math.min(blob.expires, man.expires) };
-  storeAnswer(job, key, answer, blob.expires);
-  return respond(answer);
+  const answer = { status: 302, location: blob.location, expires: Math.min(blob.expires, man.expires), unexpected: blob.unexpected === true };
+  return respond(answer, storeAnswer(job, key, answer, blob.expires) ? 'miss' : 'nostore');
 }
 
 // Fills the loc entry of a package's .sig while the package answer is made
@@ -432,9 +598,9 @@ async function route(job, request, ctx) {
     return text(200, usage(url.host), { 'cache-control': 'max-age=3600' });
   }
   const r = await parsePath(url.pathname);
-  if (r.refuse) return text(404, r.refuse);
+  if (r.refuse) return text(404, r.refuse, { 'x-mirror-cache': 'nostore' });
   const hot = await cacheGet(job, cacheKey(job.host, 'loc', [r.arch, r.repo, r.ref, r.file]));
-  if (hot) return respond(hot);
+  if (hot) return respond(hot, 'hit');
   const man = await manifestOf(job, r);
   if (man instanceof Response) return man;
   // The .sig blob is asked for at the same time as the package blob.

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+#
+# Raise or clear status-down and worker-down from the record that the build
+# job of status.yml pushes to the branch status. The worker job of status.yml
+# runs this on main after each build, also a build that failed.
+#
+#   scripts/check-status-record BUILD_RESULT STATUS_JSON WORKER_MD
+#
+# BUILD_RESULT is the result of the build job: success, failure, cancelled or
+# skipped. STATUS_JSON and WORKER_MD are status.json and worker.md of the
+# branch status. A path that does not exist is a record that does not exist.
+#
+#   status-down  raised when build did not succeed, or when the record is
+#                missing or older than STATUS_MAX_AGE (10800 s: three hourly
+#                runs missed). Cleared when build succeeded and the record is
+#                fresh. scripts/check-status-site (watchdog.yml) raises it
+#                too, when status.yml stops running at all.
+#   worker-down  judged from a fresh record only: raised on worker.down,
+#                cleared on worker.ok. An older record says nothing about now.
+#
+# ⛔ A build that fails pushes no record. So this runs whatever build did, and
+# a status page that stops changing is an issue, not only a red run.
+#
+# Environment: GH_TOKEN and GITHUB_REPOSITORY for scripts/track-issue;
+# GITHUB_SERVER_URL and GITHUB_RUN_ID name the run. MIRROR_NOW (seconds) pins
+# the clock, for the test suite only.
+#
+# Exit status: 0 done; 1 the record is missing or too old, or an issue could
+# not be updated.
+set -euo pipefail
+SCRIPT_NAME=check-status-record
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+need jq
+
+[ "$#" -eq 3 ] || die "usage: scripts/check-status-record BUILD_RESULT STATUS_JSON WORKER_MD"
+build="$1"
+json="$2"
+worker_md="$3"
+STATUS_MAX_AGE=10800
+
+slug="${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}"
+server="${GITHUB_SERVER_URL:-https://github.com}"
+run_url="$server/$slug/actions/runs/${GITHUB_RUN_ID:-0}"
+record_url="$server/$slug/blob/status/status.json"
+now="$(now_epoch)"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# The record: its time, and its age in seconds
+generated=""
+age=""
+if [ -f "$json" ]; then
+  rc=0
+  vals="$(jq -r '[.generated, .generated_epoch] | map(tostring) | join(" ")' "$json" 2> "$work/jq.err")" || rc=$?
+  epoch=""
+  read -r generated epoch <<< "$vals"
+  if [ "$rc" -eq 0 ] && [[ "$epoch" =~ ^[0-9]+$ ]]; then
+    age=$((now - epoch))
+  else
+    warn "$json does not read as a status record" "$(cat "$work/jq.err")" "reproduce: jq '{generated, generated_epoch}' $json"
+    generated=""
+  fi
+fi
+fresh=0
+if [ -n "$age" ] && [ "$age" -le "$STATUS_MAX_AGE" ]; then
+  fresh=1
+fi
+if [ -n "$age" ]; then
+  said="the record on branch status was measured $generated, ${age}s before this check"
+else
+  said="branch status holds no status.json that reads"
+fi
+log "build $build; $said"
+
+# shellcheck disable=SC2016 # Markdown backticks, not command substitution
+{
+  printf '<!-- written by scripts/check-status-record -->\n'
+  if [ "$build" != success ]; then
+    printf 'The build job of `status.yml` ended `%s`, so it pushed no record: %s\n\n' "$build" "$run_url"
+  else
+    printf 'The record that `status.yml` reads back is too old to say anything about now.\n\n'
+  fi
+  printf -- '- %s: %s\n' "$said" "$record_url"
+  printf -- '- a fresh record is at most %s s old: each hourly run writes one\n\n' "$STATUS_MAX_AGE"
+  printf 'While this lasts, the status page, the badges and the `worker-down` check show an old state.\n\n'
+  printf 'reproduce:\n\n```bash\ngh run list --workflow status.yml --limit 5\ngit fetch origin status && git show FETCH_HEAD:status.json | jq '"'"'{generated, worker}'"'"'\n```\n\n'
+  printf 'This issue closes itself when a build of `status.yml` succeeds and its record is fresh.\n'
+} > "$work/status-down.md"
+
+if [ "$build" != success ] || [ "$fresh" -eq 0 ]; then
+  "$REPO_ROOT/scripts/track-issue" raise status-down "status.yml does not record the status of the mirror" "$work/status-down.md"
+else
+  "$REPO_ROOT/scripts/track-issue" clear status-down "\`status.yml\` recorded the status again, measured $generated: $run_url"
+fi
+
+# worker-down, from a fresh record only
+if [ "$fresh" -eq 1 ]; then
+  read -r ok down failed span <<< "$(jq -r '[.worker.ok, .worker.down, .worker.failed_runs, .worker.failing_seconds] | map(tostring) | join(" ")' "$json")"
+  log "Worker ok $ok, failed $failed run(s) in a row over $span s, down $down"
+  if [ "$ok" = true ]; then
+    "$REPO_ROOT/scripts/track-issue" clear worker-down "The Worker passes its probes again, measured $generated: $server/$slug/blob/status/worker.md"
+  elif [ "$down" = true ]; then
+    if [ ! -f "$worker_md" ]; then
+      printf 'The Worker fails its probe, and branch status holds no worker.md. Read status.json: %s\n' "$record_url" > "$work/worker.md"
+      worker_md="$work/worker.md"
+    fi
+    "$REPO_ROOT/scripts/track-issue" raise worker-down "The Worker fails its probe" "$worker_md"
+  else
+    log "nothing to raise or clear: worker-down opens at failed probes in 2 runs in a row over 50 minutes or more (status.json .worker.down_after)"
+  fi
+else
+  log "worker-down is not judged: $said"
+fi
+
+if [ "$fresh" -eq 0 ]; then
+  die "status.yml has stopped recording: $said" \
+    "reproduce: git fetch origin status && git show FETCH_HEAD:status.json | jq '{generated, worker}'"
+fi
+exit 0

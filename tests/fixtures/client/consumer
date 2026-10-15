@@ -27,6 +27,9 @@
 #   norange      -Sy and -S big with PACMAN_OCI_PREFETCH=0 from a plain http
 #                Server that ignores Range and stops sending big for 35 s
 #                after its first 64 KiB
+#   token        -Sy and -S alpha beta gamma through the proxy that refuses
+#                the dummy token and gives an anonymous token
+#   token-nodummy  the same with PACMAN_OCI_NO_DUMMY=1
 #
 # Exit status: 0 the case ran (its results say how it went), 1 it could not.
 set -euo pipefail
@@ -199,6 +202,20 @@ EOS
     sync sy -Sy
     sync s -S big
     installed big
+    ;;
+  token | token-nodummy)
+    conf yes 'Required DatabaseOptional'
+    if [ "$case_name" = token-nodummy ]; then
+      export PACMAN_OCI_NO_DUMMY=1
+    fi
+    sync sy -Sy
+    sync s -S alpha beta gamma
+    for l in sy s; do
+      result "${l}_said_refused" "$(count 'refused the dummy token Bearer QQ==; the anonymous token flow is used' "/tmp/$l.err")"
+      result "${l}_token_get" "$(count 'pacman-oci: token: GET ' "/tmp/$l.err")"
+    done
+    installed alpha
+    installed gamma
     ;;
   flip)
     conf yes 'Required DatabaseNever'

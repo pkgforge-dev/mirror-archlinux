@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# Keep every schedule enabled, check that every schedule fired, and keep the
+# issue schedules-stopped in step with both. The schedules job of
+# watchdog.yml and the keepalive job of sync.yml run this.
+#
+#   scripts/watch-schedules
+#
+# It runs scripts/keep-schedules-enabled, then scripts/check-schedules-fired,
+# each to the end, and prints what each said.
+#
+#   schedules-stopped  raised when check-schedules-fired says a schedule has
+#                      stopped (its exit 3), or keep-schedules-enabled names
+#                      a workflow that a person disabled. The body holds what
+#                      both said, with the line that reproduces it. Cleared
+#                      when both ran, every schedule fires, and no workflow is
+#                      disabled by hand.
+#
+# ⛔ A schedule that stops leaves no run behind to fail. A red step alone
+# reaches only the person who reads the run, so it becomes an issue too, as
+# every other lasting problem does (scripts/track-issue).
+#
+# Environment: GH_TOKEN with actions: write and issues: write, and
+# GITHUB_REPOSITORY. GITHUB_SERVER_URL and GITHUB_RUN_ID name the run.
+# SCHEDULES_TODAY goes to check-schedules-fired (fault injection only).
+#
+# Exit status: 0 every schedule fires (a workflow disabled by hand raises the
+# issue and is not a failure); 3 a schedule has stopped: the run stays red
+# after the issue is raised; 1 a check could not run.
+set -euo pipefail
+SCRIPT_NAME=watch-schedules
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+[ "$#" -eq 0 ] || die "usage: scripts/watch-schedules"
+slug="${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}"
+run_url="${GITHUB_SERVER_URL:-https://github.com}/$slug/actions/runs/${GITHUB_RUN_ID:-0}"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+rc_keep=0
+"$REPO_ROOT/scripts/keep-schedules-enabled" > "$work/keep.out" 2>&1 || rc_keep=$?
+cat "$work/keep.out"
+rc_fired=0
+"$REPO_ROOT/scripts/check-schedules-fired" > "$work/fired.out" 2>&1 || rc_fired=$?
+cat "$work/fired.out"
+
+awk '/disabled by hand/' "$work/keep.out" > "$work/manual.txt"
+manual="$(awk 'END { print NR + 0 }' "$work/manual.txt")"
+could_not=0
+if [ "$rc_keep" -ne 0 ]; then
+  warn "scripts/keep-schedules-enabled could not run (exit $rc_keep)" "reproduce: GH_TOKEN=... scripts/keep-schedules-enabled"
+  could_not=1
+fi
+case "$rc_fired" in
+  0 | 3) ;;
+  *)
+    warn "scripts/check-schedules-fired could not run (exit $rc_fired)" "reproduce: GH_TOKEN=... scripts/check-schedules-fired"
+    could_not=1
+    ;;
+esac
+
+if [ "$rc_fired" -eq 3 ] || [ "$manual" -gt 0 ]; then
+  # shellcheck disable=SC2016 # Markdown backticks, not command substitution
+  {
+    printf '<!-- written by scripts/watch-schedules -->\n'
+    if [ "$rc_fired" -eq 3 ]; then
+      printf 'A schedule has stopped firing. A schedule that stops leaves no run behind, so no run of it fails.\n\n'
+    fi
+    if [ "$manual" -gt 0 ]; then
+      printf 'A person disabled %s workflow(s). Its schedule does not fire while it is disabled.\n\n' "$manual"
+    fi
+    printf '`scripts/check-schedules-fired` (exit %s):\n\n```\n' "$rc_fired"
+    sed -n 1,60p "$work/fired.out"
+    printf '```\n\n`scripts/keep-schedules-enabled` (exit %s):\n\n```\n' "$rc_keep"
+    sed -n 1,60p "$work/keep.out"
+    printf '```\n\n'
+    printf 'GitHub stops the schedules of a repository after 60 days with no activity. Enable a workflow again in the Actions tab, or with `gh workflow enable FILE`. Start a run by hand to see the answer now: `gh workflow run watchdog.yml --ref main`.\n\n'
+    printf 'reproduce:\n\n```bash\nscripts/check-schedules-fired\ngh api repos/%s/actions/workflows --jq '"'"'.workflows[] | "\\(.path) \\(.state)"'"'"'\n```\n\n' "$slug"
+    printf 'Seen in: %s\n\nThis issue closes itself when every schedule fires again and no workflow is disabled by hand.\n' "$run_url"
+  } > "$work/body.md"
+  "$REPO_ROOT/scripts/track-issue" raise schedules-stopped "A schedule has stopped firing" "$work/body.md"
+elif [ "$could_not" -eq 0 ]; then
+  "$REPO_ROOT/scripts/track-issue" clear schedules-stopped "Every schedule fires again, and no workflow is disabled by hand: $run_url"
+fi
+
+if [ "$could_not" -eq 1 ]; then
+  exit 1
+fi
+if [ "$rc_fired" -eq 3 ]; then
+  exit 3
+fi
+exit 0

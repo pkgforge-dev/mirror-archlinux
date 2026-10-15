@@ -75,6 +75,7 @@ A run of pacman makes many calls of the wrapper, one per file. The run store let
 | `,down.<host>` | the host failed once its retries were spent |
 | `,absent.<file>` | the database manifest of this run has no layer `<file>` |
 | `,index` | `FILE<TAB>SHA256<TAB>SIZE` of each package the prefetch planned |
+| `,token.<host>.<hex>` | the anonymous pull token of the repository whose name has sha256 `<hex>`, mode 0600 (see [Tokens](#tokens)) |
 | `,pacver` | the pacman version, asked once per run |
 | `,reaper` | the output of the background remover |
 | `tmp.*` | files that are being written |
@@ -99,7 +100,6 @@ The prefetch runs once per run when all of these are true:
 - the requested file name is printable ASCII and does not start with `,`
 - `PACMAN_OCI_PREFETCH` is not `0`
 - `PACMAN_OCI_JOBS` is more than 1
-- `PACMAN_OCI_NO_DUMMY` is not `1`
 - OUTPUT's directory holds no `"`, `\`, tab or newline
 
 ### The print run
@@ -143,6 +143,7 @@ One curl process runs each list with `--parallel --parallel-max $PACMAN_OCI_JOBS
 
 - Each finished transfer is checked by size and sha256, then renamed to its ready entry. A file that fails the check is removed.
 - A transfer that is cut goes on in the next pass. Cut means: its time limit, 408, 429, 5xx, or a connection that broke after the answer started. With bytes on disk, it resumes with `--continue-at -`. Each pass is a new curl process, so it has new connections.
+- A transfer that the registry refuses with 401 or 403 goes on once in the next pass, with the anonymous token of its repository (see [Tokens](#tokens)).
 - A transfer with no answer at all, another 4xx, or a file over its size is not tried again in the prefetch.
 - A resumed file that fails its sha256 check starts again from zero, once.
 - A pass after the first that makes no file ready and moves less than 30 KiB is the last. There are at most 100 passes.
@@ -163,14 +164,29 @@ The first `oci://` request for a `.db` or `.files` file of a run does the same f
 5. It reads each database blob in parallel, except when the copy pacman holds already has that sha256. pacman downloads every database again on each `-Sy` under an `XferCommand`.
 6. A manifest with a signature layer gives its `.sig` too. When a database is ready and its manifest has no signature layer, the wrapper writes an `,absent` entry. The request for that `.sig` then gets the answer for an absent database signature (below), with no network.
 
+## Tokens
+
+GHCR accepts the dummy token `Bearer QQ==` for every public package. So the wrapper needs no token request. When a registry refuses the dummy token, with 401 or 403, the wrapper uses the registry's anonymous token flow:
+
+1. It reads the Bearer challenge of the refusal. When the refusal has none, as GHCR's 403 does, one request with no authorization gets it.
+2. It asks the realm of the challenge for a pull token of that one repository. An `http://` realm is accepted only for an `oci+http://` registry. A token with a character outside `A-Z a-z 0-9 . _ ~ + / = -` is refused.
+3. It keeps the token in the run store as `,token.<host>.<hex>`, with `<hex>` the sha256 of the repository name. `mktemp` makes the file with mode 0600, and the token goes with the store.
+4. Every later request of the run for that repository sends the token first: the prefetch, and each call of the single-file path. A token that is refused is replaced once in each call.
+
+The prefetch asks again, once, each manifest and each blob that the registry refuses, with the token of its repository. The wrapper then prints one line on stderr, also with no debug output: `pacman-oci: <host> refused the dummy token Bearer QQ==; the anonymous token flow is used`.
+
+A run then makes one token request per repository, and the prefetch still reads every file. Without the kept token, each file takes 4 requests: the refused manifest, the token, the manifest and the blob ([measurements.md](measurements.md)).
+
+`PACMAN_OCI_NO_DUMMY=1` sends no dummy token: the requests start with no authorization, and the first refusal starts the token flow. The prefetch runs as it does with the dummy token.
+
 ## The single-file path
 
 A file the store does not hold is read alone.
 
 1. A host with a `,down.<host>` entry misses at once, for a `pkg` or `db` request. A `.sig` request is never skipped: pacman asks for a `.sig` only from the server that served its file.
 2. A URL that is not `oci://` goes to curl (below).
-3. The wrapper reads the manifest. It sends `Authorization: Bearer QQ==`, which GHCR accepts for public packages, and saves a token round trip.
-4. A 401 or 403 makes it read the Bearer challenge and fetch the anonymous pull token once. Manifest and token requests follow no redirect.
+3. The wrapper reads the manifest. It sends the run's token for the repository when the run keeps one, else `Authorization: Bearer QQ==`, which GHCR accepts for public packages, and saves a token round trip.
+4. A 401 or 403 makes it read the Bearer challenge and fetch the anonymous pull token once. It keeps the token for the rest of the run (see [Tokens](#tokens)). Manifest and token requests follow no redirect.
 5. A 303 is asked again once, after 1 s. GHCR answers a reference it cannot parse with 303 to an HTML page.
 6. A manifest asked for by digest must hash to that digest.
 7. Exactly one layer must carry the file's name. A package manifest with no signature layer is an error: pacman tries no other server for a `.sig`.
@@ -227,6 +243,7 @@ With no sandbox, the empty file would stay as the signature. So the wrapper miss
 | --- | --- |
 | manifest, token, single-file path | `--connect-timeout 10 --max-time 15`, `--retry 2 --retry-max-time 30`, 64 KiB at most |
 | manifest, prefetch | `--connect-timeout 10 --max-time 15`, 64 KiB at most, no retry |
+| challenge request, prefetch | `--connect-timeout 10 --max-time 15`, 64 KiB at most, no retry |
 | blob, single-file path | `--connect-timeout 20 --speed-limit 1024 --speed-time 60`, plus the attempt limits above |
 | prefetch transfer | `--connect-timeout 10 --speed-limit 1024 --speed-time 60`, plus the pass limit above |
 | print run | `timeout 120` |
@@ -241,7 +258,7 @@ A manifest far larger than any real one fails at once. The parser is plain awk.
 | `PACMAN_OCI_PREFETCH` | `1` | `0` turns the prefetch off: each file is one request |
 | `PACMAN_OCI_JOBS` | `32` | transfers at once in a prefetch, at most 64; `1`, or a value that is not a number, turns the prefetch off |
 | `PACMAN_OCI_SIG` | `auto` | `registry` reads each package signature from the registry's layer, never from `%PGPSIG%` |
-| `PACMAN_OCI_NO_DUMMY` | `0` | `1` skips `Bearer QQ==` and uses the registry's token flow, with no prefetch; the watchdog uses it |
+| `PACMAN_OCI_NO_DUMMY` | `0` | `1` skips `Bearer QQ==` and uses the registry's token flow; the watchdog uses it |
 | `PACMAN_OCI_EMPTY_SIG` | `1` | `0` turns off the empty answer for an absent database signature |
 | `PACMAN_OCI_TEST_PROC` | unset | for the test suite only: read the parent from DIR, not `/proc`; used only when DIR holds a file named `pacman-oci-test-proc` |
 | `TMPDIR` | `/tmp` | where the private work directory goes; OUTPUT's directory when TMPDIR is not writable |
@@ -250,6 +267,7 @@ A manifest far larger than any real one fails at once. The parser is plain awk.
 
 - The wrapper serves no package or database that a call did not check. A ready entry passed its size and sha256 check, against `%SHA256SUM%` or the layer descriptor, before it got its name. A `.sig` entry made from `%PGPSIG%` is the value that pacman checks the package against.
 - An entry is used only when it is a regular file owned by the user that runs the wrapper, and not a symbolic link.
+- A `,token.<host>.<hex>` entry holds an anonymous pull token, mode 0600. It gives no access that a request with no credential does not get.
 - Under `DownloadUser`, the store sits in the `download-XXXXXX` directory, mode 0700, owned by the download user. pacman removes that directory with the run.
 - Without `DownloadUser`, the store sits in the sync or cache directory, which root owns. The wrapper runs as root there.
 - A store lasts one run of pacman. There is no cache across runs. A package tag can be pushed again to repair its signature layer. So a cache keyed by tag could serve a stale `.sig`. pacman's own `CacheDir` keeps packages across runs.

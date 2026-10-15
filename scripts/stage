@@ -56,8 +56,10 @@
 # batch_count), and the log says so.
 #
 # Environment: STAGING_TAG (default staging), VERIFY_BATCH_FILES (400),
-# VERIFY_BATCH_BYTES (2147483648), VERIFY_MAX_BATCHES (40), MIRROR_NAMESPACE,
-# REGISTRY_USER, REGISTRY_TOKEN.
+# VERIFY_BATCH_BYTES (2147483648), VERIFY_MAX_BATCHES (40), STAGE_RATE_WAIT
+# (600: the seconds of pauses after a 429 that the staging push may take, below
+# the job's 20 minutes; each pause RATE_PAUSE_MIN to RATE_PAUSE_MAX seconds,
+# lib.sh throttle_pause), MIRROR_NAMESPACE, REGISTRY_USER, REGISTRY_TOKEN.
 #
 # Exit status: 0 the target has a state, 1 the step itself could not run.
 set -euo pipefail
@@ -88,7 +90,8 @@ STAGING_TAG="${STAGING_TAG:-staging}"
 BATCH_FILES="${VERIFY_BATCH_FILES:-400}"
 BATCH_BYTES="${VERIFY_BATCH_BYTES:-2147483648}"
 MAX_BATCHES="${VERIFY_MAX_BATCHES:-40}"
-for v in BATCH_FILES BATCH_BYTES MAX_BATCHES; do
+STAGE_RATE_WAIT="${STAGE_RATE_WAIT:-600}"
+for v in BATCH_FILES BATCH_BYTES MAX_BATCHES STAGE_RATE_WAIT; do
   case "${!v}" in
     '' | *[!0-9]* | 0) die "$v must be a positive integer, not '${!v}'" ;;
   esac
@@ -250,16 +253,24 @@ stage_target() {
     args+=(--annotation "dev.pkgforge.mirror.unsigned=$unsigned_list")
   fi
   args+=("$MIRROR_REGISTRY/$repo_path:$STAGING_TAG" "${layers[@]}")
-  local rc=0 attempt
-  for attempt in 1 2 3; do
+  # A 429 costs no attempt (lib.sh rate_limited, throttle_pause): the shards
+  # of other targets push on the same token at the same time.
+  local rc=0 attempt=0
+  while :; do
     rc=0
-    (cd "$sd" && timeout --kill-after=30 300 "$ORAS" "${args[@]}" > "$sd/push.log" 2>&1) || rc=$?
+    (cd "$sd" && timeout -k 30 300 "$ORAS" "${args[@]}" > "$sd/push.log" 2>&1) || rc=$?
     [ "$rc" -ne 0 ] || break
+    if rate_limited "$sd/push.log"; then
+      throttle_pause "$work" "$STAGE_RATE_WAIT" "$name: staging push" || break
+      continue
+    fi
+    attempt=$((attempt + 1))
     warn "$name: staging push attempt $attempt ended $rc" "$(tail -n 3 "$sd/push.log")"
+    [ "$attempt" -lt 3 ] || break
     sleep $((attempt * attempt * 5))
   done
   if [ "$rc" -ne 0 ]; then
-    set_state "$dir" error "could not push $repo_path:$STAGING_TAG: $(tail -n 1 "$sd/push.log")"
+    set_state "$dir" error "could not push $repo_path:$STAGING_TAG ($attempt failed attempt(s), ${THROTTLE_WAITED}s of 429 pauses of at most ${STAGE_RATE_WAIT}s): $(tail -n 1 "$sd/push.log")"
     return 0
   fi
 
@@ -292,15 +303,36 @@ stage_target() {
   # What a consumer sees: the same manifest, read with no credential at all.
   # GitHub creates a package private and offers no API to change that, so the
   # first push of a new target needs one click, and this is where it shows.
+  # Only the registry's own refusal (401, 403 or 404) means private. Any other
+  # answer, or none, is asked again up to 5 times, and then is an error: a
+  # 5xx or a timeout says nothing about the package.
   #-------------------------------------------------------------------------#
-  rc=0
-  REGISTRY_TOKEN='' registry_manifest "$repo_path" "$digest" "$sd/anon.json" || rc=$?
+  local anon_code=000
+  for attempt in 1 2 3 4 5; do
+    rc=0
+    REGISTRY_TOKEN='' registry_manifest "$repo_path" "$digest" "$sd/anon.json" || rc=$?
+    anon_code="$REG_LAST_CODE"
+    [ "$rc" -ne "$REG_STATUS_OK" ] || break
+    case "$anon_code" in
+      401 | 403 | 404) break ;;
+    esac
+    if [ "$attempt" -lt 5 ]; then
+      sleep $((attempt * 2))
+    fi
+  done
   # This read is the authority: plan's own flag may come from a transient
   # failure of its anonymous read, and is only a hint.
   if [ "$rc" -ne "$REG_STATUS_OK" ]; then
-    printf 'https://github.com/orgs/%s/packages/container/%s/settings\n' "${MIRROR_NAMESPACE%%/*}" \
-      "$(printf '%s' "${repo_path#*/}" | sed 's|/|%2F|g')" > "$dir/settings-url"
-    set_state "$dir" private "$repo_path reads back with the workflow's token and not without one: the package is not public; $(cat "$dir/settings-url")"
+    case "$anon_code" in
+      401 | 403 | 404)
+        printf 'https://github.com/orgs/%s/packages/container/%s/settings\n' "${MIRROR_NAMESPACE%%/*}" \
+          "$(printf '%s' "${repo_path#*/}" | sed 's|/|%2F|g')" > "$dir/settings-url"
+        set_state "$dir" private "$repo_path reads back with the workflow's token, and without one the registry refuses it (HTTP $anon_code): the package is not public; $(cat "$dir/settings-url")"
+        ;;
+      *)
+        set_state "$dir" error "$repo_path@$digest reads back with the workflow's token, and the read without one got no answer that decides in 5 tries (last: HTTP $anon_code, 000 is no answer); its visibility is not known"
+        ;;
+    esac
     return 0
   fi
 

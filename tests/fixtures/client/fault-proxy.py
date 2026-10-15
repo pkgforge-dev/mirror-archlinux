@@ -15,6 +15,11 @@ MODE is one of:
           headers, with the full Content-Length, and 64 KiB of its body; then
           nothing for 40 s, and the connection closes. Every other GET is
           passed through.
+    token a registry that refuses the dummy token. A request with no
+          Authorization, or with one other than "Bearer anon-token", gets 401
+          with a Bearer challenge whose realm is this proxy's /token. GET
+          /token answers {"token": "anon-token"}. Every other request is
+          passed through.
     norange
           not a proxy: a plain http server for the files under UPSTREAM, a
           directory. Each GET gets the whole file with 200, whatever its Range
@@ -41,6 +46,7 @@ UPSTREAM = sys.argv[2]
 PASS_HEADERS = ("accept", "authorization", "range", "user-agent")
 SEEN = set()
 SEEN_LOCK = threading.Lock()
+TOKEN = "anon-token"
 
 
 def first_time(path):
@@ -100,6 +106,19 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         if MODE == "503":
             self.answer(503, [("Content-Length", "0")], b"")
             return
+        if MODE == "token":
+            if self.path.startswith("/token"):
+                body = ('{"token": "%s"}' % TOKEN).encode()
+                self.answer(200, [("Content-Type", "application/json"), ("Content-Length", str(len(body)))], body)
+                return
+            auth = self.headers.get("Authorization")
+            if auth != "Bearer " + TOKEN:
+                realm = "http://127.0.0.1:%d/token" % self.server.server_address[1]
+                body = b'{"errors":[{"code":"UNAUTHORIZED"}]}'
+                challenge = 'Bearer realm="%s",service="registry.test"' % realm
+                self.answer(401, [("WWW-Authenticate", challenge), ("Content-Length", str(len(body)))], body)
+                print("  refused %s" % (auth or "no authorization"), flush=True)
+                return
         conn = http.client.HTTPConnection(UPSTREAM, timeout=30)
         sent = {k: v for k, v in self.headers.items() if k.lower() in PASS_HEADERS}
         conn.request(self.command, self.path, headers=sent)

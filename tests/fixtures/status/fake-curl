@@ -9,23 +9,44 @@
 #   F.code      the HTTP code to answer; 000 is a connection that fails
 #   F.location  the Location of a 3xx answer
 #   F.time      the seconds %{time_total} reports (default 0.012)
+#   F.headers   more response headers, one "name: value" per line, for
+#               --dump-header
 #   F           the body; a code of 200 when F exists and F.code does not
 #   ROOT/HOST/.404  the body of a 404 for a file that is not there
 # A host with no directory under ROOT does not resolve.
 #
-# Understood: --output/-o, --write-out/-w, --fail/-f (in a short option group
-# too), --location/-L for one 3xx hop. Options that take a value are skipped
+# Understood: --output/-o, --write-out/-w, --dump-header/-D, --fail/-f (in a
+# short option group too), --location/-L for one 3xx hop. Options that take a
+# value are skipped
 # with their value; any other option is skipped alone. -K and --config are
 # refused, so a caller that needs them fails loudly here.
 #
 # FAKE_CURL_LOG, when set, gets one line per request: the URL.
 #
+# FAKE_CURL_REAL, when set, is the path of the real curl. A URL on host
+# 127.0.0.1 then goes to it with every argument as given. So a test can serve
+# one host from a real local listener, for example one that never answers.
+#
 # Exit status: 0, or curl's own codes: 6 no such host, 7 no connection,
 # 22 --fail and a code of 400 or more, 2 an option this stand-in refuses.
 set -euo pipefail
 
+if [ -n "${FAKE_CURL_REAL:-}" ]; then
+  for a in "$@"; do
+    case "$a" in
+      http://127.0.0.1[:/]* | https://127.0.0.1[:/]*)
+        if [ -n "${FAKE_CURL_LOG:-}" ]; then
+          printf '%s\n' "$a" >> "$FAKE_CURL_LOG"
+        fi
+        exec "$FAKE_CURL_REAL" "$@"
+        ;;
+    esac
+  done
+fi
+
 root="${FAKE_CURL_ROOT:?FAKE_CURL_ROOT is not set}"
 outfile=""
+hdrfile=""
 fmt=""
 url=""
 fail=0
@@ -34,6 +55,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     -o | --output) outfile="$2"; shift 2 ;;
     -w | --write-out) fmt="$2"; shift 2 ;;
+    -D | --dump-header) hdrfile="$2"; shift 2 ;;
     -f | --fail) fail=1; shift ;;
     -L | --location) follow=1; shift ;;
     -K | --config)
@@ -43,7 +65,7 @@ while [ "$#" -gt 0 ]; do
     --proto | --proto-redir | --max-redirs | --connect-timeout | --max-time | --speed-limit | \
       --speed-time | --retry | --retry-delay | --retry-max-time | -H | --header | -A | \
       --user-agent | --max-filesize | --data-urlencode | -u | --user | -X | --request | \
-      -C | --continue-at | -e | --referer | -D | --dump-header | --parallel-max)
+      -C | --continue-at | -e | --referer | --parallel-max)
       shift 2
       ;;
     http://* | https://*) url="$1"; shift ;;
@@ -80,8 +102,10 @@ answer() {
   f="$root/$host$path"
   body=""
   location=""
+  headers=""
   seconds=0.012
   if [ -f "$f.time" ]; then seconds="$(cat "$f.time")"; fi
+  if [ -f "$f.headers" ]; then headers="$f.headers"; fi
   if [ -f "$f.code" ]; then
     code="$(cat "$f.code")"
     if [ -f "$f" ]; then body="$f"; fi
@@ -127,6 +151,14 @@ if [ "$code" = 000 ]; then
   echo "curl: (7) Failed to connect" >&2
   write_out
   exit 7
+fi
+if [ -n "$hdrfile" ]; then
+  {
+    printf 'HTTP/2 %s\r\n' "$code"
+    if [ -n "$location" ]; then printf 'location: %s\r\n' "$location"; fi
+    if [ -n "$headers" ]; then sed 's/$/\r/' "$headers"; fi
+    printf '\r\n'
+  } > "$hdrfile"
 fi
 if [ "$fail" -eq 1 ] && [ "$code" -ge 400 ]; then
   echo "curl: (22) The requested URL returned error: $code" >&2

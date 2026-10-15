@@ -571,7 +571,8 @@ reconcile_results() {
 # to promote over a database it could not see.
 #
 # REGISTRY_USER and REGISTRY_TOKEN, when set, are exchanged for a scoped token.
-# Without them the reads are anonymous, the way any consumer reads.
+# Without them the reads are anonymous, the way any consumer reads: the token
+# endpoint is asked with no credential.
 #
 # REGISTRY_TOKEN_CACHE, when set, is a directory that keeps each scoped token
 # in a file of its own. Every process that reads it uses the same token, so a
@@ -580,15 +581,29 @@ reconcile_results() {
 # kept. A read with REGISTRY_TOKEN empty is a consumer's read: it never uses
 # the cache, or it would send the workflow's token and read a private package.
 #
-# On GHCR a manifest read tries the dummy token Bearer QQ== first, which every
-# public package accepts. Only its 200 is taken as the answer: GHCR answers QQ==
-# with 404 MANIFEST_UNKNOWN for a repository it does not show to anonymous
-# readers (measured 2026-10-14), so with REGISTRY_TOKEN set any other answer is
-# asked again with the real token before it decides anything.
+# On GHCR a read tries the dummy token Bearer QQ== first, which every public
+# package accepts, so a read costs one request. GHCR answers QQ== with 404
+# MANIFEST_UNKNOWN for a repository it does not show to anonymous readers
+# (measured 2026-10-14). With REGISTRY_TOKEN set, only the 200 of QQ== is the
+# answer, and any other answer is asked again with the real token. With
+# REGISTRY_TOKEN empty, the answer of QQ== is the answer, except a 401 or a
+# 403: GHCR does not document QQ==, so a refusal of it is asked again with the
+# anonymous token flow, and a warning says so. The token endpoint answers that
+# flow with 403 for a repository it does not show (measured 2026-10-15): for
+# an anonymous read that is absent, the same answer as QQ== gives today.
+# Only that 403: a 401 of the token endpoint is not measured, and is an
+# error.
+#
+# REG_LAST_CODE is the HTTP code of the last answer registry_manifest read:
+# 000 when nothing answered, the token endpoint's code when it gave no token.
 #---------------------------------------------------------------------------#
 REG_STATUS_OK=0
 REG_STATUS_ERROR=1
 REG_STATUS_ABSENT=4
+REG_LAST_CODE=000
+# shellcheck disable=SC2034 # REG_TOKEN and REG_TOKEN_CODE are read by the functions below
+REG_TOKEN=""
+REG_TOKEN_CODE=""
 
 # registry_token_file REPO SCOPE -> the cache file for that token, or nothing
 # when there is no cache, or when the read is anonymous
@@ -606,53 +621,95 @@ registry_token_drop() {
   fi
 }
 
-# registry_token REPO SCOPE -> a bearer token on stdout. SCOPE is pull or
-# pull,push. Anonymous pulls on GHCR use the dummy token every public package
-# accepts; anything else asks the token endpoint, or the cache.
-registry_token() {
-  local repo="$1" scope="$2" out rc=0 tok cache tmp
+# registry_token_get REPO SCOPE: a bearer token in REG_TOKEN, set in the
+# caller's shell, not in $( ). SCOPE is pull or pull,push. The token comes from
+# the cache, or from the token endpoint, with REGISTRY_TOKEN or with no
+# credential. REG_TOKEN_CODE is the token endpoint's HTTP code: empty when no
+# request was made, 000 when nothing answered.
+#   returns 0 a token, 1 none
+registry_token_get() {
+  local repo="$1" scope="$2" out rc=0 code="" tok cache tmp max="${REG_TOKEN_MAX_TIME:-90}"
+  REG_TOKEN=""
+  REG_TOKEN_CODE=""
   if [ "$MIRROR_REGISTRY_AUTH" = none ]; then
-    printf 'none\n'
-    return 0
-  fi
-  if [ -z "${REGISTRY_TOKEN:-}" ] && [ "$scope" = pull ] && [ "$MIRROR_REGISTRY" = ghcr.io ]; then
-    printf 'QQ==\n'
+    REG_TOKEN=none
     return 0
   fi
   cache="$(registry_token_file "$repo" "$scope")"
   if [ -n "$cache" ] && [ -s "$cache" ]; then
-    cat -- "$cache"
+    REG_TOKEN="$(cat -- "$cache")"
     return 0
   fi
+  # ⛔ The whole call, its retries included, ends within REG_TOKEN_MAX_TIME,
+  # as registry_blob's does. With --max-time alone a token endpoint that
+  # stalls held each call about 250 s, and status-collect asks once for
+  # every target.
+  case "$max" in
+    '' | *[!0-9]* | 0) die "REG_TOKEN_MAX_TIME must be a positive number of seconds, not '$max'" ;;
+  esac
   out="$(mktemp)"
   if [ -n "${REGISTRY_TOKEN:-}" ]; then
     # The credential goes to curl on stdin, as a config line, never on its
     # command line, where every process of the runner could read it.
-    printf 'user = "%s:%s"\n' "${REGISTRY_USER:-token}" "$REGISTRY_TOKEN" |
-      curl -q --silent --show-error --fail --connect-timeout 20 --max-time 60 \
+    code="$(printf 'user = "%s:%s"\n' "${REGISTRY_USER:-token}" "$REGISTRY_TOKEN" |
+      timeout -k 5 "$((max + 5))" curl -q --silent --show-error --connect-timeout 20 \
+        --max-time "$max" --retry-max-time "$max" \
         --retry 3 --retry-connrefused --retry-delay 2 --config - \
         --get --data-urlencode "service=$MIRROR_REGISTRY" --data-urlencode "scope=repository:$repo:$scope" \
-        --output "$out" "https://$MIRROR_REGISTRY/token" || rc=$?
+        --output "$out" --write-out '%{http_code}' "https://$MIRROR_REGISTRY/token")" || rc=$?
   else
-    curl -q --silent --show-error --fail --connect-timeout 20 --max-time 60 \
+    code="$(timeout -k 5 "$((max + 5))" curl -q --silent --show-error --connect-timeout 20 \
+      --max-time "$max" --retry-max-time "$max" \
       --retry 3 --retry-connrefused --retry-delay 2 \
       --get --data-urlencode "service=$MIRROR_REGISTRY" --data-urlencode "scope=repository:$repo:$scope" \
-      --output "$out" "https://$MIRROR_REGISTRY/token" || rc=$?
+      --output "$out" --write-out '%{http_code}' "https://$MIRROR_REGISTRY/token")" || rc=$?
   fi
-  if [ "$rc" -ne 0 ]; then
+  REG_TOKEN_CODE="${code:-000}"
+  if [ "$rc" -eq 0 ] && [ "$REG_TOKEN_CODE" = 403 ] && registry_anon_ghcr; then
+    log "GHCR gives no anonymous $scope token for $repo (HTTP $REG_TOKEN_CODE): it does not show that repository"
     rm -f "$out"
-    warn "no $scope token for $MIRROR_REGISTRY/$repo (curl $rc)"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ] || [ "$REG_TOKEN_CODE" != 200 ]; then
+    warn "no $scope token for $MIRROR_REGISTRY/$repo (curl $rc, HTTP $REG_TOKEN_CODE)" "$(head -c 300 "$out")"
+    rm -f "$out"
     return 1
   fi
   tok="$(jq -r '.token // .access_token // empty' "$out")"
   rm -f "$out"
-  [ -n "$tok" ] || return 1
+  if [ -z "$tok" ]; then
+    warn "the token endpoint of $MIRROR_REGISTRY answered 200 with no token for $repo"
+    return 1
+  fi
   if [ -n "$cache" ]; then
     tmp="$(mktemp "$REGISTRY_TOKEN_CACHE/.token.XXXXXX")"
     printf '%s\n' "$tok" > "$tmp"
     mv -f -- "$tmp" "$cache"
   fi
-  printf '%s\n' "$tok"
+  REG_TOKEN="$tok"
+  return 0
+}
+
+# registry_token REPO SCOPE -> a bearer token on stdout (registry_token_get).
+# GHCR gives no anonymous token for a repository it does not show (403,
+# measured), such as a target with no push yet. Then the token is QQ==, with
+# which GHCR answers that repository with 404 MANIFEST_UNKNOWN: the caller
+# reads it as absent, as a consumer does (scripts/status-collect).
+registry_token() {
+  if registry_token_get "$1" "$2"; then
+    printf '%s\n' "$REG_TOKEN"
+    return 0
+  fi
+  if registry_anon_ghcr && [ "$2" = pull ] && [ "$REG_TOKEN_CODE" = 403 ]; then
+    printf 'QQ==\n'
+    return 0
+  fi
+  return 1
+}
+
+# registry_anon_ghcr -> 0 when a read goes to GHCR with no credential of its own
+registry_anon_ghcr() {
+  [ "$MIRROR_REGISTRY_AUTH" != none ] && [ "$MIRROR_REGISTRY" = ghcr.io ] && [ -z "${REGISTRY_TOKEN:-}" ]
 }
 
 # registry_error_code BODY -> the first error code in a registry error body
@@ -673,28 +730,44 @@ registry_get_manifest() {
 # registry_manifest REPO REF OUT -> the manifest bytes in OUT
 #   returns 0 read, 4 the registry has no such manifest, 1 could not read
 registry_manifest() {
-  local repo="$1" ref="$2" outfile="$3" token code="" rc=0 err url
+  local repo="$1" ref="$2" outfile="$3" code="" rc=0 err url
+  REG_LAST_CODE=000
   url="$REG_URL/v2/$repo/manifests/$ref"
-  if [ "$MIRROR_REGISTRY_AUTH" != none ] && [ "$MIRROR_REGISTRY" = ghcr.io ] && [ -n "${REGISTRY_TOKEN:-}" ]; then
+  if [ "$MIRROR_REGISTRY_AUTH" != none ] && [ "$MIRROR_REGISTRY" = ghcr.io ]; then
     code="$(registry_get_manifest "$url" 'QQ==' "$outfile")" || rc=$?
-    if [ "$rc" -ne 0 ] || [ "$code" != 200 ]; then
+    if [ -n "${REGISTRY_TOKEN:-}" ]; then
+      if [ "$rc" -ne 0 ] || [ "$code" != 200 ]; then
+        code=""
+        rc=0
+      fi
+    elif [ "$rc" -eq 0 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; }; then
+      warn "GHCR refused Bearer QQ== for $repo (HTTP $code); the anonymous token flow was used"
       code=""
-      rc=0
     fi
   fi
-  if [ -z "$code" ]; then
-    token="$(registry_token "$repo" pull)" || return "$REG_STATUS_ERROR"
-    code="$(registry_get_manifest "$url" "$token" "$outfile")" || rc=$?
+  if [ -z "$code" ] && [ "$rc" -eq 0 ]; then
+    if ! registry_token_get "$repo" pull; then
+      REG_LAST_CODE="${REG_TOKEN_CODE:-000}"
+      if registry_anon_ghcr && [ "$REG_LAST_CODE" = 403 ]; then
+        return "$REG_STATUS_ABSENT"
+      fi
+      return "$REG_STATUS_ERROR"
+    fi
+    code="$(registry_get_manifest "$url" "$REG_TOKEN" "$outfile")" || rc=$?
     if [ "$rc" -eq 0 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; } && [ -n "$(registry_token_file "$repo" pull)" ]; then
       registry_token_drop "$repo" pull
-      token="$(registry_token "$repo" pull)" || return "$REG_STATUS_ERROR"
-      code="$(registry_get_manifest "$url" "$token" "$outfile")" || rc=$?
+      if ! registry_token_get "$repo" pull; then
+        REG_LAST_CODE="${REG_TOKEN_CODE:-000}"
+        return "$REG_STATUS_ERROR"
+      fi
+      code="$(registry_get_manifest "$url" "$REG_TOKEN" "$outfile")" || rc=$?
     fi
   fi
   if [ "$rc" -ne 0 ]; then
     warn "no answer for $repo:$ref (curl $rc)"
     return "$REG_STATUS_ERROR"
   fi
+  REG_LAST_CODE="$code"
   if [ "$code" = 404 ]; then
     err="$(registry_error_code "$outfile")"
     case "$err" in
@@ -720,22 +793,50 @@ registry_manifest() {
   return "$REG_STATUS_OK"
 }
 
+# registry_get_blob URL TOKEN OUT MAX_SECONDS -> the HTTP status of the last
+# answer on stdout, curl's status as the return value. The whole call, its
+# retries and the redirect to the blob host included, ends within MAX_SECONDS,
+# as fetch_upstream's does.
+registry_get_blob() {
+  timeout -k 5 "$(($4 + 5))" curl -q --location --silent --show-error --proto "$REG_PROTO" --proto-redir "$REG_PROTO" --max-redirs 5 \
+    --connect-timeout 20 --speed-limit 1024 --speed-time 60 --max-time "$4" --retry-max-time "$4" \
+    --retry 3 --retry-connrefused --retry-delay 2 \
+    --header "Authorization: Bearer $2" \
+    --output "$3" --write-out '%{http_code}' "$1"
+}
+
 # registry_blob REPO DIGEST OUT -> the blob in OUT, its sha256 checked
 #   returns 0 read and checked, 1 anything else
+# REG_BLOB_MAX_TIME (seconds, default 600) bounds each read. On GHCR with no
+# credential, Bearer QQ== is tried first, as in registry_manifest.
 registry_blob() {
-  local repo="$1" digest="$2" outfile="$3" token rc=0
+  local repo="$1" digest="$2" outfile="$3" code="" rc=0 url max="${REG_BLOB_MAX_TIME:-600}"
   case "$digest" in
     sha256:*) ;;
     *) warn "not a sha256 digest: $digest"; return 1 ;;
   esac
-  token="$(registry_token "$repo" pull)" || return 1
-  curl -q --fail --location --silent --show-error --proto "$REG_PROTO" --proto-redir "$REG_PROTO" --max-redirs 5 \
-    --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
-    --retry 3 --retry-connrefused --retry-delay 2 \
-    --header "Authorization: Bearer $token" \
-    --output "$outfile" "$REG_URL/v2/$repo/blobs/$digest" || rc=$?
+  case "$max" in
+    '' | *[!0-9]* | 0) die "REG_BLOB_MAX_TIME must be a positive number of seconds, not '$max'" ;;
+  esac
+  url="$REG_URL/v2/$repo/blobs/$digest"
+  if registry_anon_ghcr; then
+    code="$(registry_get_blob "$url" 'QQ==' "$outfile" "$max")" || rc=$?
+    if [ "$rc" -eq 0 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; }; then
+      warn "GHCR refused Bearer QQ== for $repo (HTTP $code); the anonymous token flow was used"
+      code=""
+    fi
+  fi
+  if [ -z "$code" ] && [ "$rc" -eq 0 ]; then
+    registry_token_get "$repo" pull || return 1
+    code="$(registry_get_blob "$url" "$REG_TOKEN" "$outfile" "$max")" || rc=$?
+  fi
   if [ "$rc" -ne 0 ]; then
-    warn "could not read blob $digest of $repo (curl $rc)"
+    warn "could not read blob $digest of $repo within ${max}s (curl $rc)"
+    rm -f "$outfile"
+    return 1
+  fi
+  if [ "$code" != 200 ]; then
+    warn "blob $digest of $repo answered HTTP $code" "$(head -c 300 "$outfile")"
     rm -f "$outfile"
     return 1
   fi
@@ -745,6 +846,64 @@ registry_blob() {
     return 1
   fi
   return 0
+}
+
+#---------------------------------------------------------------------------#
+# Rate limits
+#
+# GHCR limits the requests of one token (measured: "toomanyrequests ...
+# allowed: 2000/minute", run 38570044665), and every push of every job shares
+# the workflow's token. A 429 costs no attempt: the caller pauses for
+# RATE_PAUSE_MIN to RATE_PAUSE_MAX seconds (20 to 60) and tries again. The
+# pauses of one process add up to at most the cap its caller gives.
+#
+# rate_limited LOG -> 0 when LOG holds a 429, in the registry's words
+#   (toomanyrequests, 429 Too Many) or in oras's ("response status code 429:
+#   Too Many Requests")
+# throttle_wait DIR: wait until the time in DIR/throttle, when it is later
+# throttle_pause DIR MAX_WAIT WHAT: pause, after DIR/throttle says when the
+#   pause ends, so that every process that shares DIR waits too. The pause is
+#   added to THROTTLE_WAITED. Returns 1, with no pause, when the pause would
+#   take THROTTLE_WAITED over MAX_WAIT.
+#---------------------------------------------------------------------------#
+THROTTLE_WAITED=0
+
+rate_limited() {
+  grep -qiE 'toomanyrequests|status code 429|429 Too Many' "$1"
+}
+
+throttle_wait() {
+  local until now
+  [ -f "$1/throttle" ] || return 0
+  until="$(cat "$1/throttle")"
+  case "$until" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  now="$(date -u +%s)"
+  if [ "$until" -gt "$now" ]; then
+    sleep "$((until - now))"
+  fi
+}
+
+throttle_pause() {
+  local dir="$1" max="$2" what="$3" lo="${RATE_PAUSE_MIN:-20}" hi="${RATE_PAUSE_MAX:-60}" pause tmp v
+  for v in "$lo" "$hi" "$max"; do
+    case "$v" in
+      '' | *[!0-9]*) die "RATE_PAUSE_MIN ($lo), RATE_PAUSE_MAX ($hi) and the cap of the pauses ($max) must be whole seconds" ;;
+    esac
+  done
+  [ "$hi" -ge "$lo" ] || die "RATE_PAUSE_MAX ($hi) is below RATE_PAUSE_MIN ($lo)"
+  pause=$((lo + RANDOM % (hi - lo + 1)))
+  if [ "$((THROTTLE_WAITED + pause))" -gt "$max" ]; then
+    warn "$what: the registry still limits requests (429) after ${THROTTLE_WAITED}s of pauses; the cap is ${max}s"
+    return 1
+  fi
+  THROTTLE_WAITED=$((THROTTLE_WAITED + pause))
+  tmp="$(mktemp "$dir/.throttle.XXXXXX")"
+  printf '%s\n' "$(($(date -u +%s) + pause))" > "$tmp"
+  mv -f -- "$tmp" "$dir/throttle"
+  log "$what: the registry limits requests (429); a pause of ${pause}s, ${THROTTLE_WAITED}s of the ${max}s cap"
+  sleep "$pause"
 }
 
 # manifest_layer MANIFEST TITLE -> "DIGEST SIZE MEDIATYPE" of the one layer
@@ -766,22 +925,36 @@ manifest_layer() {
 # curl gives each retry a new --max-time. --retry-max-time starts no retry
 # after MAX_SECONDS, and timeout(1) ends a retry that started just before it.
 # Without them a call took 3 x MAX_SECONDS + 4 s (measured with curl 8.22).
+#
+# An answer other than 200, 404 and 410 is logged with its HTTP code, and
+# with Cloudflare's cf-mitigated header when the answer has one: a block or a
+# challenge then shows as what it is, not as a server that did not answer.
+# 404 and 410 are not logged: mirror-file asks for many .sig files that are
+# not there. %header{} needs curl 7.84; an older curl prints it as it is,
+# and that is ignored.
 fetch_upstream() {
-  local url="$1" outfile="$2" code rc=0 max=() limit=()
+  local url="$1" outfile="$2" out code cf="" rc=0 max=() limit=()
   if [ -n "${3:-}" ]; then
     max=(--max-time "$3" --retry-max-time "$3")
     limit=(timeout -k 5 "$(($3 + 5))")
   fi
-  code="$("${limit[@]}" curl -q --location --silent --show-error --max-redirs 5 \
+  out="$("${limit[@]}" curl -q --location --silent --show-error --max-redirs 5 \
     --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \
     --connect-timeout 20 --speed-limit 4096 --speed-time 60 "${max[@]}" \
     --retry 2 --retry-connrefused --retry-delay 2 \
     --user-agent "mirror-archlinux (+https://github.com/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux})" \
-    --output "$outfile" --write-out '%{http_code}' "$url")" || rc=$?
+    --output "$outfile" --write-out '%{http_code}\t%header{cf-mitigated}' "$url")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     rm -f "$outfile"
     return 1
   fi
+  code="${out:0:3}"
+  case "$out" in
+    *$'\t'*) cf="${out#*$'\t'}" ;;
+  esac
+  case "$cf" in
+    *%* | *[![:print:]]*) cf="" ;;
+  esac
   case "$code" in
     200) return 0 ;;
     404 | 410)
@@ -789,6 +962,7 @@ fetch_upstream() {
       return 4
       ;;
     *)
+      log "$url answered HTTP $code${cf:+ (cf-mitigated: $cf)}"
       rm -f "$outfile"
       return 1
       ;;
@@ -817,6 +991,22 @@ sig_packet() {
 # down_last DIR URL... -> the URLs, one per line, in the order given, except
 #   that those whose host failed come last
 #---------------------------------------------------------------------------#
+# url_host URL -> the host and port of URL
+url_host() {
+  local h="${1#*://}"
+  printf '%s\n' "${h%%/*}"
+}
+
+# in_list WORD LIST... -> 0 when WORD is one of LIST
+in_list() {
+  local w="$1" x
+  shift
+  for x in "$@"; do
+    [ "$x" != "$w" ] || return 0
+  done
+  return 1
+}
+
 # down_key URL -> the file name for the host and port of URL
 down_key() {
   local h="${1#*://}"

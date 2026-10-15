@@ -92,6 +92,52 @@ test('a signed URL with no se is not stored', () =>
     assert.equal(w.cache.ofKind('blob').filter((p) => p.url.endsWith(encodeURIComponent(D.pkg))).length, 0);
   }));
 
+test('a signed URL with no usable se: asked again each time, logged once, x-mirror-cache: nostore', () =>
+  inWorld(async (w) => {
+    const location = 'https://pkg-containers.githubusercontent.com/x?sig=y';
+    w.blobs.set(`x86_64/core@${D.db}`, location);
+    const blobAsks = () => w.requests.filter((r) => r.url.endsWith(`/blobs/${D.db}`)).length;
+    for (const n of [1, 2]) {
+      const res = await w.get('/x86_64/core/core.db');
+      assert.equal(res.status, 302);
+      assert.equal(res.headers.get('location'), location);
+      assert.equal(res.headers.get('x-mirror-cache'), 'nostore', `answer ${n}`);
+      assert.equal(blobAsks(), n, `answer ${n}: the blob is asked for again`);
+    }
+    assert.equal(w.cache.ofKind('loc').length, 0);
+    assert.equal(w.cache.ofKind('blob').length, 0);
+    assert.equal(w.errors.length, 1, 'one console.error in this isolate');
+    assert.match(w.errors[0][0].error, /^signed URL without a usable se; not cached/);
+    // A signed URL with se less than 150 s ahead is not stored either.
+    w.seAfter = 149;
+    w.manifest('x86_64/core:2026.10.14', [['core.db', D.files]]);
+    const short = await w.get('/x86_64/core:2026.10.14/core.db');
+    assert.equal(short.headers.get('x-mirror-cache'), 'nostore');
+    assert.equal(w.errors.length, 1);
+  }));
+
+test('x-mirror-cache: miss when the answer is stored, hit when it comes from the loc entry', () =>
+  inWorld(async (w) => {
+    for (const p of ['/x86_64/core/core.db', `/x86_64/core/${PKG}`, `/x86_64/core/${NOSIG}.sig`, '/x86_64/extra/extra.db']) {
+      const first = await w.get(p);
+      assert.ok([302, 404].includes(first.status), `${p}: ${first.status}`);
+      assert.equal(first.headers.get('x-mirror-cache'), 'miss', `${p}: first`);
+      await first.text();
+      const again = await w.get(p);
+      assert.equal(again.status, first.status);
+      assert.equal(again.headers.get('x-mirror-cache'), 'hit', `${p}: again`);
+      await again.text();
+    }
+    // A path that is not served, and a blob GHCR does not hold, are not stored.
+    const refused = await w.get('/x86_64/core/README');
+    assert.equal(refused.headers.get('x-mirror-cache'), 'nostore');
+    w.blobs.delete(`x86_64/core@${D.files}`);
+    const noblob = await w.get('/x86_64/core/core.files');
+    assert.equal(noblob.status, 404);
+    assert.equal(noblob.headers.get('x-mirror-cache'), 'nostore');
+    assert.deepEqual(w.errors, []);
+  }));
+
 test('manifest TTLs: pins and dated, db- and files- tags 1 year; packages 6 h or 60 s; latest 30 s; 404 60 s', () =>
   inWorld(async (w) => {
     const layers = [

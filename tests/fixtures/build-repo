@@ -40,9 +40,20 @@
 #              extra.files names qemu-system-cris 9.1.2-1 (2026-10-15)
 #   port-files-conflict  as port, with port.files of another build of
 #              unsigned 1-1: the same file name with other bytes
+#   files-lag  40 packages with no signature, p01 to p40; p01 to p12 rebuilt
+#              at pkgrel 2, and a files database of before that rebuild, as
+#              when the files database lags during a mass rebuild
+#   files-other  the same 40 packages, and the files database of another
+#              repository: q01 to q20
 #   port-signed  the unsigned package of DIR (aarch64/port) signed now, beside
 #              it: the database and every other file stay as they are, as when
 #              upstream uploads a .sig late for a database that embeds none
+#   resig-one  in DIR, a nopgpsig repository: alpha's detached .sig made again
+#              by the second key; the database and the package files stay, as
+#              when upstream replaces one .sig
+#   resig-all  in DIR, a nopgpsig repository: every detached .sig made again
+#              by the test key; the database and the package files stay, as
+#              when upstream signs every file again with a new key
 #
 # Every database carries %PGPSIG% for every signed package, as Arch's own core
 # and extra do, except nopgpsig. pacman 7's repo-add embeds a signature only
@@ -124,6 +135,27 @@ if [ "$state" = port-signed ]; then
   [ -f "$repo/unsigned-1-1-any.pkg.tar.zst" ]
   [ ! -e "$repo/unsigned-1-1-any.pkg.tar.zst.sig" ]
   sign "$repo/unsigned-1-1-any.pkg.tar.zst" "$GNUPGHOME"
+  ls -l "$repo"
+  exit 0
+fi
+
+# resign FILE HOME: FILE.sig made again now, beside FILE. /out/sigcache is not
+# changed, so a later build of any state keeps its first signatures.
+resign() {
+  GNUPGHOME="$2" gpg --batch --yes --detach-sign --no-armor -o "$1.sig.tmp" "$1"
+  mv -f "$1.sig.tmp" "$1.sig"
+}
+if [ "$state" = resig-one ]; then
+  [ -f "$repo/alpha-1:1.0+r2-1-any.pkg.tar.zst.sig" ]
+  resign "$repo/alpha-1:1.0+r2-1-any.pkg.tar.zst" /out/gnupg-second
+  ls -l "$repo"
+  exit 0
+fi
+if [ "$state" = resig-all ]; then
+  for f in "$repo"/*.pkg.tar.zst; do
+    [ -f "$f.sig" ]
+    resign "$f" "$GNUPGHOME"
+  done
   ls -l "$repo"
   exit 0
 fi
@@ -240,6 +272,37 @@ case "$state" in
       fi
     done
     tar -tvf "$repo/$db.db.tar.gz"
+    ls -l "$repo"
+    exit 0
+    ;;
+  files-lag | files-other)
+    # 40 packages, p01 to p40, with no signature: only plan reads these.
+    for i in $(seq -w 1 40); do
+      mkpkg "p$i" 1-1 any "$((1700000000 + 10#$i))" "p$i one" none
+    done
+    repo-add --quiet "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
+    mkdir -p "$repo/.alt"
+    if [ "$state" = files-lag ]; then
+      # p01 to p12 rebuilt at pkgrel 2, and the files database of before the
+      # rebuild: it names every package, 12 of them at the earlier file name.
+      cp "$repo/$db.files.tar.gz" "$repo/.alt/before.files.tar.gz"
+      for i in $(seq -w 1 12); do
+        rm -f "$repo/p$i-1-1-any.pkg.tar.zst"
+        mkpkg "p$i" 1-2 any "$((1700100000 + 10#$i))" "p$i two" none
+      done
+      repo-add --quiet "$repo/$db.db.tar.gz" "$repo"/p*-1-2-any.pkg.tar.zst
+      cp "$repo/.alt/before.files.tar.gz" "$repo/$db.files.tar.gz"
+    else
+      # The files database of another repository: q01 to q20, which the
+      # database does not name.
+      for i in $(seq -w 1 20); do
+        mkpkg "q$i" 1-1 any "$((1700200000 + 10#$i))" "q$i" none
+        mv "$repo/q$i-1-1-any.pkg.tar.zst" "$repo/.alt/"
+      done
+      repo-add --quiet "$repo/.alt/x.db.tar.gz" "$repo"/.alt/q*.pkg.tar.zst
+      cp "$repo/.alt/x.files.tar.gz" "$repo/$db.files.tar.gz"
+    fi
+    rm -rf "$repo/.alt"
     ls -l "$repo"
     exit 0
     ;;

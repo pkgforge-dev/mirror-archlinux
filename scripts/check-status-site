@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+#
+# Say from outside status.yml whether the status record and the status site
+# still move. The staleness job of watchdog.yml runs this once a day.
+#
+#   scripts/check-status-site STATUS_JSON
+#
+# STATUS_JSON is status.json of the branch status. A path that does not exist
+# is a record that does not exist.
+#
+#   status-down  raised when the record is missing or older than
+#                STATUS_SITE_MAX_AGE (21600 s). This also sees status.yml
+#                stop running at all, when no worker job runs to say so.
+#                Only scripts/check-status-record clears it: a build that
+#                succeeds with a fresh record.
+#   pages-stale  raised when the Pages copy of status.json does not answer
+#                with a record, or its generated time trails the branch's by
+#                more than PAGES_MAX_LAG (10800 s). Then the deploy job
+#                fails, or Pages no longer takes a workflow build, and the
+#                README badges show an old state. Cleared when the copy
+#                answers and trails by that much or less.
+#
+# Environment: STATUS_PAGES_URL, default
+# https://<owner>.github.io/<name>/status.json from GITHUB_REPOSITORY.
+# GH_TOKEN and GITHUB_REPOSITORY for scripts/track-issue. GITHUB_SERVER_URL
+# and GITHUB_RUN_ID name the run. MIRROR_NOW (seconds) pins the clock, for the
+# test suite only.
+#
+# Exit status: 0 nothing raised, 3 an issue raised, 1 the check could not run.
+set -euo pipefail
+SCRIPT_NAME=check-status-site
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+need curl jq
+
+[ "$#" -eq 1 ] || die "usage: scripts/check-status-site STATUS_JSON"
+json="$1"
+STATUS_SITE_MAX_AGE=21600
+PAGES_MAX_LAG=10800
+
+slug="${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}"
+owner="${slug%%/*}"
+repo_name="${slug#*/}"
+pages_url="${STATUS_PAGES_URL:-https://$owner.github.io/$repo_name/status.json}"
+server="${GITHUB_SERVER_URL:-https://github.com}"
+run_url="$server/$slug/actions/runs/${GITHUB_RUN_ID:-0}"
+now="$(now_epoch)"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# record FILE -> "GENERATED EPOCH" of a status record, or nothing when FILE
+# does not read as one
+record() {
+  local vals rc=0 g e=""
+  vals="$(jq -r '[.generated, .generated_epoch] | map(tostring) | join(" ")' "$1" 2> "$work/jq.err")" || rc=$?
+  read -r g e <<< "$vals"
+  if [ "$rc" -eq 0 ] && [[ "$e" =~ ^[0-9]+$ ]]; then
+    printf '%s %s\n' "$g" "$e"
+  else
+    log "$1 does not read as a status record: $(sed -n 1p "$work/jq.err")"
+  fi
+}
+
+raised=0
+
+#---------------------------------------------------------------------------#
+# The record on the branch
+#---------------------------------------------------------------------------#
+generated=""
+epoch=""
+if [ -f "$json" ]; then
+  read -r generated epoch <<< "$(record "$json")"
+fi
+if [ -n "$epoch" ]; then
+  age=$((now - epoch))
+  said="the record on branch status was measured $generated, ${age}s before this check"
+else
+  age=""
+  said="branch status holds no status.json that reads"
+fi
+log "$said"
+if [ -z "$age" ] || [ "$age" -gt "$STATUS_SITE_MAX_AGE" ]; then
+  # shellcheck disable=SC2016 # Markdown backticks, not command substitution
+  {
+    printf '<!-- written by scripts/check-status-site -->\n'
+    printf '`status.yml` has recorded nothing for more than %s s: %s.\n\n' "$STATUS_SITE_MAX_AGE" "$said"
+    printf 'It runs each hour. Its runs fail, or it does not run at all. Seen by the watchdog: %s\n\n' "$run_url"
+    printf 'reproduce:\n\n```bash\ngh run list --workflow status.yml --limit 5\ngh api repos/%s/actions/workflows/status.yml --jq .state\n```\n\n' "$slug"
+    printf 'This issue closes itself when a build of `status.yml` succeeds and its record is fresh.\n'
+  } > "$work/status-down.md"
+  "$REPO_ROOT/scripts/track-issue" raise status-down "status.yml does not record the status of the mirror" "$work/status-down.md"
+  raised=1
+fi
+
+#---------------------------------------------------------------------------#
+# The copy on Pages
+#---------------------------------------------------------------------------#
+rc=0
+code="$(curl -q --silent --show-error --location --max-redirs 5 --proto '=https' --proto-redir '=https' \
+  --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 5 --retry-max-time 60 \
+  --output "$work/pages.json" --write-out '%{http_code}' "$pages_url")" || rc=$?
+p_generated=""
+p_epoch=""
+if [ "$rc" -ne 0 ]; then
+  p_said="$pages_url did not answer (curl $rc)"
+elif [ "$code" != 200 ]; then
+  p_said="$pages_url answered HTTP $code"
+else
+  read -r p_generated p_epoch <<< "$(record "$work/pages.json")"
+  if [ -n "$p_epoch" ]; then
+    p_said="$pages_url holds the record measured $p_generated"
+  else
+    p_said="$pages_url answered 200 with no status record"
+  fi
+fi
+log "$p_said"
+
+pages=""
+if [ -z "$p_epoch" ]; then
+  pages=stale
+elif [ -n "$epoch" ]; then
+  lag=$((epoch - p_epoch))
+  if [ "$lag" -gt "$PAGES_MAX_LAG" ]; then
+    pages=stale
+    p_said="$p_said, ${lag}s before the record on branch status"
+  else
+    pages=current
+  fi
+else
+  log "the Pages copy is not compared: there is no record on branch status to compare it with"
+fi
+
+case "$pages" in
+  stale)
+    # shellcheck disable=SC2016 # Markdown backticks, not command substitution
+    {
+      printf '<!-- written by scripts/check-status-site -->\n'
+      printf 'The status site on Pages does not follow the record of `status.yml`.\n\n'
+      printf -- '- Pages: %s\n' "$p_said"
+      printf -- '- branch status: %s\n\n' "$said"
+      printf 'The README badges and the dashboard show an old state. The deploy job of `status.yml` fails, or Pages no longer takes a workflow build. Seen by the watchdog: %s\n\n' "$run_url"
+      printf 'reproduce:\n\n```bash\ncurl -sS %s | jq '"'"'{generated}'"'"'\ngh api repos/%s/pages --jq .build_type\ngh run list --workflow status.yml --limit 5\n```\n\n' "$pages_url" "$slug"
+      printf 'This issue closes itself when the copy on Pages trails the branch by %s s or less.\n' "$PAGES_MAX_LAG"
+    } > "$work/pages-stale.md"
+    "$REPO_ROOT/scripts/track-issue" raise pages-stale "The status site on Pages has stopped following status.yml" "$work/pages-stale.md"
+    raised=1
+    ;;
+  current)
+    "$REPO_ROOT/scripts/track-issue" clear pages-stale "The status site on Pages follows status.yml again: $p_said. Seen by $run_url"
+    ;;
+esac
+
+if [ "$raised" -eq 1 ]; then
+  exit 3
+fi
+exit 0

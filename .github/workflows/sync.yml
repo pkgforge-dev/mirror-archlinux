@@ -360,18 +360,18 @@ jobs:
     permissions:
       actions: write
       contents: read
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Keep every schedule enabled
+      # keep-schedules-enabled, then check-schedules-fired; a schedule that
+      # stopped, or a workflow disabled by hand, raises schedules-stopped.
+      # Exit 3 (a schedule stopped) keeps the run red.
+      - name: Keep every schedule enabled, check every schedule fired
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/keep-schedules-enabled
-      - name: Check every schedule fired
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: scripts/check-schedules-fired
+        run: scripts/watch-schedules
       # Each scheduled workflow starts the others when theirs did not fire.
       # always(): a check above that fails must not stop the restart.
       - name: Start an overdue status run

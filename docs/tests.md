@@ -5,7 +5,7 @@
 | suite | files | needs |
 | --- | --- | --- |
 | `static` | `tests/static/*.sh`: shellcheck, actionlint, py_compile and the policy checks | `shellcheck`, `actionlint`, `jq`; `python3` when there is python to compile; `git` for the file modes |
-| `unit` | `tests/unit/*.sh`: the wrapper and the scripts on fixed inputs, with no network | `curl`, `jq`; GNU tar for the database cases; `python3` and `git` for parts of `60-status.sh` |
+| `unit` | `tests/unit/*.sh`: the wrapper and the scripts on fixed inputs, with no network outside the host | `curl`, `jq`; GNU tar for the database cases; `python3` and `git` for parts of `60-status.sh`: `python3` runs its local listeners |
 | `integration` | `tests/integration/*.sh`: a local registry and pacman in containers, oras on the host | docker or podman (`CONTAINER_RUNTIME`), curl, jq, tar, sha256sum, and network to pull the pinned images and oras |
 | `worker` | `tests/worker/*.sh`: the Worker under `node --test` | node 22 or newer, and `sh` |
 
@@ -17,6 +17,7 @@
 | `static/35-pipeline-traps.sh` | no pipeline in a shipped bash script ends in a reader that stops early; `client/pacman-oci` runs with no `pipefail` and is left out |
 | `static/40-executable-bits.sh` | a shipped file with a `#!` line is 100755 in the git index; one without is 100644 |
 | `static/50-workflow-policy.sh` | the shape of every workflow: permissions, timeouts, pins, no untrusted value in `run:`; artifact names that survive a re-run; each step that calls `gh workflow run`, run against a stub `gh`; the concurrency group of each kind of `ci.yml` run, evaluated; the concurrency queues |
+| `static/55-issue-steps.sh` | the workflow steps that raise and clear issues run when they are needed: `stale-<target>` with `always()`, after a check step that stops before its job; `status.yml` job `worker` whatever `build` did, with the result of `build` through `env`; `check-status-site` with `always()`; `watch-schedules` in the jobs that watch the schedules, with `issues: write` |
 | `static/60-targets.sh` | every target file parses and pins its images; one verify image; a plan slot for each target |
 | `static/70-python.sh` | every python file compiles; every file in `client/` and `scripts/` is shell or python |
 | `static/72-test-runner.sh` | `tests/run.sh` finds the files, runs one file, gates a live test, and fails a failed run |
@@ -24,11 +25,13 @@
 | `unit/10-tag-encoding.sh` | every package file maps to one tag, and no two files share one |
 | `unit/20-json-parser.sh` | the JSON parser reads every legal shape and refuses anything else |
 | `unit/30-wrapper-urls.sh` | one manifest request per URL; a URL it cannot read is refused before the network |
-| `unit/31-run-store.sh` | the run store: key, ownership, sweep, remover, host blacklist |
+| `unit/31-run-store.sh` | the run store: key, ownership, sweep, remover, host blacklist, the run's anonymous token |
 | `unit/32-prefetch-plan.sh` | the argument rewrite, the print lines, the signatures written from `%g`, the size of a held `.part` |
 | `unit/40-lib.sh` | the decisions of the sync on fixed inputs |
+| `unit/42-registry-faults.sh` | `stage`, `promote`, `mirror-file` and `verify-batch` against stand-ins for curl, oras and the container runtime: a registry or an image source that fails, refuses or limits them |
 | `unit/45-dispatch-overdue.sh` | `scripts/dispatch-overdue` starts a workflow only when it is active and overdue |
-| `unit/60-status.sh` | `status-collect`, `status-render` and `check-staleness` on fixtures, also with one registry read that fails and with no registry read at all; the synced badge, the times and the one script of the page, and the size table and badges |
+| `unit/60-status.sh` | `status-collect`, `status-render` and `check-staleness` on fixtures, also with one registry read that fails and with no registry read at all; `check-staleness` within `STALENESS_BUDGET` and `status-collect` within `STATUS_BUDGET`, against a local `db_server` that never answers; both against a first `db_server` that is behind the second, and one that answers 200 with an HTML page; the Worker probe through to the signed URL (one that answers 403, a working host outside `githubusercontent.com`), and the database downloaded through the Worker; the synced badge, the times and the one script of the page, and the size table and badges |
+| `unit/62-issues.sh` | the scripts that raise and clear issues, against a stand-in for `gh` (`tests/fixtures/issues/fake-gh`): `check-status-record`, `check-status-site`, `watch-schedules`, and `report` for `refused-<target>` |
 | `integration/10-pipeline.sh` | the whole mirror against its own registry and upstream |
 | `integration/20-client.sh` | the wrapper against its own registry, through faulty proxies |
 | `worker/10-node.sh` | `node --test 'worker/test/*.test.js'` |
@@ -84,7 +87,7 @@ A test that needs a tool can call `need_tool NAME DESC` (`tests/lib/harness.sh`)
 TESTS_REQUIRE_TOOLS='shellcheck actionlint jq python3' tests/run.sh static
 ```
 
-`50-workflow-policy.sh`, `70-python.sh`, `75-renovate.sh` and `45-dispatch-overdue.sh` use `need_tool`. The static, unit and worker jobs of CI set `TESTS_REQUIRE_TOOLS`. The integration job does not.
+`50-workflow-policy.sh`, `70-python.sh`, `75-renovate.sh`, `45-dispatch-overdue.sh` and `62-issues.sh` use `need_tool`. The static, unit and worker jobs of CI set `TESTS_REQUIRE_TOOLS`. The integration job does not.
 
 ⚠ Other tests handle an absent tool in their own way:
 
@@ -171,6 +174,9 @@ The tree itself is never changed. An integration fault runs with its own registr
 | integration/20-client | a transfer cut by its time limit never goes on in the next pass | not ok: `stall: the prefetch cut the stopped transfer and resumed it from 64 KiB` |
 | integration/20-client | the prefetch makes one pass only | not ok: `resume: every blob cut in half: the prefetch resumed it, the serial pass made no request` |
 | integration/20-client | a refused range keeps the 30 s stop of the attempts | 3 not ok, among them `norange: a plain Server that ignores Range: pacman -S big succeeds after its range is refused past 30 s` |
+| integration/20-client | the wrapper of before the run's token | 18 not ok, among them `token: the prefetch reads the three packages, again with the token after the refusal` (3 where 6 is expected) and `token: one token request per repository and pacman run, 4 for -Sy and -S of two repositories` (7) |
+| unit/31-run-store | the wrapper of before the run's token | 4 not ok, among them `the next call of the run sends the kept token first: no 401, no token request` (4 requests: the refused manifest, the token, the manifest, the blob) and `a kept token that the registry refuses is replaced: the file is read, and the store holds the new token` |
+| unit/32-prefetch-plan | the wrapper of before the run's token | not ok: `a print run with PACMAN_OCI_NO_DUMMY=1` (got `no print run`) |
 
 ### scripts
 
@@ -224,6 +230,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | integration/10-pipeline | the first failed server ends the search | not ok: assertion 109 |
 | integration/10-pipeline | the unsigned list is not written to the staged manifest | not ok: assertions 42, 44, 45, 46 |
 | integration/10-pipeline | plan ignores the unsigned list of `latest` | not ok: assertions 44, 45, 46 (a signature published later never reaches the mirror) |
+| integration/10-pipeline | plan's step 4b turned off | 8 not ok, among them `a .sig made again upstream, with the database the same, plans that file alone` (got `current`) and `more than SIGCHECK_ESCALATE of one sample changed: every file with a detached signature only is planned` |
 | unit/40-lib | an anonymous read uses the cached token | not ok: assertions 91, 92 |
 | unit/40-lib | the report reads every summary, of any plan | not ok: assertions 96, 97, 99, 100 |
 | unit/40-lib | `collect` reads verdicts of another digest | not ok: assertion 101 |
@@ -231,9 +238,24 @@ The tree itself is never changed. An integration fault runs with its own registr
 | integration/10-pipeline | plan refuses a files database that leaves a package out | not ok: assertions 47 to 50 |
 | integration/10-pipeline | verify runs `-Fl` over every name of the batch | not ok: assertion 50 |
 | integration/10-pipeline | plan refuses a files database that names a package the database does not | not ok: `a files database that names a package the database does not is planned`, `the plan names the package only the files database names` |
+| integration/10-pipeline | the file-name drift bound used when `FILES_DRIFT_MAX` is not set | 3 not ok: `a files database that lags 12 rebuilt packages of 40 is planned` (got `error`), `the plan names the 12 packages the files database names at an earlier file name`, `the refusal names how many packages the files database names` |
 | integration/10-pipeline | plan no longer compares the sha256 of a file both databases name | not ok: `a files database that names a file of the database with other bytes is refused`, `the refusal names the file` |
 | integration/10-pipeline | every `sig-refused` package excused | not ok: with no `%PGPSIG%`, a layer that is not upstream's `.sig` is not excused |
 | integration/10-pipeline | `build-repo` signs on every build | not ok: an update is planned as new files only; `latest` does not move backwards |
+| unit/40-lib | `scripts/lib.sh` of before the anonymous token flow | 11 not ok, among them `registry, anonymous: GHCR refuses QQ== with 401, and the anonymous token reads the manifest` (got `1 1 0`), `registry blob, anonymous: GHCR refuses QQ==, and the anonymous token reads the blob` and `registry_blob: a blob that trickles is given up within REG_BLOB_MAX_TIME, with one request` (status 124 after 30 s) |
+| unit/42-registry-faults | `scripts/lib.sh` and `scripts/stage` of before `REG_LAST_CODE` | not ok: `stage: an anonymous read that answers 503 is asked 5 times` (1 read), `stage: an anonymous read that answers 503 sets error, naming HTTP 503, not private` (state `private`) |
+| unit/40-lib | `rate_limited` with the old pattern `toomanyrequests\|429 Too Many` | not ok: `rate limit: oras's words for a 429 with no body` |
+| unit/42-registry-faults | `lib.sh`, `stage`, `promote` and `mirror-file` of before `throttle_pause` | 4 not ok: `stage: three 429s on the staging push: three pauses, four pushes, staged` (got `0 0 3 error`), `promote: three 429s on the first tag: three pauses, seven tag calls, promoted` (got `1 0 3`), `promote: 429s past PROMOTE_RATE_WAIT fail it, naming the pauses`, `mirror-file: three 429s in oras's words: three pauses, the shard's throttle file, pushed` (got `1 0 no failed`) |
+| integration/10-pipeline | `scripts/verify-batch` with no `disable-dirmngr` | not ok: `verify's key lockdown, network default: a WKD lookup on archlinux.org fails within 5 s` (exit 0 after 2 s: the key came by WKD); the case with no network passes either way |
+| integration/10-pipeline | `scripts/mirror-file` of before the plain-server rule | 3 not ok: `a plain server that does not answer: the file upstream signs nowhere is pushed unsigned, naming the host` (got `failed its .sig could not be read (1 server(s) failed, 2 answered 404)`), `a plain server that does not answer: the target stages, verify excuses the file as sig-missing, and it is promoted` (got `held`), and the `db_server` case, whose why named no host |
+| integration/10-pipeline | the `sig-missing` loop of `scripts/verify-batch` of before the plain-server rule | not ok: `a plain server that does not answer: the target stages, verify excuses the file as sig-missing, and it is promoted` (got `staged failed`) |
+| integration/10-pipeline | `scripts/verify-batch` of before `@@keyring-failed` | not ok: `a keyring package that does not install: the verdict names it and pacman's error line` (got `the container ended with status 1 before its last phase`) |
+| unit/40-lib | `registry_token` of before the `QQ==` answer for a repository GHCR does not show | not ok: `registry_token, anonymous: GHCR refuses the repository (403): QQ==, which reads it as absent` (got `1`: status-collect would show a target with no push yet in error) |
+| unit/40-lib | `scripts/lib.sh` that takes a 401 of the token endpoint for an absence, as its 403 | 2 not ok: `registry, anonymous: a token endpoint that answers 401 is an error, not an absence` (got `4 2 1 401`), `registry_token, anonymous: a token endpoint that answers 401 gives no token, not QQ==` (got `0 QQ==`) |
+| unit/42-registry-faults, in the busybox leg | `timeout --kill-after=N` in `stage`, `promote`, `mirror-file` and `verify-batch` | 14 not ok of 14: busybox 1.37 `timeout` says `unrecognized option: kill-after=10` |
+| unit/40-lib | `scripts/lib.sh` `fetch_upstream` of before the HTTP code is logged | 3 not ok: `fetch_upstream: a 403 with a Cloudflare challenge is status 1, with one line` (got `1 0`), `fetch_upstream: the line names the URL, HTTP 403 and the challenge`, `fetch_upstream: a 503 with no cf-mitigated header is named with its code alone` |
+| unit/40-lib | `scripts/lib.sh` `registry_token_get` with `--max-time 60` and no whole-call deadline | 3 not ok: `registry_token: the token request gets REG_TOKEN_MAX_TIME, ...` (got `60 none`), `registry_token: a token endpoint that stalls is given up within REG_TOKEN_MAX_TIME, and gives no token` (after 60 s, the length of the fake's stall), and `... a REG_TOKEN_MAX_TIME that is not a number of seconds is refused` (accepted) |
+| unit/42-registry-faults | `scripts/verify-batch` of before the image mirrors | 5 not ok, among them `verify-batch: Docker Hub's pull limit: the digest comes from the first mirror, and the container runs it` (exit 1, verdict `could not pull ... in two attempts of 300 s`) and `verify-batch: a pull limit is not asked again: one pull from Docker Hub, one from the mirror` (two pulls from Docker Hub) |
 | static/60-targets | five edits in a copy: a `docker.io` keyring image, a removed `# tag: aarch64`, another verify digest, renamed plan slots, a `keyring_from` that does not exist | one not ok for each edit, among them `every target verifies in the one image, on linux/amd64` |
 
 ### status
@@ -243,7 +265,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/60-status | `cron-tolerance --minutes` leaves out the gap from the last firing to the first | not ok: `interval: only on 29 February is 1461 days, 2103840 minutes` |
 | unit/60-status | coverage keyed by file name only | 17 not ok, among them `x86_64-extra: a file counts only with the same name and sha256: 3 of 5` and the badge texts |
 | unit/60-status | `failed_runs` always 1 | not ok: `worker: two failed runs in a row, failing since the first` |
-| unit/60-status | the Location check accepts `http://` | not ok: `worker: a 302 to http is not a redirect to https://*.githubusercontent.com` |
+| unit/60-status | the Location check accepts `http://` | not ok: `worker: a 302 to http fails: the Location must be https` |
 | unit/60-status | the history keeps every line | not ok: `history keeps the last 2000 lines`, `the oldest lines go first and the new one is last` |
 | unit/60-status | a background `<rect>` left unclosed | 18 not ok, among them `site: all 22 SVG files parse as XML, each with a title and its own dark style` |
 | unit/60-status | the badge message left empty | 30 not ok: each `<site>: badge <name> carries its text: <words>` |
@@ -266,6 +288,13 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/60-status | `fmt_ago` divides days by 0 | not ok: `synced-30h: status-render exits 0`, `synced-30h: 30 h ago is 1 d ago, red` |
 | unit/60-status | `status-render` reads `created` only, never `fetched` | 5 not ok, among them `synced-fetched: a status.json with no created time falls back to the newest fetched time, 3 h ago` |
 | unit/60-status | `status-collect` takes `last_synced` from `created` only | not ok: `no latest names a created time: last_synced falls back to the newest fetched time` |
+| unit/60-status | `check-staleness` of before `STALENESS_BUDGET`, against 8 targets whose first `db_server` never answers | 5 not ok, among them `check-staleness: a db_server that never answers: every target has a state` (got 0: `timeout 120` ended the check at its first target) and `... is asked once in the run, not once per target` (got 2) |
+| unit/60-status | `status-collect` of before `STATUS_BUDGET`, against the same 8 targets | 7 not ok, among them `status-collect: a db_server that never answers: the collect ends by itself and exits 0` (got 124 from `timeout 120`, no `status.json`) and `status-collect: no time left for a read: each target is measured, with an upstream.error that names STATUS_BUDGET` |
+| unit/60-status | `upstream-db`, `check-staleness` and `status-collect` that take the first `db_server` that answers 200 | 7 not ok, among them `check-staleness: a first db_server behind the second does not stand for upstream: stale, exit 3` (got `current`), `check-staleness: an HTML page that answers 200 is refused, ...` (got `stale`) and `status-collect: upstream is the second db_server when the first is behind it, ...` |
+| unit/60-status | `status-collect` whose Worker probe does not follow the 302, and judges the Location host | 11 not ok, among them `worker: a signed URL that answers 403 to the runner fails the probe, whatever the 302 looks like` (got `ok` true, `worker.ok` true), `worker: a working blob host outside githubusercontent.com passes, marked location_unexpected` (got `ok` false) and `the smallest database of a target with latest, downloaded through the Worker, is the one latest names` (got no download) |
+| unit/60-status | `worker.median_seconds` over every probe, the download too | not ok: `worker: the median answer time is of the 7 probes, 0.4 s; the 9 s download is left out` (got 0.45 and 450 ms) |
+| unit/60-status | `status-render` with no signed URL, cache and unexpected host in the probe table | 5 not ok: `<site>: index.html says: pkg-containers.githubusercontent.com hit ok` in four sites, and `site: a probe whose redirect host is outside githubusercontent.com is shown as a warning that passes` |
+| unit/60-status | `status-render` with no list of the `db_server` hosts not taken | 4 not ok: `<site>: index.html says: https://up.test/loong64/core 1 db_server(s) not taken https://down.test/loong64/core : curl 6` |
 | unit/60-status | `status-collect` takes the oldest time for `last_synced` | 14 not ok, among them `summary: last_synced is the newest of each target's created time, or its fetched time` and `site: badge synced carries its text: synced \| 2 h ago` |
 | unit/60-status | `status-collect` keeps the fraction of `created` | 19 not ok, among them `mirror.created is latest's org.opencontainers.image.created, the fraction cut; null when latest names none` |
 | unit/60-status | `mirror.created` is `""` in place of `null` | 3 not ok, among them the `mirror.created` test and `summary: no registry read: last_synced is unknown` |
@@ -286,6 +315,17 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/60-status | the size badges of the architectures with no `</svg>` | 31 not ok, among them `site: a size badge for each architecture (aarch64 loong64 x86_64) parses as XML` |
 | unit/60-status | the group labels of `charts/size.svg` with no sum | 5 not ok: `<site>: chart size shows ... x86_64 · 1.6 KiB of 2.4 KiB, 2 of 3 measured ...` |
 
+### issues
+
+| test | fault | observed |
+| --- | --- | --- |
+| unit/62-issues | no `scripts/check-status-record` and no `scripts/check-status-site` | 12 of 12 not ok |
+| unit/62-issues | `check-status-record` takes every build for `success` | not ok: `a build that failed raises status-down; the fresh record still clears worker-down` (got `comment 12;close 12`, no `open status-down`), `the status-down body names the build result and the run` |
+| static/55-issue-steps | `status.yml` of before the `status-down` check, and `watchdog.yml` with no `check-status-site` step | not ok: `job worker runs whatever build did, so a build that fails raises status-down` (its `if` names `needs.build.result == 'success'`), `job worker gives scripts/check-status-record the result of build, through env`, `job staleness checks the status record and its copy on Pages, with always()` |
+| unit/62-issues | `watch-schedules` that runs the two checks of before it, and raises no issue | 6 not ok, among them `watch-schedules: the last scheduled runs are 10 days old: schedules-stopped is raised, and the run stays red (exit 3)` (got exit 3 and no issue call) and `... a workflow disabled by hand raises schedules-stopped, ...` |
+| unit/62-issues | `report` of before `refused-<target>` | not ok: `report: 20 upstream-refused files of a promoted target raise refused-<target>; the run stays green` (got exit 0 and no issue call), `report: the refused-<target> body lists the files ...`, `report: a later promoted run with none clears refused-<target>` |
+| static/55-issue-steps | `watchdog.yml` and `sync.yml` of before `watch-schedules` | not ok: `job schedules runs scripts/watch-schedules with issues: write, ...`, `job keepalive runs scripts/watch-schedules with issues: write, ...` |
+
 ### worker
 
 | test | fault | observed |
@@ -294,6 +334,10 @@ The tree itself is never changed. An integration fault runs with its own registr
 | worker/test (cache) | 404 answers not stored under the `loc` key | not ok: `a repeat request is one cache lookup and no subrequest` |
 | worker/test (cache) | no 600 s cap on the signed URL time to live | not ok: TTL 880 where 600 is expected |
 | worker/test (cache) | a URL with no `se` stored for 600 s | not ok: `a signed URL with no se is not stored` |
+| worker/test (cache) | no `x-mirror-cache` on a 302 | 2 not ok, among them `x-mirror-cache: miss when the answer is stored, hit when it comes from the loc entry` |
+| worker/test (cache) | no log for a signed URL with no usable `se` | not ok: `a signed URL with no usable se: asked again each time, logged once, x-mirror-cache: nostore` |
+| worker/test (cache) | a `loc` hit says `miss` | not ok: `x-mirror-cache: miss when the answer is stored, hit when it comes from the loc entry` |
+| worker/test (cache) | `storeAnswer` says that it stored nothing | not ok: `x-mirror-cache: miss when the answer is stored, hit when it comes from the loc entry` |
 | worker/test (cache) | the package-with-sig time to live 86400 | not ok: manifest TTLs |
 | worker/test (cache) | the layer count check uses `>= 1` | not ok: `a package manifest with a second layer of the file name is not kept 6 h` |
 | worker/test (cache) | the `loc` entry ignores the manifest entry | not ok: `a latest redirect never outlives the latest manifest entry, so a new latest shows within 30 s` |
@@ -302,8 +346,15 @@ The tree itself is never changed. An integration fault runs with its own registr
 | worker/test (cache) | `cache.match` exceptions not caught | not ok: `a cache that fails is logged, and the request still gets its answer from GHCR` |
 | worker/test (ghcr) | no `signal` on fetch | not ok: `every subrequest has a 10 s deadline, the anonymous token and no redirect followed` |
 | worker/test (ghcr) | a blob 200 returned as is | not ok: `a blob that GHCR answers with 200 gets 502: the Worker never sends the bytes` |
-| worker/test (ghcr) | the Location host check removed | not ok: `the Location must be https and its host must end in .githubusercontent.com` |
+| worker/test (ghcr) | the Location https check removed | not ok: `a Location that is not https, or not a URL, gets 502 and is not stored` |
+| worker/test (ghcr) | a Location host outside `*.githubusercontent.com` refused with 502 | not ok: `a Location on an https host outside *.githubusercontent.com is served, marked, and logged once` |
+| worker/test (ghcr) | no `x-mirror-blob-host` header | not ok: `a Location on an https host outside *.githubusercontent.com is served, marked, and logged once` |
+| worker/test (ghcr) | `logOnce` logs on every call | not ok: `a Location on an https host outside *.githubusercontent.com is served, marked, and logged once` |
 | worker/test (ghcr) | the `@sha256` pin not compared | not ok: `an @sha256 pin whose manifest hashes to another value gets 502 and is not stored` |
+| worker/test (ghcr) | `ghcr()` returns every refusal of `Bearer QQ==`: no token flow | 4 not ok, among them `GHCR refuses Bearer QQ==: one token request, then every file reads with that token` (502 where 302 is expected) |
+| worker/test (ghcr) | the outermost `catch` throws again | not ok: `an unexpected error inside the Worker gets 502 with retry-after, not an error page` |
+| worker/test (ghcr) | a refusal of the kept token returned as is | not ok: `a kept token that GHCR refuses is replaced once; with no new token the 502 names the kept token` |
+| worker/test (ghcr) | the 502 names `Bearer QQ==` when the kept token was refused | not ok: `a kept token that GHCR refuses is replaced once; with no new token the 502 names the kept token` |
 | worker/test (ghcr) | the 64 KiB byte cap removed | not ok: `a manifest over 64 KiB with no or a false content-length is cut at 64 KiB` |
 | worker/test (paths) | `TAG_RE` accepts every tag | not ok: `any other tag gets 404 with no subrequest, staging included` |
 | worker/test (paths) | no `decodeURIComponent` | not ok: `a percent-encoded file name is decoded before its tag is made` |
@@ -313,7 +364,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | worker/10-node | a node shim that reports v20.18.0 | not ok: `node is 22 or newer` |
 | worker/live | run against the deployed version 1 | 3 of 28 not ok: `:staging` gets 302, `%2B` gets 404 |
 
-63 faults, each applied alone to a copy of `worker/`, were each caught. Every one of the 51 node tests was seen to fail at least once.
+74 faults, each applied alone to a copy of `worker/`, were each caught. Every one of the 59 node tests was seen to fail at least once.
 
 ### policy and tools
 
@@ -328,6 +379,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | static/35-pipeline-traps | a pipeline that ends in a reader that stops early | not ok: `scripts/install-oras: no pipeline ends in a reader that stops early` |
 | static/40-executable-bits | a script committed without its executable bit | not ok: `scripts/plan is mode 100755 in the index` |
 | static/40-executable-bits | a `#!` line added to `scripts/lib.sh` | not ok: `scripts/lib.sh has no #! line, so it stays 100644` |
+| static/55-issue-steps | `watchdog.yml` of before the step of its own for `stale-<target>` | not ok: `the step that raises or clears stale-<target> runs with always() ...`, `the check-staleness step stops before the job does` |
 | static/50-workflow-policy | a job with no `timeout-minutes` | not ok: `.github/workflows/watchdog.yml: every job has timeout-minutes` |
 | static/50-workflow-policy | a dispatch input expanded inside a `run:` block | not ok: `.github/workflows/sync.yml: no untrusted value is expanded inside a run: block` |
 | static/50-workflow-policy | an action pinned by tag | not ok: `.github/workflows/ci.yml: every action is pinned by commit` |
@@ -370,6 +422,8 @@ These are not code faults. They are hostile or broken inputs, built by `tests/fi
 | another arch | verified in the x86_64 image with `Architecture` from the target |
 | a package that upstream signs nowhere, and one signed by an expired key | upstream-refused: listed, and the snapshot promoted |
 | the same batch with no trust root | failed: nothing is excused |
+| a WKD lookup of a packager's key in the verify container | fails within 5 s, with the network on and off |
+| a keyring package name that the repository does not hold | failed; the verdict names the package and pacman's `target not found` line |
 | a keyring package that only `keyring_from` holds | installed from that target's `latest`, pinned by digest |
 | an upstream database older than the promoted one | `behind`; `latest` does not move |
 | a file signed again with the same bytes | planned; its signature layer repaired under the same tag |
@@ -377,10 +431,16 @@ These are not code faults. They are hostile or broken inputs, built by `tests/fi
 | a file whose bytes change under its own name | `replaced`; the tag does not move |
 | a new file whose tag already holds other bytes | `replaced`; the tag does not move |
 | two db_servers, each ahead of the other on one package | `held` |
+| a files database that lags 12 rebuilt packages of 40 | planned; the 12 packages named |
+| a files database that names none of the packages of the database | refused, with the count named |
 | a package signed by a key nobody trusts | upstream-refused: listed, and the snapshot promoted |
+| a file that upstream signs nowhere, with a plain server that refuses every connection | pushed unsigned, the closed host named; upstream-refused as `sig-missing`; promoted |
+| the same with the closed host as a `db_server` | `held`, the closed host named |
 | a database with no `%PGPSIG%` | each new signature layer is upstream's detached `.sig` |
 | a db_server, listed first, that lags by one dropped package | `latest` does not move |
-| with no `%PGPSIG%`, a signature layer that is not upstream's `.sig` | verify fails: the mirror is at fault |
+| with no `%PGPSIG%`, a signature layer that is not upstream's `.sig`, written after stage | verify fails: the mirror is at fault |
+| with no `%PGPSIG%`, a `.sig` that upstream makes again, the database the same | planned alone; its layer repaired with the same package blob; promoted |
+| more `.sig` files made again in one sample than `SIGCHECK_ESCALATE` | every file with a detached signature only is planned, with a warning |
 | a manifest whose bytes are not the pinned digest | refused by the wrapper |
 | a manifest with two layers of one name | refused by the wrapper |
 | a package manifest with no signature layer | refused by the wrapper, with a message |
@@ -388,7 +448,7 @@ These are not code faults. They are hostile or broken inputs, built by `tests/fi
 | a manifest over 64 KiB | given up within 20 s |
 | a database signature whose snapshot moved on | not paired; the wrapper misses |
 
-`20-client.sh` adds these. The first four go through proxies of its own:
+`20-client.sh` adds these. The first six go through proxies of its own:
 
 | input | must end as |
 | --- | --- |
@@ -396,6 +456,8 @@ These are not code faults. They are hostile or broken inputs, built by `tests/fi
 | every blob cut in half | the install succeeds; the cut package resumes with a Range request |
 | a blob that stops after 64 KiB for 40 s | the install takes less than 20 s; the transfer resumes from 64 KiB |
 | one byte changed in the first answer for each blob | the prefetch keeps nothing; each file is read again alone; the install succeeds |
+| a registry that refuses the dummy token, and gives an anonymous token | one token request per repository and run; the prefetch reads every file with it; the serial pass makes no request; the refusal is said once |
+| the same with `PACMAN_OCI_NO_DUMMY=1` | the same, and no refusal is said |
 | a plain Server of its own that ignores Range, and stops a large file for 35 s | the install succeeds; the refused range is followed by one fetch from zero |
 | a provider other than the default | the prefetch takes the first provider; the chosen one is read alone |
 | two repositories with no database signature, under the sandbox | both signatures answered with an empty file; `-Sy` takes less than 1.9 s |

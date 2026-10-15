@@ -1654,6 +1654,17 @@ def page(ctx, charts, badges):
             if speed_rows else "<p>No benchmark yet.</p>"),
     ])
 
+    def upstream_cell(u):
+        """The db_server taken, or why none was, then each db_server not
+        taken with its result: behind, refused, an HTTP code, a curl status."""
+        main = esc(u.get("server") or u.get("error") or "-")
+        others = [x for x in (u.get("tried") or []) if isinstance(x, dict) and x.get("result") != "ok"]
+        if not others:
+            return main
+        return ('%s<details><summary>%d db_server(s) not taken</summary><div class="missing">%s</div></details>'
+                % (main, len(others), "<br>".join("<code>%s</code>: %s" % (esc(x.get("server")), esc(x.get("result")))
+                                                for x in others)))
+
     repo_rows = []
     for t in targets:
         c = t.get("coverage") or {}
@@ -1667,7 +1678,7 @@ def page(ctx, charts, badges):
                     % (miss, ", ".join("<code>%s</code>" % esc(n) for n in names),
                        esc(", and %s more" % fmt_int(more)) if more > 0 else ""))
         probes = []
-        for key in ("db", "package"):
+        for key in ("db", "package", "download"):
             p = (t.get("worker") or {}).get(key)
             if p:
                 probes.append("%s %s%s" % (key, p.get("code"), " failed" if p.get("ok") is False else ""))
@@ -1678,7 +1689,7 @@ def page(ctx, charts, badges):
             miss, esc(fmt_gib(c.get("of_bytes"))), esc(fmt_age(t.get("age_seconds"))),
             esc(fmt_ago(ctx["now"] - t_synced) if t_synced is not None and ctx["now"] else "-"),
             esc(fmt_age(t.get("lag_seconds"))), time_iso((t.get("mirror") or {}).get("fetched")),
-            esc(u.get("server") or u.get("error") or "-"), esc(", ".join(probes) or "-"),
+            upstream_cell(u), esc(", ".join(probes) or "-"),
             '<img src="badges/%s.svg" alt="%s badge" height="20">' % (esc(t["target"]), esc(t["target"])),
         ])
     repos = table(["repository", "state", "coverage", "files", "upstream", "missing", "GiB", "age",
@@ -1688,19 +1699,26 @@ def page(ctx, charts, badges):
 
     probe_rows = []
     for t in targets:
-        for key in ("db", "package"):
+        for key in ("db", "package", "download"):
             p = (t.get("worker") or {}).get(key)
             if not p:
                 continue
             ok = p.get("ok")
             lvl = "good" if ok is True else ("critical" if ok is False else "unknown")
+            word = "ok" if ok is True else (p.get("error") or "not judged")
+            if ok is True and p.get("location_unexpected") is True:
+                lvl, word = "warning", "ok, the redirect host is outside *.githubusercontent.com"
+            where = p.get("location") or "-"
+            if p.get("blob_host") and p.get("blob_host") != p.get("location"):
+                where = "%s (the Worker names %s)" % (where, p.get("blob_host"))
+            signed = p.get("signed_code")
             probe_rows.append([
                 esc(t["target"]), esc(key), "<code>%s</code>" % esc(p.get("url")),
                 esc(p.get("code")), esc(p.get("expect") if p.get("expect") is not None else "-"),
-                esc(fmt_secs(p.get("seconds"))), esc(p.get("location") or "-"),
-                state_cell(lvl, "ok" if ok is True else (p.get("error") or "not judged"))])
-    probes_html = (table(["repository", "probe", "URL", "HTTP", "expected", "time", "redirect to",
-                          "result"], probe_rows, (3, 4, 5))
+                esc(signed if signed is not None else "-"), esc(fmt_secs(p.get("seconds"))), esc(where),
+                esc(p.get("cache") or "-"), state_cell(lvl, word)])
+    probes_html = (table(["repository", "probe", "URL", "HTTP", "expected", "signed URL", "time", "redirect to",
+                          "cache", "result"], probe_rows, (3, 4, 5, 6))
                    if probe_rows else "<p>The Worker was not probed.</p>")
 
     badge_rows = []
@@ -1757,7 +1775,7 @@ def page(ctx, charts, badges):
 <h2>Repositories</h2>
 <div class="scroll">%(repos)s</div>
 <h2>Worker probes</h2>
-<p>Each probe is one GET with no redirect followed. A repository with a snapshot must answer 302 to <code>https://*.githubusercontent.com</code>. A repository with no snapshot must answer 404. %(down)s</p>
+<p>Each probe is one GET with no redirect followed. A repository with a snapshot must answer 302 to an https URL, and that signed URL must answer a request for one byte from the status runner, with no credential. A redirect host outside <code>*.githubusercontent.com</code> whose signed URL works is shown, and passes. A repository with no snapshot must answer 404. Once per run, the smallest database is downloaded through the Worker, and it must be the database its snapshot names. %(down)s</p>
 <div class="scroll">%(probes)s</div>
 <h2>Badges</h2>
 <p>The status workflow writes each badge when it measures: each hour, and after each sync. An age in a badge counts to that measurement, not to now. The synced badge is green under %(good)d h, yellow under %(late)d h, and red after. A badge is an image and runs no script, so it shows its time in UTC or as an age.</p>

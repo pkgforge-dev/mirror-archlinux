@@ -229,6 +229,108 @@ else
 fi
 
 #---------------------------------------------------------------------------#
+# A registry that refuses the dummy token: the first call gets the anonymous
+# token from the challenge and keeps it in the store, mode 0600. The next call
+# of the run sends it first. The token goes with the store.
+#---------------------------------------------------------------------------#
+if need_tool python3 "the run's anonymous token: kept in the store, sent first, gone with the store"; then
+  cat > "$work/tokreg.py" << 'EOF'
+import hashlib, http.server, json, sys
+hits = open(sys.argv[1], "a", buffering=1)
+PKG, SIG = b"package bytes\n", b"\x88signature\n"
+def dg(b):
+    return "sha256:" + hashlib.sha256(b).hexdigest()
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *args):
+        pass
+    def send(self, code, body, ctype="application/json", extra=()):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        auth = self.headers.get("Authorization") or "none"
+        path = self.path.split("?")[0]
+        hits.write("%s %s\n" % (path, auth))
+        if path == "/token":
+            return self.send(200, b'{"token":"anon","expires_in":300}')
+        if auth != "Bearer anon":
+            realm = "http://127.0.0.1:%d/token" % self.server.server_address[1]
+            return self.send(401, b'{"errors":[{"code":"UNAUTHORIZED"}]}', extra=[("WWW-Authenticate", 'Bearer realm="%s",service="test"' % realm)])
+        if "/manifests/" in path:
+            name = path.rsplit("/", 1)[1]
+            layers = [(name, PKG, "application/vnd.pkgforge.archlinux.pkg.v1"), (name + ".sig", SIG, "application/pgp-signature")]
+            m = {"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                 "layers": [{"mediaType": t, "digest": dg(b), "size": len(b), "annotations": {"org.opencontainers.image.title": n}} for n, b, t in layers]}
+            return self.send(200, json.dumps(m).encode(), "application/vnd.oci.image.manifest.v1+json")
+        for b in (PKG, SIG):
+            if path.endswith("/blobs/" + dg(b)):
+                return self.send(200, b, "application/octet-stream")
+        return self.send(404, b'{"errors":[{"code":"BLOB_UNKNOWN"}]}')
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+print(s.server_address[1], flush=True)
+s.serve_forever()
+EOF
+  : > "$work/tok.hits"
+  python3 -I "$work/tokreg.py" "$work/tok.hits" > "$work/tok.port" 2> "$work/tok.err" &
+  tok_pid=$!
+  trap 'kill "$tok_pid"; rm -rf "$work"' EXIT
+  tport=""
+  for _ in $(seq 1 50); do
+    tport="$(sed -n 1p "$work/tok.port")"
+    [ -z "$tport" ] || break
+    sleep 0.1
+  done
+  T="oci+http://127.0.0.1:$tport/ns/mirror/x86_64/core"
+  parent 850
+  K="$$-850"
+  d="$work/token"
+  mkdir -p "$d"
+  call "$d/tok-1-1-any.pkg.tar.zst.part" "$T/tok-1-1-any.pkg.tar.zst"
+  check "a registry that refuses the dummy token: the file is read with the anonymous token" "0:package bytes" \
+    "$rc:$(cat "$d/tok-1-1-any.pkg.tar.zst.part" 2> /dev/null)" "client/pacman-oci DIR/tok...part $T/tok...; cat $work/tok.hits"
+  check "the refusal of the dummy token is said once on stderr, not only in debug output" 1 \
+    "$(grep -c 'refused the dummy token Bearer QQ==; the anonymous token flow is used' "$work/err")" "cat $work/err"
+  tname=".pacman-oci.$K.,token.127.0.0.1:$tport.$(printf '%s' ns/mirror/x86_64/core | sha256sum | cut -d ' ' -f 1)"
+  check "the token is kept in the run store, mode 0600" "600 anon" \
+    "$(stat -c %a "$d/$tname" 2> /dev/null) $(cat "$d/$tname" 2> /dev/null)" "ls -la $d"
+  : > "$work/tok.hits"
+  call "$d/tok2-1-1-any.pkg.tar.zst.sig.part" "$T/tok2-1-1-any.pkg.tar.zst.sig"
+  check "the next call of the run sends the kept token first: no 401, no token request" \
+    "0 /v2/ns/mirror/x86_64/core/manifests/tok2-1-1-any.pkg.tar.zst Bearer anon|/v2/ns/mirror/x86_64/core/blobs/sha256:$(printf '\210signature\n' | sha256sum | cut -d ' ' -f 1) Bearer anon|" \
+    "$rc $(tr '\n' '|' < "$work/tok.hits")" "cat $work/tok.hits; cat $work/err"
+  parent 851
+  left=1
+  for _ in 1 2 3 4 5 6; do
+    left="$(find "$d" -name ".pacman-oci.$K.*" | wc -l | tr -d ' ')"
+    [ "$left" -ne 0 ] || break
+    sleep 0.5
+  done
+  check "the token goes with the store when the run ends" 0 "$left" "ls -la $d"
+  # A kept token that the registry refuses is replaced, and no refusal of
+  # the dummy token is said: it was not sent.
+  parent 852
+  K="$$-852"
+  tname=".pacman-oci.$K.,token.127.0.0.1:$tport.$(printf '%s' ns/mirror/x86_64/core | sha256sum | cut -d ' ' -f 1)"
+  printf 'stale\n' > "$d/$tname"
+  : > "$work/tok.hits"
+  call "$d/tok3-1-1-any.pkg.tar.zst.part" "$T/tok3-1-1-any.pkg.tar.zst"
+  check "a kept token that the registry refuses is replaced: the file is read, and the store holds the new token" \
+    "0 /v2/ns/mirror/x86_64/core/manifests/tok3-1-1-any.pkg.tar.zst Bearer stale|/token none| anon 0" \
+    "$rc $(sed -n 1,2p "$work/tok.hits" | tr '\n' '|') $(cat "$d/$tname" 2> /dev/null) $(grep -c 'refused the dummy token' "$work/err")" \
+    "cat $work/tok.hits; cat $work/err"
+  kill "$tok_pid"
+  trap 'rm -rf "$work"' EXIT
+  wait_rc=0
+  wait "$tok_pid" || wait_rc=$?
+  [ "$wait_rc" -ne 0 ] || diag "the token registry ended with status 0 before it was stopped: $(cat "$work/tok.err")"
+fi
+
+#---------------------------------------------------------------------------#
 # Under dash, when it is here: the same key and the same serving.
 #---------------------------------------------------------------------------#
 if command -v dash > /dev/null 2>&1; then

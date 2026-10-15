@@ -27,8 +27,17 @@
 #      dev.pkgforge.mirror.unsigned annotation, scripts/stage): each one's
 #      .sig is asked for again. One that upstream signs now is planned again,
 #      so mirror-file adds its signature layer.
-#   5. The same bytes as the promoted database, and no file signed since: the
-#      target is current.
+#   4b. The files with the promoted sha256 and no %PGPSIG% on either side,
+#      which step 6 would skip: SIGCHECK_SAMPLE of them, sorted by name, from
+#      an offset that moves on each 3-hour run (MIRROR_NOW fixes the clock).
+#      For each, upstream's .sig (the first server in the target's order that
+#      answers with a signature packet) is compared with the signature layer
+#      of its tag. One that differs is planned again, so mirror-file pushes it
+#      again with the same package blob. When more than SIGCHECK_ESCALATE of
+#      one sample differ, every such file of the target is planned, and the
+#      plan warns. A file whose tag or .sig did not read waits for a later run.
+#   5. The same bytes as the promoted database, and no file planned again by
+#      step 4 or 4b: the target is current.
 #   6. Otherwise every file is skip, when the promoted database names it with
 #      the same sha256 and the same %PGPSIG% (no request made), or todo.
 #      scripts/mirror-file reads each todo file's tag before writing it: it
@@ -81,9 +90,9 @@
 # workflow's upload steps read to upload OUT/<target> as plan-<target>.
 #
 # Environment: SHARD_BYTES (default 536870912), SHARD_FILES (400), MAX_SHARDS
-# (32, per target), PLAN_BUDGET (1200 s), ALLOW_OLDER, MIRROR_NAMESPACE,
-# REGISTRY_USER and REGISTRY_TOKEN (used only to tell a private package from an
-# absent one).
+# (32, per target), PLAN_BUDGET (1200 s), SIGCHECK_SAMPLE (64, per target),
+# SIGCHECK_ESCALATE (8), ALLOW_OLDER, MIRROR_NAMESPACE, REGISTRY_USER and
+# REGISTRY_TOKEN (used only to tell a private package from an absent one).
 #
 # Exit status: 0 planned, whatever state each target is in; 1 no plan could be
 # made at all.
@@ -103,7 +112,9 @@ SHARD_BYTES="${SHARD_BYTES:-536870912}"
 SHARD_FILES="${SHARD_FILES:-400}"
 MAX_SHARDS="${MAX_SHARDS:-32}"
 PLAN_BUDGET="${PLAN_BUDGET:-1200}"
-for v in SHARD_BYTES SHARD_FILES MAX_SHARDS PLAN_BUDGET; do
+SIGCHECK_SAMPLE="${SIGCHECK_SAMPLE:-64}"
+SIGCHECK_ESCALATE="${SIGCHECK_ESCALATE:-8}"
+for v in SHARD_BYTES SHARD_FILES MAX_SHARDS PLAN_BUDGET SIGCHECK_SAMPLE SIGCHECK_ESCALATE; do
   case "${!v}" in
     '' | *[!0-9]* | 0) die "$v must be a positive integer, not '${!v}'" ;;
   esac
@@ -235,7 +246,8 @@ prune() {
   done
   rm -f -- "$dir/promoted.db" "$dir/promoted.db.part" "$dir/promoted.tsv" "$dir/pairs.tsv" \
     "$dir/files.tsv" "$dir"/files.tsv.* "$dir/latest.json" "$dir/listed.txt" "$dir/recheck.txt" \
-    "$dir/recheck.sig" "$dir/signed-now.txt"
+    "$dir/recheck.sig" "$dir/signed-now.txt" "$dir/sigcheck-all.txt" "$dir/sigcheck-sample.tsv" \
+    "$dir/sigcheck-changed.txt" "$dir/sigcheck.json" "$dir/sigcheck.sig" "$dir/files-lagging.txt"
 }
 
 plan_target() {
@@ -450,6 +462,106 @@ plan_target() {
   fi
 
   #-------------------------------------------------------------------------#
+  # 4b. Detached signatures that upstream made again. A file the plan would
+  #     skip with no %PGPSIG% is read only by its sha256, and an unchanged
+  #     database makes the target current: a .sig that upstream replaces is
+  #     never seen. So each run compares SIGCHECK_SAMPLE of these files: the
+  #     .sig upstream serves with the signature layer of the file's tag. The
+  #     sample starts at another file on each 3-hour run. A file whose .sig
+  #     differs is planned again, and mirror-file pushes it again with the
+  #     same package blob. More than SIGCHECK_ESCALATE of one sample that
+  #     differ is a new signing key: every such file is planned this run.
+  #     These reads count in the target's share, and stop when half of what
+  #     was left at the start of this step is used.
+  #-------------------------------------------------------------------------#
+  local signed_late sig_all=0 sig_sampled=0 sig_changed=0 sig_unread=0 sig_offset sig_floor tag_rc lay got m_tag bad_srcs=" "
+  signed_late="$(awk 'END { print NR + 0 }' "$dir/signed-now.txt")"
+  : > "$dir/sigcheck-changed.txt"
+  if [ -n "$promoted_sha" ]; then
+    awk -F '\t' '
+      FILENAME == ARGV[1] { if ($0 != "") listed[$0] = 1; next }
+      FILENAME == ARGV[2] { if ($8 == "") p[$1] = $5; next }
+      !($1 in listed) && ($1 in p) && p[$1] == $5 && $8 == "" { print $1 }
+    ' "$dir/listed.txt" "$dir/promoted.tsv" "$dir/records.tsv" | LC_ALL=C sort > "$dir/sigcheck-all.txt"
+    sig_all="$(awk 'END { print NR + 0 }' "$dir/sigcheck-all.txt")"
+  fi
+  if [ "$sig_all" -gt 0 ]; then
+    # The run's 3-hour window, then that many samples on from the first file.
+    sig_offset=$(($(now_epoch) / 10800))
+    sig_offset=$(((sig_offset * SIGCHECK_SAMPLE) % sig_all))
+    awk -v o="$sig_offset" -v k="$SIGCHECK_SAMPLE" '
+      { a[NR - 1] = $0 }
+      END { m = (k < NR) ? k : NR; for (i = 0; i < m; i++) print a[(o + i) % NR] }
+    ' "$dir/sigcheck-all.txt" | "$WRAPPER" --tags > "$dir/sigcheck-sample.tsv"
+    sig_floor=$(((share_deadline + SECONDS) / 2))
+    while IFS=$'\t' read -r f m_tag; do
+      if [ "$SECONDS" -ge "$sig_floor" ]; then
+        log "$name: the detached signature check stops at half of what was left of the target's share; the rest of the sample waits for a later run"
+        break
+      fi
+      tag_rc=0
+      if [ "$private" -eq 1 ]; then
+        registry_manifest "$repo_path" "$m_tag" "$dir/sigcheck.json" || tag_rc=$?
+      else
+        REGISTRY_TOKEN='' registry_manifest "$repo_path" "$m_tag" "$dir/sigcheck.json" || tag_rc=$?
+      fi
+      case "$tag_rc" in
+        "$REG_STATUS_OK") read -r lay _ _ <<< "$(manifest_layer "$dir/sigcheck.json" "$f.sig")" ;;
+        "$REG_STATUS_ABSENT") lay="" ;;
+        *)
+          log "$name: $repo_path:$m_tag did not read; the .sig of $f is compared on a later run"
+          sig_unread=$((sig_unread + 1))
+          continue
+          ;;
+      esac
+      # The first server in the target's order that answers with a signature
+      # packet gives the .sig, as mirror-file reads it. A server that fails is
+      # not asked again in this sample.
+      got=""
+      for src in "${srcs[@]}"; do
+        case "$bad_srcs" in
+          *" $src "*) continue ;;
+        esac
+        probe_rc=0
+        fetch_within "$src/$f.sig" "$dir/sigcheck.sig" "$SIG_MAX_TIME" 4 || probe_rc=$?
+        case "$probe_rc" in
+          0)
+            if sig_packet "$dir/sigcheck.sig"; then
+              got="$(sha256sum "$dir/sigcheck.sig" | cut -d ' ' -f 1)"
+              break
+            fi
+            log "$name: $src/$f.sig answered 200 with no OpenPGP signature packet"
+            ;;
+          4) ;;
+          *)
+            log "$name: $src/$f.sig did not answer within ${fetch_max}s (status $probe_rc); no other .sig of this sample is asked of it"
+            bad_srcs="$bad_srcs$src "
+            ;;
+        esac
+      done
+      rm -f "$dir/sigcheck.sig"
+      if [ -z "$got" ]; then
+        sig_unread=$((sig_unread + 1))
+        continue
+      fi
+      sig_sampled=$((sig_sampled + 1))
+      if [ "$lay" != "sha256:$got" ]; then
+        sig_changed=$((sig_changed + 1))
+        log "$name: upstream's $f.sig is sha256:$got, and $repo_path:$m_tag holds ${lay:-no signature layer}; it is planned again"
+        printf '%s\n' "$f" >> "$dir/sigcheck-changed.txt"
+      fi
+    done < "$dir/sigcheck-sample.tsv"
+    log "$name: $sig_sampled of $sig_all file(s) with a detached signature only compared with their tags, $sig_changed changed upstream, $sig_unread not read this run"
+    if [ "$sig_changed" -gt "$SIGCHECK_ESCALATE" ]; then
+      warn "$name: upstream signed $sig_changed of $sig_sampled sampled files again; every detached signature is checked this run" \
+        "SIGCHECK_ESCALATE=$SIGCHECK_ESCALATE; $sig_all file(s) are planned, and mirror-file pushes again each one whose .sig differs"
+      cat "$dir/sigcheck-all.txt" >> "$dir/signed-now.txt"
+    else
+      cat "$dir/sigcheck-changed.txt" >> "$dir/signed-now.txt"
+    fi
+  fi
+
+  #-------------------------------------------------------------------------#
   # 5. Current?
   #-------------------------------------------------------------------------#
   local packages bytes newest signed_now
@@ -475,7 +587,7 @@ plan_target() {
   # the same sha256, or pacman -F would describe other packages. A server that
   # fails gives way to the next one with the same bytes.
   #-------------------------------------------------------------------------#
-  local files_ok=0 s sig_rc sig_done cands tried=0
+  local files_ok=0 s sig_rc sig_done cands tried=0 drift db_n left_out
   cands="$(awk -F '\t' -v c="$chosen_sha" '$3 == c { n++ } END { print n + 0 }' "$dir/cand/list.tsv")"
   while IFS=$'\t' read -r idx srv sha; do
     [ "$sha" = "$chosen_sha" ] || continue
@@ -494,30 +606,54 @@ plan_target() {
     # describes them for pacman -F. A file name both name with other sha256
     # values means the two are of different snapshots: refused. Drift is
     # accepted and named: packages the files database leaves out (Arch Linux
-    # ARM aarch64 aur.files left out localepurge, 2026-10-14) and files the
-    # database does not name (aarch64 extra.files still names
+    # ARM aarch64 aur.files left out localepurge, 2026-10-14), packages only
+    # the files database names (aarch64 extra.files still names
     # qemu-system-cris 9.1.2-1 that extra.db dropped, and findnewest, whose
     # extra.db desc is NUL bytes, 2026-10-15; Arch Linux RISC-V extra.files
-    # left out 934 of 14716, 2026-10-15). Upstream serves both so to its own
-    # users, and a lagging files database must never hold package updates.
-    # More drift than FILES_DRIFT_MAX (default the larger of 16 and half the
-    # records) means the files database is of another repository.
+    # left out 934 of 14716, 2026-10-15), and packages both name at other
+    # file names: the files database lags, as during a mass rebuild. Upstream
+    # serves all of these so to its own users, and a lagging files database
+    # must never hold package updates. So drift is counted by package name:
+    # the files database is of another repository only when it names fewer
+    # than half of the packages of the database, and leaves out 16 or more.
+    # FILES_DRIFT_MAX, when set, is a bound on the file names that only one
+    # of the two databases names, and replaces that rule.
     cut -f 1,5 "$dir/files.tsv" | sort -u > "$dir/files-pairs.txt"
     cut -f 1,5 "$dir/records.tsv" | sort -u > "$dir/db-pairs.txt"
     awk -F '\t' 'FILENAME == ARGV[1] { sha[$1] = $2; next } ($1 in sha) && sha[$1] != $2' \
       "$dir/db-pairs.txt" "$dir/files-pairs.txt" > "$dir/files-conflict.txt"
-    awk -F '\t' 'FILENAME == ARGV[1] { sha[$1] = $2; next } !($1 in sha) { print $1 }' \
-      "$dir/db-pairs.txt" "$dir/files-pairs.txt" > "$dir/files-extra.txt"
-    comm -13 "$dir/files-pairs.txt" "$dir/db-pairs.txt" | cut -f 1 > "$dir/files-missing.txt"
     if [ -s "$dir/files-conflict.txt" ]; then
       warn "$name: $srv/$repo.files and $repo.db name $(awk 'END { print NR + 0 }' "$dir/files-conflict.txt") file(s) with other sha256 values, e.g. $(awk -F '\t' 'NR == 1 { print $1 " sha256 " $2 }' "$dir/files-conflict.txt")"
       continue
     fi
-    drift_max="${FILES_DRIFT_MAX:-$(awk -F '\t' 'END { n = int(NR / 2); print (n > 16) ? n : 16 }' "$dir/records.tsv")}"
-    drift="$(cat "$dir/files-extra.txt" "$dir/files-missing.txt" | awk 'END { print NR + 0 }')"
-    if [ "$drift" -gt "$drift_max" ]; then
-      warn "$name: $srv/$repo.files differs from $repo.db by $drift package file(s), over FILES_DRIFT_MAX=$drift_max"
-      continue
+    # By package name: the files of packages only the files database names,
+    # the files of packages it leaves out, and the packages both name at
+    # other file names.
+    awk -F '\t' 'FILENAME == ARGV[1] { n[$2] = 1; next } !($2 in n) { print $1 }' \
+      "$dir/records.tsv" "$dir/files.tsv" > "$dir/files-extra.txt"
+    awk -F '\t' 'FILENAME == ARGV[1] { n[$2] = 1; next } !($2 in n) { print $1 }' \
+      "$dir/files.tsv" "$dir/records.tsv" > "$dir/files-missing.txt"
+    awk -F '\t' 'FILENAME == ARGV[1] { f[$2] = $1; next } ($2 in f) && f[$2] != $1 { print $2 }' \
+      "$dir/files.tsv" "$dir/records.tsv" | LC_ALL=C sort > "$dir/files-lagging.txt"
+    if [ -n "${FILES_DRIFT_MAX:-}" ]; then
+      drift="$(
+        {
+          awk -F '\t' 'FILENAME == ARGV[1] { d[$1] = 1; next } !($1 in d) { print $1 }' "$dir/db-pairs.txt" "$dir/files-pairs.txt"
+          comm -13 "$dir/files-pairs.txt" "$dir/db-pairs.txt"
+        } | awk 'END { print NR + 0 }'
+      )"
+      if [ "$drift" -gt "$FILES_DRIFT_MAX" ]; then
+        warn "$name: $srv/$repo.files differs from $repo.db by $drift package file(s), over FILES_DRIFT_MAX=$FILES_DRIFT_MAX"
+        continue
+      fi
+    else
+      db_n="$(awk 'END { print NR + 0 }' "$dir/records.tsv")"
+      left_out="$(awk 'END { print NR + 0 }' "$dir/files-missing.txt")"
+      if [ "$((2 * (db_n - left_out)))" -lt "$db_n" ] && [ "$left_out" -ge 16 ]; then
+        warn "$name: $srv/$repo.files names $((db_n - left_out)) of the $db_n packages of $repo.db: it is the files database of another repository" \
+          "a files database is refused when it names fewer than half of the packages, and leaves out 16 or more"
+        continue
+      fi
     fi
     # first20 FILE: the count, and at most 20 of the names
     first20() {
@@ -528,6 +664,9 @@ plan_target() {
     fi
     if [ -s "$dir/files-missing.txt" ]; then
       warn "$name: $srv/$repo.files leaves out package(s) of $repo.db, as upstream serves it: $(first20 "$dir/files-missing.txt")"
+    fi
+    if [ -s "$dir/files-lagging.txt" ]; then
+      warn "$name: $srv/$repo.files names package(s) of $repo.db at another file name, as upstream serves it (the files database lags): $(first20 "$dir/files-lagging.txt")"
     fi
     # A signature is absent only when the server says so with a 404; any other
     # failure would otherwise turn a signed database into an unsigned one.
@@ -563,8 +702,9 @@ plan_target() {
   fi
 
   #-------------------------------------------------------------------------#
-  # 6. Skip or todo. A file promoted with no signature that upstream signs now
-  #    is todo, whatever its record says.
+  # 6. Skip or todo. A file of signed-now.txt is todo, whatever its record
+  #    says: one promoted with no signature that upstream signs now (step 4),
+  #    and one whose detached .sig upstream made again (step 4b).
   #-------------------------------------------------------------------------#
   cut -f 1 "$dir/records.tsv" | "$WRAPPER" --tags > "$dir/pairs.tsv"
   awk -F '\t' -v OFS='\t' -v target="$name" '
@@ -580,8 +720,11 @@ plan_target() {
   if [ "$resigned" -gt 0 ]; then
     log "$name: $resigned file(s) keep their bytes and carry a new %PGPSIG%; mirror-file repairs their signature layers"
   fi
-  if [ "$signed_now" -gt 0 ]; then
-    log "$name: $signed_now file(s) promoted with no signature have a .sig upstream now; mirror-file adds their signature layers"
+  if [ "$signed_late" -gt 0 ]; then
+    log "$name: $signed_late file(s) promoted with no signature have a .sig upstream now; mirror-file adds their signature layers"
+  fi
+  if [ "$((signed_now - signed_late))" -gt 0 ]; then
+    log "$name: $((signed_now - signed_late)) file(s) with a detached signature only are planned again; mirror-file pushes again each one whose .sig differs"
   fi
 
   #-------------------------------------------------------------------------#
@@ -589,7 +732,11 @@ plan_target() {
   #-------------------------------------------------------------------------#
   shard_target "$dir" "$name"
 
-  set_state "$dir" pending "$(awk 'END { print NR + 0 }' "$dir/todo.tsv") file(s) to mirror, $(awk -F '\t' '{ s += $5 } END { printf "%.0f", s / 1048576 }' "$dir/todo.tsv") MiB, in $(find "$dir/shards" -name '*.tsv' | awk 'END { print NR + 0 }') shard(s), database from $chosen_server$(nul_note "$dir")"
+  local sig_note=""
+  if [ "$sig_changed" -gt 0 ]; then
+    sig_note="; $sig_changed detached signature(s) changed upstream"
+  fi
+  set_state "$dir" pending "$(awk 'END { print NR + 0 }' "$dir/todo.tsv") file(s) to mirror, $(awk -F '\t' '{ s += $5 } END { printf "%.0f", s / 1048576 }' "$dir/todo.tsv") MiB, in $(find "$dir/shards" -name '*.tsv' | awk 'END { print NR + 0 }') shard(s), database from $chosen_server$sig_note$(nul_note "$dir")"
 }
 
 left="$#"

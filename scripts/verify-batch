@@ -32,7 +32,8 @@
 #
 # Phases, each logged with its time:
 #   pull       the verify image, and keyring_image when the target names one:
-#              two attempts of 300 s each
+#              two attempts of 300 s each; then the verify image's digest from
+#              each mirror of VERIFY_IMAGE_MIRRORS, one attempt each
 #   keyring    pacman-key --init; the files of keyring_image's
 #              /usr/share/pacman/keyrings added, never over a file the verify
 #              image has; --populate. Then every keyring package installed
@@ -60,7 +61,8 @@
 # serves exactly upstream's file: its tag holds the database's sha256 and
 # size, and its signature layer is the decoded %PGPSIG%, or, with no %PGPSIG%,
 # the .sig upstream serves now; or upstream has no signature at all, the tag
-# has none, and every server answers 404 for the .sig. pacman refuses it from
+# has none, every db_server answers 404 for the .sig, and the other servers
+# answer 404 or give no answer that decides. pacman refuses it from
 # upstream too (loong64 extra, 2026-10-14: three packages signed by keys that
 # expired, one signed nowhere). It is listed in OUT/refused-TARGET-BATCH.tsv,
 # and the batch passes when every failure is one of these. Any other failure,
@@ -72,7 +74,10 @@
 # a run that is too long, and says so.
 #
 # Environment: MIRROR_NAMESPACE, CONTAINER_RUNTIME (docker or podman; docker
-# by default), VERIFY_BUDGET.
+# by default), VERIFY_BUDGET, VERIFY_IMAGE_MIRRORS (the registry and path
+# prefixes, space separated, that may serve a docker.io/library verify image
+# by its digest; default "mirror.gcr.io/library public.ecr.aws/docker/library";
+# empty for none).
 # For the integration suite only: VERIFY_NETWORK, a container network (host,
 # to reach a registry on the loopback).
 #
@@ -216,19 +221,68 @@ if [ -n "$keyring_from" ]; then
 fi
 
 #---------------------------------------------------------------------------#
-# Pulls: two attempts of 300 s each
+# Pulls: two attempts of 300 s each. A Docker Hub official image pinned by
+# digest (docker.io/library/NAME:TAG@sha256:D) then comes from a mirror that
+# serves the same digest: one attempt of 300 s at each prefix of
+# VERIFY_IMAGE_MIRRORS, as PREFIX/NAME@sha256:D. The digest pins the bytes, so
+# the trust is the same. Docker Hub limits anonymous pulls per address, and
+# runners share addresses: a "toomanyrequests" answer goes to the mirrors at
+# once, with a log line of its own.
 #---------------------------------------------------------------------------#
-# pull IMAGE PLATFORM -> 0 pulled
+# Each mirror here served the pinned verify image by its digest
+# (docs/measurements.md).
+# read -a splits without glob expansion.
+image_mirrors=()
+read -r -a image_mirrors <<< "${VERIFY_IMAGE_MIRRORS-mirror.gcr.io/library public.ecr.aws/docker/library}"
+for m in "${image_mirrors[@]}"; do
+  [[ "$m" =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)*$ ]] || die "VERIFY_IMAGE_MIRRORS: '$m' is not a registry and a path"
+done
+pulled=""
+pull_limited=0
+
+# pull_one REF PLATFORM -> 0 pulled; the output goes to pull.log
+pull_one() {
+  local rc=0
+  timeout -k 10 300 "$RUNTIME" pull --platform "$2" "$1" > "$work/pull-one.log" 2>&1 || rc=$?
+  cat "$work/pull-one.log" >> "$work/pull.log"
+  if [ "$rc" -ne 0 ] && grep -qi toomanyrequests "$work/pull-one.log"; then
+    pull_limited=1
+    log "pull of $1: the registry limits pulls (toomanyrequests)"
+    printf 'pull: %s: the registry limits pulls (toomanyrequests)\n' "$1" >> "$log_file"
+  fi
+  return "$rc"
+}
+
+# pull IMAGE PLATFORM -> 0 pulled; sets pulled, the reference that was pulled
 pull() {
-  local attempt rc=0
+  local attempt rc=0 name digest m ref
+  pulled=""
+  pull_limited=0
   for attempt in 1 2; do
     rc=0
-    timeout --kill-after=10 300 "$RUNTIME" pull --platform "$2" "$1" >> "$work/pull.log" 2>&1 || rc=$?
-    [ "$rc" -ne 0 ] || return 0
+    pull_one "$1" "$2" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      pulled="$1"
+      return 0
+    fi
     log "pull of $1 for $2, attempt $attempt, ended $rc"
+    [ "$pull_limited" -eq 0 ] || break
     if [ "$attempt" -eq 1 ]; then
       sleep 10
     fi
+  done
+  [[ "$1" =~ ^docker\.io/library/([a-z0-9._-]+):[A-Za-z0-9._-]+@(sha256:[0-9a-f]{64})$ ]] || return 1
+  name="${BASH_REMATCH[1]}"
+  digest="${BASH_REMATCH[2]}"
+  for m in "${image_mirrors[@]}"; do
+    ref="$m/$name@$digest"
+    rc=0
+    pull_one "$ref" "$2" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      pulled="$ref"
+      return 0
+    fi
+    log "pull of $ref for $2 ended $rc"
   done
   return 1
 }
@@ -236,9 +290,21 @@ pull() {
 phase "pull $image ($platform)"
 if ! pull "$image" "$platform"; then
   cat "$work/pull.log" >> "$log_file"
-  verdict failed "could not pull $image in two attempts of 300 s: $(tail -n 1 "$work/pull.log")"
+  why="could not pull $image in two attempts of 300 s"
+  if [ "${#image_mirrors[@]}" -gt 0 ] && [[ "$image" =~ ^docker\.io/library/ ]]; then
+    why="$why, nor its digest from $(printf '%s, ' "${image_mirrors[@]}" | sed 's/, $//')"
+  fi
+  if [ "$pull_limited" -eq 1 ]; then
+    why="$why; a registry limited the pulls (toomanyrequests)"
+  fi
+  verdict failed "$why: $(tail -n 1 "$work/pull.log")"
   exit 1
 fi
+image_ref="$pulled"
+if [ "$image_ref" != "$image" ]; then
+  warn "$target: the verify image came from $image_ref, the same digest as $image"
+fi
+printf 'pull: the verify image came from %s\n' "$image_ref" >> "$log_file"
 
 if [ -n "$keyring_image" ]; then
   phase "pull $keyring_image ($keyring_platform), for its keyring files"
@@ -290,11 +356,14 @@ pac() { pacman --config /tmp/pacman.conf --noconfirm "$@"; }
 
 phase "keyring"
 pacman-key --init
-# A key that is missing or expired must fail at once. pacman asks a keyserver
-# for it otherwise, and that makes verify wait on a host outside this run.
-# Port 9 on the loopback refuses the connection at once.
+# A key that is missing or expired must fail at once. pacman looks it up on
+# the network otherwise: by WKD on the domain of the key's user ID first, then
+# on a keyserver. The verdict then depends on a host outside this run, and
+# verify waits on it. disable-dirmngr stops both lookups at once: gpg starts
+# no dirmngr, and every lookup fails with "No dirmngr". The keyserver is port
+# 9 on the loopback, which refuses the connection at once, as a second guard.
 sed -i '/^[[:space:]]*keyserver[[:space:]]/d' /etc/pacman.d/gnupg/gpg.conf
-echo 'keyserver hkp://127.0.0.1:9' >> /etc/pacman.d/gnupg/gpg.conf
+printf 'keyserver hkp://127.0.0.1:9\ndisable-dirmngr\n' >> /etc/pacman.d/gnupg/gpg.conf
 copied=()
 for f in /in/keyrings/*; do
   [ -f "$f" ] || continue
@@ -317,7 +386,15 @@ if [ -n "$keyrings" ] && [ -n "$keyring_repo" ]; then
   done
   read -r -a kr <<< "$keyrings"
   phase "keyring: install ${kr[*]} from [$keyring_repo]"
-  pac -Sdd "${kr[@]/#/$keyring_repo/}"
+  # A keyring package that upstream renamed, split or signed with a new key
+  # does not install. The marker line gives the verdict pacman's own words.
+  rc=0
+  pac -Sdd "${kr[@]/#/$keyring_repo/}" > /tmp/keyring.log 2>&1 || rc=$?
+  cat /tmp/keyring.log
+  if [ "$rc" -ne 0 ]; then
+    printf '@@keyring-failed\t%s\t%s\n' "$rc" "$(awk '/^error:/ && !f { print; f = 1 }' /tmp/keyring.log)"
+    exit 1
+  fi
   pacman-key --populate
   # pacman checked the keyring packages' own signatures: the trust root works.
   printf '@@trust\tkeyring\n'
@@ -442,13 +519,13 @@ if [ "$remaining" -lt 60 ]; then
 fi
 phase "container: $remaining s of the ${BUDGET}s budget left"
 rc=0
-timeout --kill-after=30 "$remaining" "$RUNTIME" run --rm --platform "$platform" "${net_args[@]}" \
+timeout -k 30 "$remaining" "$RUNTIME" run --rm --platform "$platform" "${net_args[@]}" \
   -v "$work/pacman-oci:/in/pacman-oci:ro" \
   -v "$work/names.txt:/in/names.txt:ro" \
   -v "$work/canaries.txt:/in/canaries.txt:ro" \
   -v "$work/keyrings:/in/keyrings:ro" \
   -v "$work/verify.sh:/in/verify.sh:ro" \
-  "$image" bash /in/verify.sh "$repo" "$arch" "$server" "$second_repo" "$second_server" "$keyrings" "$keyring_repo" \
+  "$image_ref" bash /in/verify.sh "$repo" "$arch" "$server" "$second_repo" "$second_server" "$keyrings" "$keyring_repo" \
   "$db_siglevel" "$FILES_SHA256" >> "$log_file" 2>&1 || rc=$?
 phase "container ended with status $rc"
 
@@ -464,6 +541,11 @@ if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
   exit 1
 fi
 if ! grep -q '^@@done$' "$log_file"; then
+  if grep -q '^@@keyring-failed' "$log_file"; then
+    read -r k_rc k_line <<< "$(awk -F '\t' '$1 == "@@keyring-failed" { r = $2; l = $3 } END { print r, l }' "$log_file")"
+    verdict failed "the keyring package(s) $keyrings did not install from [$keyring_repo] (pacman exit ${k_rc:-?}): ${k_line:-pacman printed no error line}"
+    exit 1
+  fi
   c="$(culprits_so_far)"
   verdict failed "the container ended with status $rc before its last phase${c:+; at fault so far: $c}"
   exit 1
@@ -476,12 +558,14 @@ sigbad="$(awk -F '\t' '$1 == "@@sigbad" { n++ } END { print n + 0 }' "$log_file"
 awk -F '\t' '$1 == "@@refused" && !seen[$2]++ { print $2 }' "$log_file" > "$work/refused-names.txt"
 sources=()
 mapfile -t sources < <(target_sources "$conf")
+db_servers=()
+mapfile -t db_servers < <(target_all "$conf" db_server)
 
 # upstream_refused NAME CLASS -> 0 when the mirror serves exactly upstream's
 # file and signature for NAME; sets refused_why either way
 refused_why=""
 upstream_refused() {
-  local name="$1" class="$2" file sha csize pgpsig sig_sha="" tag rc decision layer s got
+  local name="$1" class="$2" file sha csize pgpsig sig_sha="" tag rc decision layer s got undecided
   IFS=$'\t' read -r file _ _ _ sha csize _ pgpsig <<<"$(awk -F '\t' -v n="$name" '$2 == n' "$stage/$target/records.tsv")"
   if [ -z "${file:-}" ]; then
     refused_why="the staged records name no package $name"
@@ -506,28 +590,31 @@ upstream_refused() {
         return 1
       fi
       [ -z "$sig_sha" ] || return 0
-      # No %PGPSIG%: the layer must be the .sig upstream serves now.
+      # No %PGPSIG%: the layer must be the .sig upstream serves now, the
+      # first signature in the target's order, as mirror-file took it. A
+      # server that gives no answer that decides is passed over.
       read -r layer _ _ <<< "$(manifest_layer "$work/refused.json" "$file.sig")"
+      undecided=""
       for s in "${sources[@]}"; do
         rc=0
         fetch_upstream "$s/$file.sig" "$work/upstream.sig" 60 || rc=$?
-        case "$rc" in
-          0)
-            got="sha256:$(sha256sum "$work/upstream.sig" | cut -d ' ' -f 1)"
-            if [ "$got" = "$layer" ]; then
-              return 0
-            fi
-            refused_why="its signature layer is $layer, and $s/$file.sig is $got"
-            return 1
-            ;;
-          4) ;;
-          *)
-            refused_why="$s/$file.sig did not answer, so upstream's signature is not known"
-            return 1
-            ;;
-        esac
+        if [ "$rc" -eq 0 ] && sig_packet "$work/upstream.sig"; then
+          got="sha256:$(sha256sum "$work/upstream.sig" | cut -d ' ' -f 1)"
+          if [ "$got" = "$layer" ]; then
+            return 0
+          fi
+          refused_why="its signature layer is $layer, and $s/$file.sig is $got"
+          return 1
+        fi
+        if [ "$rc" -ne 4 ]; then
+          undecided="$undecided $(url_host "$s") (status $rc)"
+        fi
       done
-      refused_why="no server serves $file.sig, and the tag holds one"
+      if [ -n "$undecided" ]; then
+        refused_why="no server answered with $file.sig, so upstream's signature is not known; no answer that decides from:$undecided"
+      else
+        refused_why="no server serves $file.sig, and the tag holds one"
+      fi
       return 1
       ;;
     sig-missing)
@@ -535,14 +622,26 @@ upstream_refused() {
         refused_why="the database or the tag has a signature for it, and pacman read none ($decision)"
         return 1
       fi
+      # The rule of mirror-file: no signature anywhere, every db_server
+      # answers 404, and only plain servers may give no answer that decides.
+      undecided=""
       for s in "${sources[@]}"; do
         rc=0
         fetch_upstream "$s/$file.sig" "$work/upstream.sig" 60 || rc=$?
-        if [ "$rc" -ne 4 ]; then
-          refused_why="$s/$file.sig answered (status $rc), so upstream may sign it"
+        [ "$rc" -ne 4 ] || continue
+        if [ "$rc" -eq 0 ] && sig_packet "$work/upstream.sig"; then
+          refused_why="$s/$file.sig answers with a signature, so upstream signs it"
           return 1
         fi
+        if in_list "$s" "${db_servers[@]}"; then
+          refused_why="the db_server $s gave no answer that decides for $file.sig (status $rc), so upstream may sign it"
+          return 1
+        fi
+        undecided="$undecided $(url_host "$s") (status $rc)"
       done
+      if [ -n "$undecided" ]; then
+        log "$name: every db_server answers 404 for $file.sig; no answer that decides from:$undecided"
+      fi
       return 0
       ;;
   esac

@@ -13,7 +13,13 @@
 # page must be UTC text in a <time> element, the page must have one inline
 # script and no other, and each sum of the size table must equal the sum of
 # its targets. The synced badge must say its age and colour at 30 min, 5 h,
-# 12 h and 30 h, and fall back to the fetched time.
+# 12 h and 30 h, and fall back to the fetched time. check-staleness and
+# status-collect must end within their budgets when the first db_server of 8
+# targets is a local listener that never answers, and ask that host once.
+# Neither may take a first db_server that is behind the second, or that
+# answers 200 with an HTML page, for upstream. A Worker probe must follow
+# its 302 to the signed URL, as a consumer does. The smallest database
+# downloaded through the Worker must be the one latest names.
 #
 # ⚠ db_records needs GNU tar, and status-render needs python3. A shell that
 # lacks one skips that part and says why: busybox has neither, Arch has no
@@ -23,7 +29,50 @@ set -euo pipefail
 . "$REPO_ROOT/tests/lib/harness.sh"
 
 work="$(work_dir)"
-trap 'rm -rf "$work"' EXIT
+# The local listeners a test starts, stopped on exit
+listeners=""
+cleanup() {
+  local p rc
+  for p in $listeners; do
+    rc=0
+    kill "$p" || rc=$?
+    [ "$rc" -eq 0 ] || echo "# listener $p had ended already (kill $rc)"
+  done
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
+# listen NAME: a local TCP listener that accepts each connection and never
+# answers. Sets port; each connection adds a line to $work/NAME.log.
+cat > "$work/listen.py" << 'EOF'
+import os, socket, sys
+log, port = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", 0))
+s.listen(64)
+with open(port + ".tmp", "w") as f:
+    f.write("%d\n" % s.getsockname()[1])
+os.rename(port + ".tmp", port)
+held = []
+while True:
+    c, _ = s.accept()
+    held.append(c)
+    with open(log, "a") as f:
+        f.write("accepted\n")
+EOF
+listen() {
+  : > "$work/$1.log"
+  python3 -I "$work/listen.py" "$work/$1.log" "$work/$1.port" &
+  listeners="$listeners $!"
+  for _ in $(seq 1 100); do
+    [ ! -s "$work/$1.port" ] || break
+    sleep 0.1
+  done
+  port=""
+  if [ -s "$work/$1.port" ]; then
+    port="$(cat "$work/$1.port")"
+  fi
+}
 
 #---------------------------------------------------------------------------#
 # The sync interval, from a cron
@@ -61,6 +110,17 @@ mkdir -p "$bin" "$net/up.test" "$net/bad.test" "$net/ghcr.io" "$net/worker.test"
 cp "$REPO_ROOT/tests/fixtures/status/fake-curl" "$bin/curl"
 chmod +x "$bin/curl"
 printf '{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}\n' > "$net/ghcr.io/.404"
+# The anonymous token, which status-collect asks for with no credential
+printf '{"token":"anon"}\n' > "$net/ghcr.io/token"
+# The blob host the Worker redirects to: each blob of the registry, and one
+# byte at sha256:00 for the package probes
+blobs="$net/pkg-containers.githubusercontent.com/ghcrblobs/blobs"
+mkdir -p "$blobs"
+printf 'x' > "$blobs/sha256:00"
+# blob_url FILE -> the signed URL of FILE's blob on the blob host
+blob_url() {
+  printf 'https://pkg-containers.githubusercontent.com/ghcrblobs/blobs/sha256:%s?se=x\n' "$(sha256sum "$1" | cut -d ' ' -f 1)"
+}
 
 # pkg DIR NAME VERSION ARCH CSIZE BUILDDATE [SEED]: one desc entry; SEED
 # changes the sha256 and nothing else
@@ -83,6 +143,7 @@ mirror() {
   size="$(wc -c < "$3" | tr -d ' ')"
   mkdir -p "$base/manifests" "$base/blobs"
   cp "$3" "$base/blobs/sha256:$sha"
+  cp "$3" "$blobs/sha256:$sha"
   jq -n --arg sha "sha256:$sha" --argjson size "$size" --arg repo "$2" --arg fetched "$4" --arg created "${5:-}" '{
     schemaVersion: 2, mediaType: "application/vnd.oci.image.manifest.v1+json",
     layers: [{mediaType: "application/vnd.pkgforge.archlinux.db.v1", digest: $sha, size: $size,
@@ -158,9 +219,12 @@ fi
 # x86_64-core names a created time with a fraction; x86_64-extra names none
 mirror x86_64 core "$net/up.test/x86_64/core/core.db" 2026-10-14T00:00:00Z 2026-10-14T00:30:00.123456Z
 mirror x86_64 extra "$work/extra-mirror.db" 2026-10-14T00:00:00Z
-redirect x86_64/core/core.db
+# Each database redirect leads to the blob of that database; the Worker says
+# its cache answered for core.db
+redirect x86_64/core/core.db 302 "$(blob_url "$net/up.test/x86_64/core/core.db")"
+printf 'x-mirror-cache: hit\nx-mirror-blob-host: pkg-containers.githubusercontent.com\n' > "$net/worker.test/x86_64/core/core.db.headers"
 redirect x86_64/core/acl-2.3.2-1-x86_64.pkg.tar.zst
-redirect x86_64/extra/extra.db
+redirect x86_64/extra/extra.db 302 "$(blob_url "$work/extra-mirror.db")"
 redirect x86_64/extra/alpha-1-1-x86_64.pkg.tar.zst 503 ''
 mkdir -p "$net/bad.test/x86_64/multilib"
 printf '500\n' > "$net/bad.test/x86_64/multilib/multilib.db.code"
@@ -221,6 +285,17 @@ check "x86_64-core: the Worker answers 302 for the database and for one package"
   "jq '$T.worker' OUT/status.json"
 check "x86_64-core: the redirect host is kept, not the signed URL" pkg-containers.githubusercontent.com \
   "$(q "$T | .worker.db.location")" "jq '$T.worker.db' OUT/status.json"
+check "x86_64-core: the signed URL of each 302 answers the runner, with no credential, and its host is expected" \
+  "200 false 200 false" \
+  "$(q "$T | .worker | \"\(.db.signed_code) \(.db.location_unexpected) \(.package.signed_code) \(.package.location_unexpected)\"")" \
+  "jq '$T.worker' OUT/status.json"
+check "x86_64-core: the Worker's x-mirror-cache and x-mirror-blob-host headers are kept" \
+  "hit pkg-containers.githubusercontent.com null" \
+  "$(q "$T | .worker | \"\(.db.cache) \(.db.blob_host) \(.package.cache)\"")" "jq '$T.worker.db' OUT/status.json"
+check "the smallest database of a target with latest, downloaded through the Worker, is the one latest names" \
+  "1 true 200" \
+  "$(q '[.targets[] | .worker.download | select(. != null)] | "\(length) \(.[0].ok) \(.[0].code)"')" \
+  "jq '.targets[].worker.download' OUT/status.json"
 
 T='.targets[] | select(.target == "x86_64-extra")'
 check "x86_64-extra: a file counts only with the same name and sha256: 3 of 5" "3 5 2" \
@@ -274,7 +349,7 @@ if grep -q 'HTTP 503, expected 302' "$out/worker.md" && grep -q 'reproduce:' "$o
 else
   fail "worker.md names the failed probe and how to reproduce it" "$(sed -n 1,30p "$out/worker.md")" "cat OUT/worker.md"
 fi
-bad_hosts="$(awk '{ h = $0; sub(/^[a-z]+:\/\//, "", h); sub(/\/.*/, "", h); if (h !~ /^(up|bad|down|worker)\.test$/ && h != "ghcr.io") print }' "$work/requests.log")"
+bad_hosts="$(awk '{ h = $0; sub(/^[a-z]+:\/\//, "", h); sub(/\/.*/, "", h); if (h !~ /^(up|bad|down|worker)\.test$/ && h != "ghcr.io" && h != "pkg-containers.githubusercontent.com") print }' "$work/requests.log")"
 check "every request went to a fixture host" "" "$bad_hosts" "cat \$work/requests.log"
 
 # A second run: the package probe now redirects to plain http. The failure
@@ -291,8 +366,8 @@ check "worker: two failed runs in a row, failing since the first" "false 2 2026-
   "$(q '.worker | "\(.ok) \(.failed_runs) \(.failing_since)"')" "jq .worker OUT/status.json"
 check "worker: two failed runs an hour apart are down" "3600 true" \
   "$(q '.worker | "\(.failing_seconds) \(.down)"')" "jq .worker OUT/status.json"
-check "worker: a 302 to http is not a redirect to https://*.githubusercontent.com" \
-  "302 to 'pkg-containers.githubusercontent.com', not to https://*.githubusercontent.com" \
+check "worker: a 302 to http fails: the Location must be https" \
+  "302 to 'pkg-containers.githubusercontent.com', not to an https URL" \
   "$(q '.targets[] | select(.target == "x86_64-extra") | .worker.package.error')" "jq .targets OUT/status.json"
 check "history.jsonl has two lines after two runs" 2 "$(awk 'END { print NR }' "$out/history.jsonl")" "wc -l OUT/history.jsonl"
 
@@ -314,6 +389,84 @@ collect "$out" "$((NOW + 420))" || rc=$?
 check "worker: two failed runs 7 minutes apart are not down; down needs 50 minutes" "false 2 420 false" \
   "$(q '.worker | "\(.ok) \(.failed_runs) \(.failing_seconds) \(.down)"')" "jq .worker OUT/status.json"
 redirect x86_64/extra/alpha-1-1-x86_64.pkg.tar.zst
+
+# The Worker answers 302, and the blob host refuses the signed URL to any
+# other client than the Worker: every download through the Worker fails.
+mkdir -p "$net/pkg-containers.githubusercontent.com/bound"
+printf '403\n' > "$net/pkg-containers.githubusercontent.com/bound/acl.code"
+redirect x86_64/core/acl-2.3.2-1-x86_64.pkg.tar.zst 302 'https://pkg-containers.githubusercontent.com/bound/acl?sip=104.16.0.1'
+out="$work/run-bound"
+mkdir -p "$out"
+rc=0
+collect "$out" || rc=$?
+check "worker: a signed URL that answers 403 to the runner fails the probe, whatever the 302 looks like" \
+  "0 302 403 false the signed URL answered 403 false" \
+  "$rc $(q '.targets[] | select(.target == "x86_64-core") | .worker.package | "\(.code) \(.signed_code) \(.ok) \(.error)"') $(q .worker.ok)" \
+  "$RP; jq '.targets[].worker' OUT/status.json"
+rc=0
+collect "$out" "$((NOW + 3600))" || rc=$?
+check "worker: a signed URL that answers 403 in 2 runs an hour apart is down" "0 true" "$rc $(q .worker.down)" \
+  "$RP, twice; jq .worker OUT/status.json"
+if grep -q 'the signed URL answered 403' "$out/worker.md" && grep -q -- '-r 0-0' "$out/worker.md"; then
+  ok "worker.md names the signed URL that failed, and how to ask it for one byte"
+else
+  fail "worker.md names the signed URL that failed, and how to ask it for one byte" "$(sed -n 1,30p "$out/worker.md")" "cat OUT/worker.md"
+fi
+redirect x86_64/core/acl-2.3.2-1-x86_64.pkg.tar.zst
+
+# A blob host outside githubusercontent.com whose signed URL works: it is
+# recorded, and passes. The database through it is the one latest names.
+mkdir -p "$net/blobs.other.test"
+cp "$net/up.test/x86_64/core/core.db" "$net/blobs.other.test/core.db"
+cp "$work/extra-mirror.db" "$net/blobs.other.test/extra.db"
+redirect x86_64/core/core.db 302 https://blobs.other.test/core.db
+redirect x86_64/extra/extra.db 302 https://blobs.other.test/extra.db
+out="$work/run-other"
+mkdir -p "$out"
+rc=0
+collect "$out" || rc=$?
+check "worker: a working blob host outside githubusercontent.com passes, marked location_unexpected" \
+  "0 true true blobs.other.test" \
+  "$rc $(q '.targets[] | select(.target == "x86_64-core") | .worker.db | "\(.ok) \(.location_unexpected) \(.location)"')" \
+  "$RP; jq '.targets[].worker.db' OUT/status.json"
+check "worker: the download through that host is the database latest names" "true" \
+  "$(q '[.targets[] | .worker.download | select(. != null)] | .[0].ok')" "$RP; jq '.targets[].worker.download' OUT/status.json"
+
+# The Worker redirects each database to other bytes: each one-byte probe
+# passes, and the download does not.
+printf 'not a database\n' > "$net/blobs.other.test/core.db"
+printf 'not a database\n' > "$net/blobs.other.test/extra.db"
+out="$work/run-wrong"
+mkdir -p "$out"
+rc=0
+collect "$out" || rc=$?
+check "worker: a database through the Worker that is not the one latest names fails the download probe" \
+  "0 false true false" \
+  "$rc $(q '[.targets[] | .worker.download | select(. != null)] | .[0] | "\(.ok) \(.error | startswith("the file has sha256"))"') $(q .worker.ok)" \
+  "$RP; jq '.targets[].worker.download' OUT/status.json"
+redirect x86_64/core/core.db 302 "$(blob_url "$net/up.test/x86_64/core/core.db")"
+redirect x86_64/extra/extra.db 302 "$(blob_url "$work/extra-mirror.db")"
+
+# The median answer time of the Worker leaves the download out: it moves a
+# whole file. The 7 probes take 0.1 to 0.7 s, the download 9 s.
+i=0
+for p in x86_64/core/core.db x86_64/core/acl-2.3.2-1-x86_64.pkg.tar.zst x86_64/extra/extra.db \
+  x86_64/extra/alpha-1-1-x86_64.pkg.tar.zst aarch64/core/core.db loong64/core/core.db x86_64/multilib/multilib.db; do
+  i=$((i + 1))
+  mkdir -p "$(dirname "$net/worker.test/$p")"
+  printf '0.%s\n' "$i" > "$net/worker.test/$p.time"
+done
+for f in "$net/up.test/x86_64/core/core.db" "$work/extra-mirror.db"; do
+  printf '9\n' > "$blobs/sha256:$(sha256sum "$f" | cut -d ' ' -f 1).time"
+done
+out="$work/run-median"
+mkdir -p "$out"
+rc=0
+collect "$out" || rc=$?
+check "worker: the median answer time is of the 7 probes, 0.4 s; the 9 s download is left out" "0 8 0.4 400" \
+  "$rc $(q '"\(.worker.probes) \(.worker.median_seconds)"') $(jq -r '.w.ms' "$out/history.jsonl")" \
+  "$RP; jq '.worker, [.targets[].worker[] | select(. != null) | .seconds]' OUT/status.json"
+find "$net/worker.test" "$blobs" -name '*.time' -exec rm -f {} +
 
 # History is cut to the last 2000 lines, the new line last.
 out="$work/run3"
@@ -457,6 +610,188 @@ else
   else
     fail "check-staleness: says that the clone is shallow" "$(sed -n 1,20p "$work/stale2.err")" "$RS"
   fi
+fi
+
+#---------------------------------------------------------------------------#
+# Upstream is never only the first db_server that answers.
+#   aarch64-lag   the first db_server serves database A, the second B, in
+#                 which alpha was built a day later. latest is A, fetched 5
+#                 days before now. A is behind B: the target is stale.
+#   aarch64-html  the first db_server answers 200 with an HTML page, the
+#                 second serves B, which latest holds: the target is current.
+#---------------------------------------------------------------------------#
+pkg "$work/beh-a" alpha 1-1 aarch64 100 "$B"
+pkg "$work/beh-a" beta 1-1 aarch64 200 "$B"
+pkg "$work/beh-b" alpha 1-2 aarch64 100 "$((B + 86400))"
+pkg "$work/beh-b" beta 1-1 aarch64 200 "$B"
+mkdir -p "$net/lag.test/aarch64/lag" "$net/new.test/aarch64/lag" "$net/new.test/aarch64/html" \
+  "$net/html.test/aarch64/html" "$work/behind-targets"
+mkdb "$work/beh-a" "$net/lag.test/aarch64/lag/lag.db"
+mkdb "$work/beh-b" "$net/new.test/aarch64/lag/lag.db"
+cp "$net/new.test/aarch64/lag/lag.db" "$net/new.test/aarch64/html/html.db"
+printf '<html><body>This mirror is down for maintenance.</body></html>\n' > "$net/html.test/aarch64/html/html.db"
+mirror aarch64 lag "$net/lag.test/aarch64/lag/lag.db" 2026-10-09T03:00:00Z
+mirror aarch64 html "$net/new.test/aarch64/html/html.db" 2026-10-09T03:00:00Z
+# shellcheck disable=SC2016 # the target file's own placeholders
+{
+  printf 'arch = aarch64\nrepo = lag\ndb_server = https://lag.test/$arch/$repo\ndb_server = https://new.test/$arch/$repo\n' \
+    > "$work/behind-targets/aarch64-lag.conf"
+  printf 'arch = aarch64\nrepo = html\ndb_server = https://html.test/$arch/$repo\ndb_server = https://new.test/$arch/$repo\n' \
+    > "$work/behind-targets/aarch64-html.conf"
+}
+sha_b="$(sha256sum "$net/new.test/aarch64/lag/lag.db" | cut -d ' ' -f 1)"
+RU="PATH=<fake-curl>:\$PATH TARGETS_DIR=<aarch64-lag, aarch64-html> MIRROR_NOW=$NOW"
+
+rc=0
+PATH="$bin:$PATH" FAKE_CURL_ROOT="$net" TARGETS_DIR="$work/behind-targets" MIRROR_NAMESPACE=test/mirror \
+  MIRROR_REGISTRY=ghcr.io MIRROR_NOW="$NOW" \
+  "$REPO_ROOT/scripts/check-staleness" "$work/behind1" > "$work/behind1.out" 2> "$work/behind1.err" || rc=$?
+touch "$work/behind1/aarch64-lag.state" "$work/behind1/aarch64-html.state" "$work/behind1/aarch64-lag.md"
+check "check-staleness: a first db_server behind the second does not stand for upstream: stale, exit 3" \
+  "3 stale" "$rc $(cat "$work/behind1/aarch64-lag.state")" "$RU scripts/check-staleness OUT; $(sed -n '$p' "$work/behind1.err")"
+if grep -q '| https://lag.test/aarch64/lag | behind by 1 package(s), against https://new.test/aarch64/lag |' "$work/behind1/aarch64-lag.md"; then
+  ok "check-staleness: the issue body names the db_server that is behind"
+else
+  fail "check-staleness: the issue body names the db_server that is behind" "$(sed -n 1,30p "$work/behind1/aarch64-lag.md")" \
+    "$RU scripts/check-staleness OUT"
+fi
+check "check-staleness: an HTML page that answers 200 is refused, and the second db_server shows latest is current" \
+  current "$(cat "$work/behind1/aarch64-html.state")" "$RU scripts/check-staleness OUT; $(grep html.test "$work/behind1.err" | sed -n 1p)"
+if grep -q 'refused the database from https://html.test/aarch64/html' "$work/behind1.err"; then
+  ok "check-staleness: the log names the db_server whose answer was refused"
+else
+  fail "check-staleness: the log names the db_server whose answer was refused" "$(sed -n 1,20p "$work/behind1.err")" \
+    "$RU scripts/check-staleness OUT"
+fi
+
+rc=0
+PATH="$bin:$PATH" FAKE_CURL_ROOT="$net" TARGETS_DIR="$work/behind-targets" MIRROR_NAMESPACE=test/mirror \
+  MIRROR_REGISTRY=ghcr.io GITHUB_REPOSITORY=test/mirror STATUS_WORKER_URL='' MIRROR_NOW="$NOW" \
+  "$REPO_ROOT/scripts/status-collect" "$work/behind2" > "$work/behind2.out" 2> "$work/behind2.err" || rc=$?
+touch "$work/behind2/status.json"
+T='.targets[] | select(.target == "aarch64-lag") | .upstream'
+check "status-collect: upstream is the second db_server when the first is behind it, and tried names the first as behind" \
+  "0 $sha_b https://new.test/aarch64/lag behind by 1 package(s), against https://new.test/aarch64/lag|ok" \
+  "$rc $(jq -r "$T"' | "\(.sha256) \(.server) \([.tried[].result] | join("|"))"' "$work/behind2/status.json")" \
+  "$RU scripts/status-collect OUT; jq '$T' OUT/status.json"
+T='.targets[] | select(.target == "aarch64-html") | .upstream'
+check "status-collect: an HTML page that answers 200 is refused, and named in tried" \
+  "$sha_b https://new.test/aarch64/html true" \
+  "$(jq -r "$T"' | "\(.sha256) \(.server) \(.tried[0].result | startswith("refused: "))"' "$work/behind2/status.json")" \
+  "$RU scripts/status-collect OUT; jq '$T' OUT/status.json"
+
+#---------------------------------------------------------------------------#
+# check-staleness within STALENESS_BUDGET: 8 targets whose first db_server
+# accepts and never answers, as one stalled host of Arch Linux ARM does for
+# 8 targets. Each read without a deadline of its own costs 184 s there.
+#---------------------------------------------------------------------------#
+real_curl="$(command -v curl)"
+if ! command -v python3 > /dev/null; then
+  ok "skipped: check-staleness against a db_server that never answers, because python3 is not on PATH"
+elif listen stall-a && [ -n "$port" ]; then
+  mkdir -p "$work/stall-targets"
+  for i in 1 2 3 4 5 6 7 8; do
+    mkdir -p "$net/up.test/aarch64/s$i"
+    cp "$net/up.test/aarch64/core/core.db" "$net/up.test/aarch64/s$i/s$i.db"
+    # shellcheck disable=SC2016 # the target file's own placeholders
+    printf 'arch = aarch64\nrepo = s%s\ndb_server = http://127.0.0.1:%s/$arch/$repo\ndb_server = https://up.test/$arch/$repo\n' \
+      "$i" "$port" > "$work/stall-targets/aarch64-s$i.conf"
+  done
+  RB="PATH=<fake-curl>:\$PATH FAKE_CURL_REAL=<curl> STALENESS_BUDGET=80 UPSTREAM_PROTO='=http,https' TARGETS_DIR=<8 targets> timeout 120 scripts/check-staleness OUT"
+  start="$SECONDS"
+  rc=0
+  PATH="$bin:$PATH" FAKE_CURL_ROOT="$net" FAKE_CURL_REAL="$real_curl" TARGETS_DIR="$work/stall-targets" \
+    MIRROR_NAMESPACE=test/mirror MIRROR_REGISTRY=ghcr.io MIRROR_NOW="$NOW" STALENESS_BUDGET=80 \
+    UPSTREAM_PROTO='=http,https' timeout 120 "$REPO_ROOT/scripts/check-staleness" "$work/stall1" \
+    > "$work/stall1.out" 2> "$work/stall1.err" || rc=$?
+  took=$((SECONDS - start))
+  check "check-staleness: a db_server that never answers: the check ends by itself, 3 for stale targets" 3 "$rc" \
+    "$RB; $(sed -n '$p' "$work/stall1.err")"
+  if [ "$took" -le 80 ]; then
+    ok "check-staleness: a db_server that never answers: the check ends within STALENESS_BUDGET (${took}s of 80s)"
+  else
+    fail "check-staleness: a db_server that never answers: the check ends within STALENESS_BUDGET" "it took ${took}s" "$RB"
+  fi
+  check "check-staleness: a db_server that never answers: every target has a state" 8 \
+    "$(find "$work/stall1" -name '*.state' | awk 'END { print NR + 0 }')" "$RB; ls OUT"
+  check "check-staleness: a db_server that never answers is asked once in the run, not once per target" 1 \
+    "$(awk 'END { print NR + 0 }' "$work/stall-a.log")" "$RB; count the listener's connections"
+  mkdir -p "$work/stall1"
+  touch "$work/stall1/aarch64-s1.md" "$work/stall1/aarch64-s2.md"
+  if grep -q "127.0.0.1:$port/aarch64/s1 | curl [0-9]*: no whole answer within" "$work/stall1/aarch64-s1.md" &&
+    grep -q "127.0.0.1:$port/aarch64/s2 | not asked" "$work/stall1/aarch64-s2.md"; then
+    ok "check-staleness: the issue body names the db_server that did not answer, and that later targets did not ask it"
+  else
+    fail "check-staleness: the issue body names the db_server that did not answer, and that later targets did not ask it" \
+      "aarch64-s1.md: $(sed -n 1,30p "$work/stall1/aarch64-s1.md")" "aarch64-s2.md: $(grep -c 127.0.0.1 "$work/stall1/aarch64-s2.md")" "$RB"
+  fi
+else
+  fail "check-staleness against a db_server that never answers: the local listener starts" "no port in $work/stall-a.port" \
+    "reproduce: python3 -I listen.py LOG PORTFILE (this file)"
+fi
+
+#---------------------------------------------------------------------------#
+# status-collect within STATUS_BUDGET: the same 8 targets, against a
+# listener of its own. With no time left for a read, a target is a
+# measurement whose upstream.error names STATUS_BUDGET.
+#---------------------------------------------------------------------------#
+if ! command -v python3 > /dev/null; then
+  ok "skipped: status-collect against a db_server that never answers, because python3 is not on PATH"
+elif listen stall-b && [ -n "$port" ]; then
+  mkdir -p "$work/stall-targets-b"
+  for i in 1 2 3 4 5 6 7 8; do
+    mkdir -p "$net/up.test/aarch64/s$i"
+    cp "$net/up.test/aarch64/core/core.db" "$net/up.test/aarch64/s$i/s$i.db"
+    # shellcheck disable=SC2016 # the target file's own placeholders
+    printf 'arch = aarch64\nrepo = s%s\ndb_server = http://127.0.0.1:%s/$arch/$repo\ndb_server = https://up.test/$arch/$repo\n' \
+      "$i" "$port" > "$work/stall-targets-b/aarch64-s$i.conf"
+  done
+  # stall_collect OUT BUDGET -> status-collect's status, under timeout 120
+  stall_collect() {
+    local rc=0
+    mkdir -p "$1"
+    PATH="$bin:$PATH" FAKE_CURL_ROOT="$net" FAKE_CURL_REAL="$real_curl" TARGETS_DIR="$work/stall-targets-b" \
+      MIRROR_NAMESPACE=test/mirror MIRROR_REGISTRY=ghcr.io GITHUB_REPOSITORY=test/mirror STATUS_WORKER_URL='' \
+      MIRROR_NOW="$NOW" STATUS_BUDGET="$2" UPSTREAM_PROTO='=http,https' \
+      timeout 120 "$REPO_ROOT/scripts/status-collect" "$1" > "$1.out" 2> "$1.err" || rc=$?
+    return "$rc"
+  }
+  RSC="PATH=<fake-curl>:\$PATH FAKE_CURL_REAL=<curl> STATUS_BUDGET=80 UPSTREAM_PROTO='=http,https' TARGETS_DIR=<8 targets> timeout 120 scripts/status-collect OUT"
+  start="$SECONDS"
+  rc=0
+  stall_collect "$work/stall2" 80 || rc=$?
+  took=$((SECONDS - start))
+  check "status-collect: a db_server that never answers: the collect ends by itself and exits 0" 0 "$rc" \
+    "$RSC; $(sed -n '$p' "$work/stall2.err")"
+  if [ "$took" -le 80 ]; then
+    ok "status-collect: a db_server that never answers: the collect ends within STATUS_BUDGET (${took}s of 80s)"
+  else
+    fail "status-collect: a db_server that never answers: the collect ends within STATUS_BUDGET" "it took ${took}s" "$RSC"
+  fi
+  touch "$work/stall2/status.json"
+  check "status-collect: a db_server that never answers: every target is read from the second db_server" \
+    "8 8 https://up.test/aarch64/s1" \
+    "$(jq -r '"\(.targets | length) \([.targets[] | select(.upstream.ok)] | length) \(.targets[0].upstream.server)"' "$work/stall2/status.json")" \
+    "$RSC; jq '.targets[].upstream' OUT/status.json"
+  check "status-collect: a db_server that never answers is asked once in the run, not once per target" 1 \
+    "$(awk 'END { print NR + 0 }' "$work/stall-b.log")" "$RSC; count the listener's connections"
+  check "status-collect: upstream.tried names the stalled db_server, then that later targets did not ask it" \
+    "true true" \
+    "$(jq -r '[(.targets[0].upstream.tried[0].result | test("^curl [0-9]+: no whole answer within")),
+               (.targets[1].upstream.tried[0].result | startswith("not asked"))] | map(tostring) | join(" ")' "$work/stall2/status.json")" \
+    "$RSC; jq '.targets[].upstream.tried' OUT/status.json"
+  rc=0
+  stall_collect "$work/stall3" 1 || rc=$?
+  touch "$work/stall3/status.json"
+  check "status-collect: no time left for a read: each target is measured, with an upstream.error that names STATUS_BUDGET" \
+    "0 8 8" \
+    "$rc $(jq -r '"\(.targets | length) \([.targets[] | select(.upstream.ok == false and (.upstream.error // "" | contains("STATUS_BUDGET")))] | length)"' "$work/stall3/status.json")" \
+    "STATUS_BUDGET=1 ${RSC#*STATUS_BUDGET=80 }; jq '.targets[].upstream.error' OUT/status.json"
+  check "status-collect: no time left for a read: no request reaches the stalled db_server" 1 \
+    "$(awk 'END { print NR + 0 }' "$work/stall-b.log")" "STATUS_BUDGET=1 ${RSC#*STATUS_BUDGET=80 }"
+else
+  fail "status-collect against a db_server that never answers: the local listener starts" "no port in $work/stall-b.port" \
+    "reproduce: python3 -I listen.py LOG PORTFILE (this file)"
 fi
 
 #---------------------------------------------------------------------------#
@@ -836,7 +1171,9 @@ spec() {
       "so the synced badge says 2 h ago.",
       "x86_64-core ok 100% 4 4 0 0.00 3.0 h 2 h ago 0 min 2026-10-14 00:00 UTC",
       "epsilon-1-1-x86_64.pkg.tar.zst 0.00 3.0 h 3 h ago 1.0 h 2026-10-14 00:00 UTC",
-      "A sum counts only the repositories read on that side: upstream in 4 of 5."]
+      "A sum counts only the repositories read on that side: upstream in 4 of 5.",
+      "https://up.test/loong64/core 1 db_server(s) not taken https://down.test/loong64/core : curl 6",
+      "pkg-containers.githubusercontent.com hit ok"]
       + ($over.page_text_more // []))}
     * ($over | del(.page_text_more))'
 }
@@ -972,6 +1309,20 @@ synced_case() {
   synced_case synced-fetched 'del(.summary.last_synced) | .targets[].mirror.created = null' \
     "synced: 3 h ago #1a7f37" "a status.json with no created time falls back to the newest fetched time, 3 h ago"
 }
+
+# A redirect host outside githubusercontent.com whose signed URL works: the
+# probe table says so, in the warning colour, and the probe passes
+d="$work/render-other"
+mkdir -p "$d"
+cp "$work/run-other/status.json" "$d/status.json"
+rc=0
+python3 -I "$REPO_ROOT/scripts/status-render" "$d" "$d/site" > "$d.out" 2> "$d.err" || rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'dot warning" aria-hidden="true"></span>ok, the redirect host is outside \*.githubusercontent.com' "$d/site/index.html"; then
+  ok "site: a probe whose redirect host is outside githubusercontent.com is shown as a warning that passes"
+else
+  fail "site: a probe whose redirect host is outside githubusercontent.com is shown as a warning that passes" \
+    "status-render exit $rc; $(sed -n 1p "$d.err")" "cp run-other/status.json IN; python3 -I scripts/status-render IN SITE; grep outside SITE/index.html"
+fi
 
 # No status.json: refused, with the path named
 rc=0

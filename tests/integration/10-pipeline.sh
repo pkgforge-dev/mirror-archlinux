@@ -192,7 +192,8 @@ conf aarch64 port
 
 # sync N [TARGET ...]: one run, as the workflows run it: plan for every
 # target, then each pending target's chain in the order given (default kr,
-# test, port), then the report; state in $work/out/N
+# test, port), then the report; state in $work/out/N. AFTER_STAGE names a
+# function that runs with the target after each stage, before verify.
 sync() {
   local n="$1" o t s b rc
   shift
@@ -218,6 +219,9 @@ sync() {
       diag "sync $n: stage of $t failed"
       logs_of "$n"
       continue
+    fi
+    if [ -n "${AFTER_STAGE:-}" ]; then
+      "$AFTER_STAGE" "$t"
     fi
     for b in "$o/stage/$t"/batches/*.txt; do
       [ -e "$b" ] || continue
@@ -482,6 +486,56 @@ case "$rc:$(cut -f 3,4 "$work/out/notrust/verify-aarch64-port-0.tsv" 2> /dev/nul
 esac
 
 #---------------------------------------------------------------------------#
+# 1d2. verify looks up no key on the network. The start of verify.sh, as
+#      verify-batch writes it, up to its key lockdown, runs in the verify
+#      image. Then gpg looks up a packager's key by WKD on archlinux.org, as
+#      pacman does for a key that is missing or expired. The lookup must fail
+#      within 5 s, with the network on and off. With no lockdown and the
+#      network on, it reads the key from openpgpkey.archlinux.org in about
+#      1.3 s and succeeds.
+#---------------------------------------------------------------------------#
+awk '/^cat > "\$work\/verify.sh" << .EOS.$/ { on = 1; next } on && /^copied=\(\)$/ { exit } on { print }' \
+  "$REPO_ROOT/scripts/verify-batch" > "$work/lockdown.sh"
+cat >> "$work/lockdown.sh" << 'EOS'
+started="$(date +%s)"
+rc=0
+timeout 30 gpg --homedir /etc/pacman.d/gnupg --batch --locate-external-keys eworm@archlinux.org > /tmp/wkd.log 2>&1 || rc=$?
+printf '@@wkd %s %s\n' "$rc" "$(($(date +%s) - started))"
+sed 's/^/  /' /tmp/wkd.log
+EOS
+for net in default none; do
+  net_arg=()
+  [ "$net" = default ] || net_arg=(--network none)
+  rc=0
+  "$RUNTIME" run --rm "${net_arg[@]}" -v "$REPO_ROOT/client/pacman-oci:/in/pacman-oci:ro" -v "$work/lockdown.sh:/in/lockdown.sh:ro" \
+    "$ARCH_IMAGE" bash /in/lockdown.sh test x86_64 oci://x/y '' '' '' '' DatabaseOptional x > "$work/lockdown-$net.log" 2>&1 || rc=$?
+  read -r w_rc w_secs <<< "$(awk '$1 == "@@wkd" { print $2, $3 }' "$work/lockdown-$net.log")"
+  if [ "$rc" -eq 0 ] && [ -n "${w_rc:-}" ] && [ "$w_rc" -ne 0 ] && [ "${w_secs:-99}" -le 5 ]; then
+    ok "verify's key lockdown, network $net: a WKD lookup on archlinux.org fails within 5 s"
+  else
+    fail "verify's key lockdown, network $net: a WKD lookup on archlinux.org fails within 5 s" \
+      "container exit $rc, lookup exit ${w_rc:-none} after ${w_secs:-?} s" "read $work/lockdown-$net.log"
+    while IFS= read -r l; do diag "$l"; done < <(tail -n 12 "$work/lockdown-$net.log")
+  fi
+done
+
+#---------------------------------------------------------------------------#
+# 1d3. A keyring package that upstream renamed: it does not install, and the
+#      verdict names the package and pacman's own words, not only the status
+#      of the container.
+#---------------------------------------------------------------------------#
+mkdir -p "$work/targets-nokr"
+sed 's/^keyring = test-keyring$/keyring = missing-keyring/' "$work/targets/x86_64-kr.conf" > "$work/targets-nokr/x86_64-kr.conf"
+rc=0
+TARGETS_DIR="$work/targets-nokr" "$REPO_ROOT/scripts/verify-batch" "$work/out/1/stage" x86_64-kr 0 "$work/out/nokr" \
+  > "$work/out/nokr.log" 2>&1 || rc=$?
+case "$rc:$(cut -f 3,4 "$work/out/nokr/verify-x86_64-kr-0.tsv" 2> /dev/null)" in
+  1:failed*'missing-keyring did not install from [kr]'*'target not found'*) ok "a keyring package that does not install: the verdict names it and pacman's error line" ;;
+  *) fail "a keyring package that does not install: the verdict names it and pacman's error line" \
+    "exit $rc: $(cat "$work/out/nokr/verify-x86_64-kr-0.tsv" 2> /dev/null)" "read out/nokr/verify-x86_64-kr-0.log" ;;
+esac
+
+#---------------------------------------------------------------------------#
 # 1e. A database with an unreadable member that is not NUL bytes is refused
 #---------------------------------------------------------------------------#
 build port-junk aarch64/port-junk port
@@ -497,6 +551,37 @@ if grep -q 'junk-1-1/desc gives no record named after its directory' "$work/out/
 else
   fail "the refusal names the member" "$(cat "$work/out/junk.log")"
 fi
+
+#---------------------------------------------------------------------------#
+# 1e2. A plain server that does not answer, the closed port 9 on the loopback,
+#      does not hold a file that upstream signs nowhere: every db_server
+#      answers 404 for its .sig, so it is mirrored unsigned, its result names
+#      the closed host, and verify excuses it. The same closed port as a
+#      db_server holds the target. Each in a namespace of its own.
+#---------------------------------------------------------------------------#
+closed='http://127.0.0.1:9'
+mkdir -p "$work/targets-closed" "$work/targets-closeddb"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+{ cat "$work/targets/aarch64-port.conf"; printf 'server = %s/$arch/$repo\n' "$closed"; } > "$work/targets-closed/aarch64-port.conf"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+{ cat "$work/targets/aarch64-port.conf"; printf 'db_server = %s/$arch/$repo\n' "$closed"; } > "$work/targets-closeddb/aarch64-port.conf"
+TARGETS_DIR="$work/targets-closed" MIRROR_NAMESPACE=it/closed sync closed aarch64-port
+unsigned_result="$(cat "$work/out/closed/results/aarch64-port"/*/results.tsv 2> /dev/null | awk -F '\t' '$2 == "unsigned-1-1-any.pkg.tar.zst" { print $3 "\t" $5 }')"
+case "$unsigned_result" in
+  pushed$'\t'unsigned:*'no answer from 127.0.0.1:9'*) ok "a plain server that does not answer: the file upstream signs nowhere is pushed unsigned, naming the host" ;;
+  *) fail "a plain server that does not answer: the file upstream signs nowhere is pushed unsigned, naming the host" \
+    "result: $unsigned_result" "cat out/closed/results/aarch64-port/*/results.tsv; read out/closed/mirror-aarch64-port-*.log" ;;
+esac
+check "a plain server that does not answer: the target stages, verify excuses the file as sig-missing, and it is promoted" \
+  "staged passed unsigned-1-1-any.pkg.tar.zst sig-missing promoted" \
+  "$(state_of closed stage aarch64-port) $(verdict_of closed aarch64-port | cut -f 1) $(awk -F '\t' '$1 == "unsigned-1-1-any.pkg.tar.zst" { split($2, r, ":"); print $1 " " r[1] }' "$work/out/closed/verify/refused-aarch64-port-0.tsv" 2> /dev/null) $([ -n "$(digest_of latest it/closed/aarch64/port)" ] && echo promoted || echo 'no latest')" \
+  "read out/closed/stage-aarch64-port.log out/closed/verify/verify-aarch64-port-0.log out/closed/promote-aarch64-port.log"
+TARGETS_DIR="$work/targets-closeddb" MIRROR_NAMESPACE=it/closeddb sync closeddb aarch64-port
+case "$(state_of closeddb stage aarch64-port):$(cat "$work/out/closeddb/stage/aarch64-port/why" 2> /dev/null)" in
+  held:*'a db_server gave no answer that decides: no answer from 127.0.0.1:9'*) ok "a db_server that does not answer holds a file that upstream signs nowhere, and the stage names the host" ;;
+  *) fail "a db_server that does not answer holds a file that upstream signs nowhere, and the stage names the host" \
+    "$(state_of closeddb stage aarch64-port): $(cat "$work/out/closeddb/stage/aarch64-port/why" 2> /dev/null)" "read out/closeddb/stage-aarch64-port.log" ;;
+esac
 
 #---------------------------------------------------------------------------#
 # 1f. A file promoted with no signature, because upstream had none, gets its
@@ -596,6 +681,34 @@ if grep -q 'port.files and port.db name 1 file(s) with other sha256 values, e.g.
   ok "the refusal names the file"
 else
   fail "the refusal names the file" "read out/fconflict.log"
+fi
+
+# A files database that lags a mass rebuild: 12 of 40 packages at their
+# earlier file names, 24 file names that only one of the two databases names.
+# That is more than the larger of 16 and half the records, and is still the
+# files database of this repository: every package is named. One that names
+# none of the packages is of another repository.
+# files_plan NAME STATE: plan a target whose upstream is build-repo STATE
+files_plan() {
+  local rc=0
+  build "$2" "aarch64/port-$1" port
+  mkdir -p "$work/targets-$1"
+  # shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+  sed 's|/\$arch/\$repo$|/$arch/port-'"$1"'|; s|/\$arch/\./\$repo$|/$arch/./port-'"$1"'|' "$work/targets/aarch64-port.conf" > "$work/targets-$1/aarch64-port.conf"
+  TARGETS_DIR="$work/targets-$1" MIRROR_NAMESPACE="it/$1" "$REPO_ROOT/scripts/plan" "$work/out/$1" > "$work/out/$1.log" 2>&1 || rc=$?
+  printf '%s\n' "$(cat "$work/out/$1/aarch64-port/state" 2> /dev/null || echo "no state, plan exit $rc")"
+}
+check "a files database that lags 12 rebuilt packages of 40 is planned" pending "$(files_plan flag files-lag)" "read out/flag.log"
+if grep -q 'port.files names package(s) of port.db at another file name, as upstream serves it (the files database lags): 12: p01 p02 p03 p04 p05 p06 p07 p08 p09 p10 p11 p12$' "$work/out/flag.log"; then
+  ok "the plan names the 12 packages the files database names at an earlier file name"
+else
+  fail "the plan names the 12 packages the files database names at an earlier file name" "read out/flag.log"
+fi
+check "a files database that names none of the packages is refused" error "$(files_plan fother files-other)" "read out/fother.log"
+if grep -q 'port.files names 0 of the 40 packages of port.db: it is the files database of another repository' "$work/out/fother.log"; then
+  ok "the refusal names how many packages the files database names"
+else
+  fail "the refusal names how many packages the files database names" "read out/fother.log"
 fi
 
 #---------------------------------------------------------------------------#
@@ -923,11 +1036,17 @@ check "a lagging db_server that only drops a package does not move latest" curre
 #---------------------------------------------------------------------------#
 # 9d. With no %PGPSIG%, a signature layer that is not upstream's .sig: pacman
 #     refuses the package for its signature, and the account of the refusal
-#     finds the mirror at fault, not upstream: the batch fails.
+#     finds the mirror at fault, not upstream: the batch fails. plan compares
+#     a sample of these layers with upstream's .sig and repairs one that
+#     differs (9g), so the layer is written after stage, before verify.
 #---------------------------------------------------------------------------#
 build nopgpsig-four
-tamper_canary
-sync 11
+# tamper_test_canary TARGET: tamper_canary, for x86_64-test only
+tamper_test_canary() {
+  [ "$1" = x86_64-test ] || return 0
+  tamper_canary
+}
+AFTER_STAGE=tamper_test_canary sync 11
 check "the canary is not new in this update either" "theta-1-1-any.pkg.tar.zst" "$(cut -f 2 "$work/out/11/plan/x86_64-test/todo.tsv")" \
   "read out/11/plan/x86_64-test/todo.tsv; the canary is $canary"
 case "$(verdict_of 11)" in
@@ -999,6 +1118,81 @@ if grep -q 'every file of this shard asks it last from now on' "$work/out/down.l
   ok "the shard log names the server it asks last"
 else
   fail "the shard log names the server it asks last" "read out/down.log"
+fi
+
+#---------------------------------------------------------------------------#
+# 9g. With no %PGPSIG%, upstream makes a detached .sig again and keeps the
+#     database bytes. plan compares a sample of the .sig files with the
+#     signature layers of their tags: the file is planned again, its layer is
+#     repaired, and the snapshot is promoted. When more than
+#     SIGCHECK_ESCALATE of one sample differ, every such file is planned. In
+#     a namespace of its own, with x86_64-kr beside it for keyring_from.
+#---------------------------------------------------------------------------#
+build nopgpsig x86_64/test-resig test
+mkdir -p "$work/targets-resig"
+cp "$work/targets/x86_64-kr.conf" "$work/targets-resig/"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/test-resig|; s|/\$arch/\./\$repo$|/$arch/./test-resig|' "$work/targets/x86_64-test.conf" > "$work/targets-resig/x86_64-test.conf"
+resig_repo=it/resig/x86_64/test
+TARGETS_DIR="$work/targets-resig" MIRROR_NAMESPACE=it/resig sync resig1 x86_64-kr x86_64-test
+resig_latest1="$(digest_of latest "$resig_repo")"
+check "a database with no %PGPSIG% is promoted in its own namespace" "promoted 0" \
+  "$(cut -f 2 "$work/out/resig1/promote-x86_64-test.tsv" 2> /dev/null) $(pgpsig_count x86_64/test-resig)" \
+  "read out/resig1/plan.log out/resig1/promote-x86_64-test.log"
+resig_db="$(sha256sum "$work/upstream/x86_64/test-resig/test.db.tar.gz" | cut -d ' ' -f 1)"
+build resig-one x86_64/test-resig
+check "upstream makes alpha's .sig again with the second key, and its database stays the same" "$resig_db" \
+  "$(sha256sum "$work/upstream/x86_64/test-resig/test.db.tar.gz" | cut -d ' ' -f 1)" "read $work/build-resig-one.log"
+SIGCHECK_SAMPLE=64 TARGETS_DIR="$work/targets-resig" MIRROR_NAMESPACE=it/resig sync resig2 x86_64-test
+check "a .sig made again upstream, with the database the same, plans that file alone" "pending $alpha" \
+  "$(state_of resig2 plan x86_64-test) $(cut -f 2 "$work/out/resig2/plan/x86_64-test/todo.tsv" 2> /dev/null | tr '\n' ' ' | sed 's/ $//')" \
+  "read out/resig2/plan.log"
+case "$(cat "$work/out/resig2/plan/x86_64-test/why" 2> /dev/null)" in
+  *'1 detached signature(s) changed upstream'*) ok "the plan's why counts the detached signature that changed" ;;
+  *) fail "the plan's why counts the detached signature that changed" "$(cat "$work/out/resig2/plan/x86_64-test/why" 2> /dev/null)" \
+    "read out/resig2/plan.log" ;;
+esac
+check "its tag gets upstream's new .sig as its signature layer, with the same package blob" \
+  "sha256:$(sha256sum "$work/upstream/x86_64/test-resig/$alpha.sig" | cut -d ' ' -f 1) sha256:$(sha256sum "$work/upstream/x86_64/test-resig/$alpha" | cut -d ' ' -f 1)" \
+  "$(manifest "$alpha_tag" "$resig_repo" > "$work/resig-alpha.json" && echo "$(layer_of "$work/resig-alpha.json" "$alpha.sig") $(layer_of "$work/resig-alpha.json" "$alpha")")" \
+  "read out/resig2/mirror-x86_64-test-0.log"
+resig_latest2="$(digest_of latest "$resig_repo")"
+check "pacman verifies the new .sig, and the snapshot is promoted" "passed moved" \
+  "$(verdict_of resig2 | cut -f 1) $([ -n "$resig_latest2" ] && [ "$resig_latest2" != "$resig_latest1" ] && echo moved || echo stayed)" \
+  "read out/resig2/verify/verify-x86_64-test-0.log out/resig2/promote-x86_64-test.log"
+
+# The sample: 2 of the 5 files, sorted by name, from (now / 10800 * 2) mod 5.
+# At 03:00 on the first day the offset is 2.
+resig_plan() {
+  local o="$work/out/$1" rc=0
+  shift
+  env "$@" TARGETS_DIR="$work/targets-resig" MIRROR_NAMESPACE=it/resig "$REPO_ROOT/scripts/plan" "$o" \
+    "$work/targets-resig/x86_64-test.conf" > "$o.log" 2>&1 || rc=$?
+  printf '%s %s\n' "$(cat "$o/x86_64-test/state" 2> /dev/null || echo "no state, plan exit $rc")" \
+    "$(cut -f 2 "$o/x86_64-test/todo.tsv" 2> /dev/null | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+}
+check "with every .sig the same as its layer, the sample plans nothing" "current " \
+  "$(resig_plan resig-same MIRROR_NOW=10800 SIGCHECK_SAMPLE=2)" "read out/resig-same.log"
+if grep -q '2 of 5 file(s) with a detached signature only compared with their tags, 0 changed upstream' "$work/out/resig-same.log"; then
+  ok "the plan logs how many detached signatures it compared"
+else
+  fail "the plan logs how many detached signatures it compared" "read out/resig-same.log"
+fi
+build resig-all x86_64/test-resig
+check "a sample of 2 that starts at offset 2 plans the third and fourth file by name" \
+  "pending eta-1-1-any.pkg.tar.zst gamma-3.0-2-any.pkg.tar.zst" \
+  "$(resig_plan resig-sample MIRROR_NOW=10800 SIGCHECK_SAMPLE=2)" "read out/resig-sample.log"
+check "more than SIGCHECK_ESCALATE of one sample changed: every file with a detached signature only is planned" \
+  "pending $(LC_ALL=C sort <<< "$alpha
+beta_pc-2.0-1-x86_64.pkg.tar.zst
+eta-1-1-any.pkg.tar.zst
+gamma-3.0-2-any.pkg.tar.zst
+$zeta" | tr '\n' ' ' | sed 's/ $//')" \
+  "$(resig_plan resig-escalate MIRROR_NOW=10800 SIGCHECK_SAMPLE=2 SIGCHECK_ESCALATE=1)" "read out/resig-escalate.log"
+if grep -q 'upstream signed 2 of 2 sampled files again; every detached signature is checked this run' "$work/out/resig-escalate.log"; then
+  ok "the plan warns that every detached signature is checked"
+else
+  fail "the plan warns that every detached signature is checked" "read out/resig-escalate.log"
 fi
 
 #---------------------------------------------------------------------------#

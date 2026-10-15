@@ -10,7 +10,8 @@
 # other than the default, through a proxy that answers 503, through a proxy
 # that cuts every blob in half, through a proxy that stops sending a large
 # blob, through a proxy that changes one byte of the first answer for each
-# blob, and from a plain http Server that ignores Range.
+# blob, through a proxy that refuses the dummy token, and from a plain http
+# Server that ignores Range.
 #
 # Needs docker or podman (CONTAINER_RUNTIME), curl, jq, sha256sum, and network
 # to pull the pinned images and oras. Ports are picked at run time and every
@@ -37,9 +38,10 @@ dead_name="client-it-dead-$id"
 flip_name="client-it-flip-$id"
 stall_name="client-it-stall-$id"
 norange_name="client-it-norange-$id"
+token_name="client-it-token-$id"
 cleanup() {
   local out
-  out="$("$RUNTIME" rm -f "$reg_name" "$cut_name" "$dead_name" "$flip_name" "$stall_name" "$norange_name" 2>&1)" || diag "cleanup: $out"
+  out="$("$RUNTIME" rm -f "$reg_name" "$cut_name" "$dead_name" "$flip_name" "$stall_name" "$norange_name" "$token_name" 2>&1)" || diag "cleanup: $out"
   if [ "${IT_KEEP:-0}" = 1 ]; then
     echo "# kept $work" >&2
   else
@@ -113,7 +115,7 @@ check "a package is pushed as the mirror lays it out" "alpha-1.0-1-any.pkg.tar.z
   "curl http://$REG/v2/it/client/x86_64/one/manifests/<alpha tag>"
 
 #---------------------------------------------------------------------------#
-# The four proxies and the plain server, on ports they pick themselves
+# The five proxies and the plain server, on ports they pick themselves
 #---------------------------------------------------------------------------#
 # proxy NAME MODE: start one and print its port. The norange mode serves the
 # files of the repositories, mounted at /up, and no registry.
@@ -136,9 +138,10 @@ dead_port="$(proxy "$dead_name" 503)"
 flip_port="$(proxy "$flip_name" flip)"
 stall_port="$(proxy "$stall_name" stall)"
 norange_port="$(proxy "$norange_name" norange)"
-[ -n "$cut_port" ] && [ -n "$dead_port" ] && [ -n "$flip_port" ] && [ -n "$stall_port" ] && [ -n "$norange_port" ] ||
+token_port="$(proxy "$token_name" token)"
+[ -n "$cut_port" ] && [ -n "$dead_port" ] && [ -n "$flip_port" ] && [ -n "$stall_port" ] && [ -n "$norange_port" ] && [ -n "$token_port" ] ||
   stop "the fault proxies start" \
-    "cut '$cut_port' 503 '$dead_port' flip '$flip_port' stall '$stall_port' norange '$norange_port'" \
+    "cut '$cut_port' 503 '$dead_port' flip '$flip_port' stall '$stall_port' norange '$norange_port' token '$token_port'" \
     "reproduce: $RUNTIME logs $cut_name"
 
 #---------------------------------------------------------------------------#
@@ -272,6 +275,35 @@ want norange s_rc 0 "a plain Server that ignores Range: pacman -S big succeeds a
 want norange installed_big 0 "a plain Server that ignores Range: big is installed"
 check "norange: the refused range is followed by one GET from zero" "range=- range=bytes=65536- range=-" "$big_gets" \
   "$RUNTIME logs $norange_name | grep big"
+
+# A registry that refuses the dummy token: each pacman run gets one anonymous
+# token per repository, keeps it in its run store, and the prefetch reads
+# every file with it. With PACMAN_OCI_NO_DUMMY=1 the prefetch starts with the
+# token flow, and says nothing of a refusal.
+# token_gets: the token requests the token proxy has answered so far
+token_gets() {
+  "$RUNTIME" logs "$token_name" 2>&1 | awk '$1 == "GET" && index($2, "/token") == 1 { n++ } END { print n + 0 }'
+}
+for c in token token-nodummy; do
+  before="$(token_gets)"
+  consumer "$c" "oci+http://127.0.0.1:$token_port/it/client/x86_64"
+  check "$c: one token request per repository and pacman run, 4 for -Sy and -S of two repositories" 4 "$(($(token_gets) - before))" \
+    "$RUNTIME logs $token_name | grep '^GET /token'"
+  want "$c" sy_rc 0 "pacman -Sy of two repositories succeeds"
+  want "$c" sy_prefetch_get 6 "the database prefetch asks both manifests, both again with the token, and reads both databases"
+  want "$c" sy_get 0 "no single request: the databases come from the run store"
+  want "$c" sy_served 2 "both databases are handed over from the run store"
+  want "$c" s_rc 0 "pacman -S of three packages from two repositories succeeds"
+  want "$c" s_prefetch_get 6 "the prefetch reads the three packages, again with the token after the refusal"
+  want "$c" s_get 0 "the serial pass makes no network request"
+  want "$c" s_served 6 "every package and every .sig is handed over from the run store"
+  want "$c" s_token_get 4 "the package prefetch reads the challenge and a token once per repository"
+  want "$c" installed_alpha 0 "alpha is installed"
+  want "$c" installed_gamma 0 "gamma is installed"
+done
+want token sy_said_refused 1 "the refusal of the dummy token is said once on stderr"
+want token sy_token_get 2 "the database prefetch takes the challenge from the refusal, and a token once per repository"
+want token-nodummy sy_said_refused 0 "with PACMAN_OCI_NO_DUMMY=1 no refusal is said"
 
 consumer flip "oci+http://127.0.0.1:$flip_port/it/client/x86_64"
 want flip sy_rc 0 "one byte changed in each first answer: pacman -Sy succeeds"

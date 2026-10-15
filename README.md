@@ -127,6 +127,7 @@ curl -sI --connect-timeout 10 --max-time 30 \
 | Package signature | the registry's `.sig` layer, through a redirect | decoded from the database's `%PGPSIG%` with no request, else the registry's layer |
 | Resume | pacman's own | `--continue-at -`, then a sha256 check |
 | A host that fails | pacman's server error limit | skipped for the rest of the run, never for a `.sig` |
+| GHCR refuses the dummy token `Bearer QQ==` | the anonymous token flow, one token per repository, kept at most 300 s | the anonymous token flow, one token per repository and run |
 | Absent `<repo>.db.sig` | a 404 with no pause | an empty file under the sandbox (pacman 7.0, 7.1), else a 2 s pause |
 | Sandbox, with `DownloadUser` | pacman's own (Landlock, seccomp) | uid switch and `NO_NEW_PRIVS` only |
 | Programs on the host | none | `curl`, `awk`, `sed`, `grep`, `sha256sum`, `mktemp`, `base64` |
@@ -168,7 +169,7 @@ pacman checks each package against the keyring of its distribution. A consumer n
 3. **stage** (`scripts/stage`) pushes the database under a staging tag once every file it names is on the registry. It reads the database back and splits the new files into verify batches.
 4. **verify** (`scripts/verify-batch`) runs pacman in the x86_64 Arch image with the wrapper as its `XferCommand`. pacman downloads every new file and checks its sha256 and signature.
 5. **promote** (`scripts/promote`, branch `main` only) tags the staged digest: the date tag once, `db-HEX`, `files-HEX`, then `latest`. `latest` never moves backwards.
-6. **report** (`scripts/report`) writes one table for the run. On `main`, it keeps the `visibility-` and `replaced-` issues current, then starts the status workflow.
+6. **report** (`scripts/report`) writes one table for the run. On `main`, it keeps the `visibility-`, `replaced-` and `refused-` issues current, then starts the status workflow.
 7. **status** (`scripts/status-collect`, `scripts/status-render`, every hour) measures each target against upstream and against the Worker. It publishes the dashboard, the badges and the charts.
 
 [docs/design.md](docs/design.md) gives each rule and the failure it prevents.
@@ -241,8 +242,12 @@ These issues open by themselves. Each one opens once, keeps its body current, an
 | --- | --- | --- |
 | `visibility-<target>` | the package reads only with the workflow's token | `scripts/report` |
 | `replaced-<target>` | a package tag holds other bytes than the database names | `scripts/report` |
+| `refused-<target>` | more than 16 new files of a run are refused by pacman from upstream too, as a revoked or rotated upstream key makes them | `scripts/report` |
 | `stale-<target>` | `latest` differs from upstream for longer than the tolerance, 3 days for the 3-hour cron | `watchdog.yml` (`scripts/check-staleness`) |
 | `worker-down` | the Worker failed its probe in 2 status runs in a row | `status.yml` |
+| `status-down` | the status workflow failed, or its record is old: the page and the badges show an old state | `status.yml`, `watchdog.yml` |
+| `pages-stale` | the copy of the status site on Pages trails the status workflow's record by more than 3 hours | `watchdog.yml` |
+| `schedules-stopped` | a schedule has stopped firing, or a person disabled a workflow | `watchdog.yml`, `sync.yml` (`scripts/watch-schedules`) |
 
 These need a person:
 
