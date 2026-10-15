@@ -38,23 +38,28 @@ jobs:
           # The whole history: a target added less than the tolerance ago,
           # with nothing promoted yet, is new, not stale.
           fetch-depth: 0
-      - name: Install curl-impersonate, so the powerpc targets read upstream
+      - name: Install the fetcher clients, so the powerpc targets read upstream
         run: |
           # check-staleness reads every enabled target's upstream through
           # scripts/upstream-db, and the powerpc (ArchPOWER) hosts refuse the
-          # runner's own address to raw curl with a 403. curl-impersonate (a
-          # patched curl with one browser's TLS and HTTP/2 profile) reads them,
-          # directly at this low volume or through the api.rv.pkgforge.dev proxy
-          # as its -rv variant: two layers, and a handful of database reads need
-          # no full browser, so chromium is not installed here. Best-effort: a
+          # runner's own address with a 403. A full browser is needed, not just
+          # curl: after a day of mirroring the runner's address and the
+          # api.rv.pkgforge.dev proxy can both be rate-flagged, and only chromium
+          # (a real browser that solves the challenge and keeps its clearance
+          # cookie) still reads. curl-impersonate (patched curl) reads cheaply
+          # when it can, directly or through the proxy; chromium is the fallback
+          # for when both are refused. Both best-effort, as sync.yml does: a
           # client-install hiccup leaves MIRROR_FETCHER unset and the powerpc
-          # targets read with curl and go to error on their own, as before.
-          imp=0
+          # targets read with curl and go to error on their own.
+          imp=0; chr=0
           fetchers/install.sh curl-impersonate || imp=$?
-          if [ "$imp" -eq 0 ]; then
+          PLAYWRIGHT_WITH_DEPS=1 fetchers/install.sh chromium || chr=$?
+          [ "$imp" -eq 0 ] || echo "::notice::curl-impersonate did not install (status $imp)"
+          [ "$chr" -eq 0 ] || echo "::notice::chromium did not install (status $chr)"
+          if [ "$imp" -eq 0 ] || [ "$chr" -eq 0 ]; then
             echo "MIRROR_FETCHER=$GITHUB_WORKSPACE/fetchers/fetcher.sh" >> "$GITHUB_ENV"
           else
-            echo "::warning::curl-impersonate did not install (status $imp); powerpc targets read upstream with curl and may go to error"
+            echo "::warning::no browser-profile client installed; powerpc targets read upstream with curl and may go to error"
           fi
       # scripts/check-staleness ends within STALENESS_BUDGET (600 s). The step
       # limit is above it and below the job's, so the step after this one

@@ -210,23 +210,28 @@ jobs:
           mkdir -p "$in/bench"
           cp "$RUNNER_TEMP/bench-new/bench.json" "$in/bench.json"
           cp "$RUNNER_TEMP/bench-new/bench.json" "$in/bench/$day.json"
-      - name: Install curl-impersonate, so the powerpc targets read upstream
+      - name: Install the fetcher clients, so the powerpc targets read upstream
         run: |
           # status-collect reads every enabled target's upstream through
           # scripts/upstream-db, and the powerpc (ArchPOWER) hosts refuse the
-          # runner's own address to raw curl with a 403, so without this the
-          # status site reports those targets as unreadable. curl-impersonate (a
-          # patched curl with one browser's TLS and HTTP/2 profile) reads them,
-          # directly at this low volume or through the api.rv.pkgforge.dev proxy
-          # as its -rv variant; a handful of database reads need no full browser,
-          # so chromium is not installed here. Best-effort: a client-install
-          # hiccup leaves MIRROR_FETCHER unset and those reads fall back to curl.
-          imp=0
+          # runner's own address with a 403, so without a reader the status site
+          # reports those targets as unreadable. A full browser is needed, not
+          # just curl: the runner's address and the api.rv.pkgforge.dev proxy can
+          # both be rate-flagged, and only chromium (a real browser that solves
+          # the challenge and keeps its clearance cookie) still reads.
+          # curl-impersonate (patched curl) reads cheaply when it can, directly
+          # or through the proxy; chromium is the fallback for when both are
+          # refused. Both best-effort, as sync.yml does: a client-install hiccup
+          # leaves MIRROR_FETCHER unset and those reads fall back to curl.
+          imp=0; chr=0
           fetchers/install.sh curl-impersonate || imp=$?
-          if [ "$imp" -eq 0 ]; then
+          PLAYWRIGHT_WITH_DEPS=1 fetchers/install.sh chromium || chr=$?
+          [ "$imp" -eq 0 ] || echo "::notice::curl-impersonate did not install (status $imp)"
+          [ "$chr" -eq 0 ] || echo "::notice::chromium did not install (status $chr)"
+          if [ "$imp" -eq 0 ] || [ "$chr" -eq 0 ]; then
             echo "MIRROR_FETCHER=$GITHUB_WORKSPACE/fetchers/fetcher.sh" >> "$GITHUB_ENV"
           else
-            echo "::warning::curl-impersonate did not install (status $imp); powerpc targets read upstream with curl"
+            echo "::warning::no browser-profile client installed; powerpc targets read upstream with curl"
           fi
       - name: Measure the mirror, upstream and the Worker
         run: scripts/status-collect "$RUNNER_TEMP/status"
