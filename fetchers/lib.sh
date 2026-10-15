@@ -286,6 +286,33 @@ retry_sleep() {
   sleep "$(retry_delay "$1").$((RANDOM % 10))"
 }
 
+# retry_run LABEL CMD... -> run CMD, and on failure retry it up to
+# FETCHER_INSTALL_RETRIES times (default 4) with the shared backoff. The npm
+# registry and the browser CDN reset a connection now and then; a transient
+# failure here would leave a runner without the client it installs, so a shard
+# that needs a browser to read a host would fall back to curl and get a 403 for
+# every file. The retry keeps that one hiccup from failing the whole shard. The
+# last attempt's own output is left for the caller, which reports it.
+retry_run() {
+  local label="$1" attempt=1 max="${FETCHER_INSTALL_RETRIES:-4}"
+  shift
+  case "$max" in
+    '' | *[!0-9]* | 0) max=4 ;;
+  esac
+  while :; do
+    if "$@"; then
+      return 0
+    fi
+    if [ "$attempt" -ge "$max" ]; then
+      fetcher_warn "$label did not succeed in $attempt attempt(s)"
+      return 1
+    fi
+    fetcher_warn "$label failed (attempt $attempt of $max); retrying after a pause"
+    retry_sleep "$attempt"
+    attempt=$((attempt + 1))
+  done
+}
+
 # client_known NAME -> 0 when NAME is a client this manager can run. A client
 # that is not available here is still known: only a name no build defines is
 # refused.

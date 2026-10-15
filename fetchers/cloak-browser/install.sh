@@ -21,6 +21,10 @@ fi
 [ -n "$version" ] || fetcher_die "could not resolve the cloakbrowser version"
 
 fetcher_log "installing cloakbrowser@$version"
-npm install --prefix "$HERE" --no-save --no-package-lock --no-audit --no-fund "cloakbrowser@$version" ||
+# Retried: the npm registry resets a connection now and then, and a transient
+# failure must not leave a runner without the client it installs.
+retry_run "npm install cloakbrowser@$version" \
+  npm install --prefix "$HERE" --no-save --no-package-lock --no-audit --no-fund \
+  --fetch-retries 5 --fetch-retry-maxtimeout 60000 "cloakbrowser@$version" ||
   fetcher_die "npm could not install cloakbrowser@$version"
 "$HERE/available"

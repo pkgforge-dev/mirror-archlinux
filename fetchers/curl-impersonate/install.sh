@@ -48,6 +48,7 @@ if [ -n "${CURL_IMPERSONATE_RELEASE_JSON:-}" ]; then
 else
   need_net
   curl -q --fail --silent --show-error --location --connect-timeout 20 --max-time 120 \
+    --retry 3 --retry-connrefused --retry-delay 2 --retry-all-errors \
     --header 'Accept: application/vnd.github+json' \
     --user-agent 'mirror-archlinux-fetcher (+https://github.com/pkgforge-dev/mirror-archlinux)' \
     --output "$release" "https://api.github.com/repos/lexiforest/curl-impersonate/releases/tags/$tag" \
@@ -83,6 +84,7 @@ sum_url="$(jq -r '
 
 name="$(basename "$asset_url")"
 curl -q --fail --silent --show-error --location --connect-timeout 20 --max-time 600 \
+  --retry 3 --retry-connrefused --retry-delay 2 --retry-all-errors \
   --user-agent 'mirror-archlinux-fetcher (+https://github.com/pkgforge-dev/mirror-archlinux)' \
   --output "$work/$name" "$asset_url" || fetcher_die "could not download $asset_url"
 
