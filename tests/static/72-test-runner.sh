@@ -95,6 +95,7 @@ summary
 EOF
 run integration
 check "a failing file fails the run" 1 "$rc" "tests/run.sh integration (with a failing file)"
+
 check "and every other file still runs" "10-first.sh 20-second.sh " "$ran" "tests/run.sh integration"
 case "$out" in
   *"failed: integration/30-fails.sh, reproduce: tests/run.sh integration 30-fails.sh"*)
@@ -105,6 +106,50 @@ case "$out" in
       "reproduce: tests/run.sh integration"
     ;;
 esac
+
+# A file that exits 0 without asserting anything is the quiet failure this
+# runner has to catch. The harness fails a file that reaches summary with no
+# assertions, so the two cases here are the ways out: a file that never reaches
+# summary at all, and one that takes an early exit before any check. The two
+# passing files above are moved aside and put back, because the assertion
+# before this one names them.
+mv "$tree/tests/integration/10-first.sh" "$tree/tests/integration/10-first.hold"
+mv "$tree/tests/integration/20-second.sh" "$tree/tests/integration/20-second.hold"
+cat > "$tree/tests/integration/10-silent.sh" << 'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+cat > "$tree/tests/integration/20-early.sh" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+. "$REPO_ROOT/tests/lib/harness.sh"
+[ -n "${JUMP_OUT:-}" ] && exit 0
+ok "a test that passes"
+summary
+EOF
+chmod 0755 "$tree/tests/integration/10-silent.sh" "$tree/tests/integration/20-early.sh"
+run integration
+check "a file that asserts nothing and exits 0 fails the run" 1 "$rc" \
+  "tests/run.sh integration (with a file that prints no TAP plan)"
+JUMP_OUT=1 run integration
+check "a file that exits 0 early, before any assertion, fails the run" 1 "$rc" \
+  "JUMP_OUT=1 tests/run.sh integration (with a file that exits before summary)"
+# The one file that did assert is still reported, so the check above is about
+# the two silent files and not about every file being called silent.
+if printf '%s' "$out" | grep -q '^1\.\.1$'; then
+  ok "and the file that does assert still reports its plan"
+else
+  fail "and the file that does assert still reports its plan" "$(printf '%s\n' "$out" | grep -E '^1\.\.' | head -n 3)" \
+    "JUMP_OUT=1 tests/run.sh integration"
+fi
+if printf '%s' "$out" | grep -q "no TAP plan line"; then
+  ok "and the summary says the file printed no plan"
+else
+  fail "and the summary says the file printed no plan" "$(printf '%s\n' "$out" | tail -n 4)" \
+    "JUMP_OUT=1 tests/run.sh integration"
+fi
+mv "$tree/tests/integration/10-first.hold" "$tree/tests/integration/10-first.sh"
+mv "$tree/tests/integration/20-second.hold" "$tree/tests/integration/20-second.sh"
 
 run all 10-first.sh
 check "all takes no FILE" 2 "$rc" "tests/run.sh all 10-first.sh"

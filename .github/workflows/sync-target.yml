@@ -72,6 +72,26 @@ jobs:
         with:
           name: plan-${{ inputs.target }}
           path: ${{ runner.temp }}/plan/${{ inputs.target }}
+      - name: Install the fetcher clients
+        if: ${{ startsWith(inputs.target, 'powerpc') }}
+        run: |
+          # The powerpc upstream needs a browser-profile client. curl-impersonate
+          # (patched curl) reads it cheaply; chromium is the fallback when a host
+          # needs a real engine. Both are installed; at least one must land, or
+          # this job fails. It runs one target only, so no other target is held.
+          # The read through the fetcher, not a strict self-check, decides: curl
+          # fails for this host by design, so a self-check that required curl
+          # would always fail.
+          imp=0; chr=0
+          fetchers/install.sh curl-impersonate || imp=$?
+          PLAYWRIGHT_WITH_DEPS=1 fetchers/install.sh chromium || chr=$?
+          [ "$imp" -eq 0 ] || echo "::notice::curl-impersonate did not install (status $imp)"
+          [ "$chr" -eq 0 ] || echo "::notice::chromium did not install (status $chr)"
+          if [ "$imp" -ne 0 ] && [ "$chr" -ne 0 ]; then
+            echo "::error::no browser-profile client installed for the powerpc read (curl-impersonate $imp, chromium $chr)"
+            exit 1
+          fi
+          echo "MIRROR_FETCHER=$GITHUB_WORKSPACE/fetchers/fetcher.sh" >> "$GITHUB_ENV"
       # The step ends before the job does, so the results of the files that
       # ended (results/<shard>/lines) are still uploaded below.
       - name: Mirror the shard
@@ -166,6 +186,23 @@ jobs:
         with:
           name: stage-${{ inputs.target }}
           path: ${{ runner.temp }}/stage
+      - name: Install the fetcher clients
+        if: ${{ startsWith(inputs.target, 'powerpc') }}
+        run: |
+          # verify reads an upstream .sig only for a file pacman refuses, a rare
+          # path, but that read is of the powerpc host, so it needs the fetcher
+          # too. curl-impersonate reads it cheaply; chromium is the fallback.
+          # Both are installed; at least one must land, or this job fails.
+          imp=0; chr=0
+          fetchers/install.sh curl-impersonate || imp=$?
+          PLAYWRIGHT_WITH_DEPS=1 fetchers/install.sh chromium || chr=$?
+          [ "$imp" -eq 0 ] || echo "::notice::curl-impersonate did not install (status $imp)"
+          [ "$chr" -eq 0 ] || echo "::notice::chromium did not install (status $chr)"
+          if [ "$imp" -ne 0 ] && [ "$chr" -ne 0 ]; then
+            echo "::error::no browser-profile client installed for the powerpc read (curl-impersonate $imp, chromium $chr)"
+            exit 1
+          fi
+          echo "MIRROR_FETCHER=$GITHUB_WORKSPACE/fetchers/fetcher.sh" >> "$GITHUB_ENV"
       # Budgets nest: verify-batch's own VERIFY_BUDGET (4800 s, the pulls and
       # the container together) ends inside this step's 85 minutes, which end
       # inside the job's 95, so the verdict is always uploaded.

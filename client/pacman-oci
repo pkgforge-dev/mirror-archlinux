@@ -908,7 +908,7 @@ find_exe() {
 #
 # A public GHCR repository accepts the dummy token Bearer QQ==, which saves a
 # token request on every file. When the registry refuses it (401 or 403), the
-# Bearer challenge names a realm, and the realm gives an anonymous pull token
+# WWW-Authenticate header names a realm, and the realm gives an anonymous pull token
 # for one repository. That token is kept in the run store as
 # ,token.HOST.SHA256-OF-REPOSITORY, mode 0600, and goes with the store. Every
 # later request of the run for that repository sends it first: the prefetch,
@@ -960,7 +960,7 @@ say_refused() {
 }
 
 # token_from HDR REPO PROTO SCHEME: the anonymous pull token of REPO into
-# $_token, from the Bearer challenge in the headers file HDR. The scope is
+# $_token, from the WWW-Authenticate header in the headers file HDR. The scope is
 # always REPO's pull scope. An http realm is accepted only for an http
 # registry. The token must be a plain token: it goes into a curl config.
 token_from() {
@@ -1017,7 +1017,7 @@ auth_for() {
 
 # anon_token BASE URL HDR CODE: make sure the run keeps a token for BASE's
 # repository, after URL was refused with CODE. HDR holds the headers of that
-# answer, or is empty. With no challenge there, one request with no
+# answer, or is empty. With no such header there, one request with no
 # authorization to URL reads it. Each repository is tried once per call.
 anon_token() {
   case " ${_anon_ok:-} " in
@@ -1042,7 +1042,7 @@ anon_token() {
     curl -q --silent --show-error --proto "$_p" --max-filesize 65536 \
       --connect-timeout 10 --max-time 15 --user-agent "pacman-oci/$PACMAN_OCI_VERSION" \
       --dump-header "$_at_hdr" --output "$work/anon.body" --url "$2" || _arc=$?
-    debug "token: GET $2 with no authorization, for the challenge (curl $_arc, after HTTP $4)"
+    debug "token: GET $2 with no authorization, for the WWW-Authenticate header (curl $_arc, after HTTP $4)"
   fi
   if ! token_from "$_at_hdr" "$_at_repo" "$_p" "${1%%://*}"; then
     debug "no anonymous token for $_at_host/$_at_repo"
@@ -2045,8 +2045,8 @@ fi
 #
 # A public GHCR repository answers a dummy bearer token, which saves the token
 # round trip on every file. A registry that refuses it answers 401, or 403 with
-# no challenge (GHCR, measured), so the same request is then made with no
-# Authorization at all to read the Bearer challenge, and the anonymous token it
+# no WWW-Authenticate header (GHCR, measured), so the same request is then made
+# with no Authorization at all to read the WWW-Authenticate header, and the anonymous token it
 # names is fetched once. Manifest and token requests follow no redirect: GHCR
 # answers a reference it cannot parse with 303 to an HTML page.
 #---------------------------------------------------------------------------#
@@ -2080,9 +2080,9 @@ get() {
   debug "GET $1 -> $code (curl $get_rc)"
 }
 
-# The anonymous pull token named by the Bearer challenge in $work_hdr, for
-# this repository's pull scope. It is kept for the rest of the run.
-challenge() {
+# The anonymous pull token named by the WWW-Authenticate header in $work_hdr,
+# for this repository's pull scope. It is kept for the rest of the run.
+bearer_token() {
   token_from "$work_hdr" "$repo" "$PROTO" "$scheme" || return 1
   AUTH="Bearer $_token"
   token_keep "$host" "$repo" "$_token"
@@ -2096,14 +2096,14 @@ fetch_manifest() {
   get "$base/manifests/$1" "$work_json"
   case $code in
     401 | 403)
-      if [ "${tried_challenge:-0}" = 0 ]; then
-        tried_challenge=1
+      if [ "${tried_bearer:-0}" = 0 ]; then
+        tried_bearer=1
         say_refused "$host"
         if [ "$code" = 403 ]; then
           AUTH=''
           get "$base/manifests/$1" "$work_json"
         fi
-        if challenge; then
+        if bearer_token; then
           get "$base/manifests/$1" "$work_json"
         fi
       fi

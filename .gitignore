@@ -1,0 +1,12 @@
+# Python bytecode. The static suite compiles the python with -X
+# pycache_prefix into its own work directory, so a __pycache__ here means
+# someone ran py_compile by hand, and it is never a file to ship.
+__pycache__/
+*.pyc
+
+# A tool install under fetchers/, not the tree. fetchers/curl-impersonate
+# resolves its profiles from a directory, and fetchers/chromium and
+# fetchers/cloak-browser resolve their packages from this directory's
+# node_modules. None of it is source.
+fetchers/node_modules/
+fetchers/curl-impersonate/curl-impersonate/

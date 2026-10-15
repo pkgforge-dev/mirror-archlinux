@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#
+# Can this host run the playwright client here? The invisible_playwright
+# package and its patched Firefox build are both needed.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+py="$HERE/venv/bin/python"
+[ -x "$py" ] || exit 1
+# The status of the import is the answer, so the output is not printed and
+# nothing is thrown away: a traceback here means the client cannot run, and the
+# caller is told so by the exit status.
+probe_log="$(mktemp)"
+"$py" -c 'import invisible_playwright' > "$probe_log" 2>&1
+probe_rc=$?
+rm -f "$probe_log"
+exit "$probe_rc"

@@ -182,17 +182,27 @@ pkg "$work/up/x86_64-extra" delta 1-1 x86_64 400 "$B" rebuilt
 pkg "$work/mirror/x86_64-extra" delta 1-1 x86_64 400 "$B"
 pkg "$work/up/x86_64-extra" epsilon 1-1 x86_64 500 "$((B + 3600))"
 pkg "$work/mirror/x86_64-extra" epsilon 0.9-1 x86_64 500 "$B"
-# aarch64-core and loong64-core: upstream only
-for t in aarch64-core loong64-core; do
+# aarch64-core, loong64-core, sparc64-core and ppc64-core: upstream only
+for t in aarch64-core loong64-core sparc64-core ppc64-core; do
   pkg "$work/up/$t" linux 6.17-1 "${t%%-*}" 1000 "$B"
   pkg "$work/up/$t" glibc 2.42-1 "${t%%-*}" 2000 "$B"
 done
+# powerpc64le-base and powerpc64le-base-any: the PowerPC targets. base-any is
+# at base/any and not at $repo/$arch, so its database is laid out that way here
+# too: two targets of one architecture, one of them a repository with a dash in
+# its name, which is the shape ARCH_ORDER and REPO_ORDER must carry.
+pkg "$work/up/powerpc64le-base" zlib 1.3.2-1 powerpc64le 300 "$B"
+pkg "$work/up/powerpc64le-base" gcc 15.2.1-1 powerpc64le 400 "$B"
+pkg "$work/up/powerpc64le-base-any" archpower-keyring 20260408-1 any 30 "$B"
 
-for t in x86_64-core x86_64-extra aarch64-core loong64-core; do
+for t in x86_64-core x86_64-extra aarch64-core loong64-core powerpc64le-base sparc64-core ppc64-core; do
   a="${t%%-*}" r="${t#*-}"
   mkdir -p "$net/up.test/$a/$r"
   mkdb "$work/up/$t" "$net/up.test/$a/$r/$r.db"
 done
+# The any database is shared by the three arches and sits at base/any.
+mkdir -p "$net/up.test/base/any"
+mkdb "$work/up/powerpc64le-base-any" "$net/up.test/base/any/base-any.db"
 mkdb "$work/mirror/x86_64-extra" "$work/extra-mirror.db"
 
 #---------------------------------------------------------------------------#
@@ -238,6 +248,17 @@ printf '500\n' > "$net/bad.test/x86_64/multilib/multilib.db.code"
   target aarch64 core 'db_server = https://up.test/$arch/$repo'
   target loong64 core 'db_server = https://down.test/$arch/$repo' 'db_server = https://up.test/$arch/$repo'
   target riscv64 core 'db_server = https://up.test/$arch/$repo' 'enabled = no'
+  # The any database is at base/any, not at $repo/$arch.
+  # shellcheck disable=SC2016 # the target file's own placeholders
+  target powerpc64le base 'db_server = https://up.test/$arch/$repo'
+  target powerpc64le base-any 'db_server = https://up.test/base/any'
+  # sparc64-core and ppc64-core: two architectures that are not in ARCH_ORDER,
+  # so arch_slots has to give each a slot of its own. With the palette full
+  # there is no colour left, so each takes a grey step, and the two steps must
+  # differ: two series of the same colour is an unreadable chart. Two of them
+  # are needed, because with one the distinctness check cannot fail.
+  target sparc64 core 'db_server = https://up.test/$arch/$repo'
+  target ppc64 core 'db_server = https://up.test/$arch/$repo'
 }
 
 NOW="$(jq -n '"2026-10-14T03:00:00Z" | fromdateiso8601')"
@@ -267,7 +288,7 @@ q() {
 
 check "status.json is schema 1" 1 "$(q .schema)" "jq .schema OUT/status.json"
 check "every enabled target, sorted; a disabled one is left out" \
-  "aarch64-core loong64-core x86_64-core x86_64-extra x86_64-multilib" \
+  "aarch64-core loong64-core powerpc64le-base powerpc64le-base-any ppc64-core sparc64-core x86_64-core x86_64-extra x86_64-multilib" \
   "$(q '[.targets[].target] | join(" ")')" "jq '.targets[].target' OUT/status.json"
 check "the sync interval is read from sync.yml's cron" \
   "$("$REPO_ROOT/scripts/cron-tolerance" --minutes "$REPO_ROOT/.github/workflows/sync.yml")" \
@@ -327,9 +348,9 @@ T='.targets[] | select(.target == "x86_64-multilib")'
 check "x86_64-multilib: no db_server answers: upstream not read, coverage unknown" "false HTTP 500 null" \
   "$(q "$T | \"\(.upstream.ok) \(.upstream.tried[0].result) \(.coverage)\"")" "jq '$T' OUT/status.json"
 
-check "summary: 5 targets, 2 promoted, 1 current, 7 of 13 files" "5 2 1 7 13" \
+check "summary: 9 targets, 2 promoted, 1 current, 7 of 20 files" "9 2 1 7 20" \
   "$(q '.summary | "\(.targets) \(.promoted) \(.current) \(.mirrored_files) \(.upstream_files)"')" "jq .summary OUT/status.json"
-check "summary: the sums count 4 measured targets; x86_64-multilib is not read upstream" "4 0" \
+check "summary: the sums count 8 measured targets; x86_64-multilib is not read upstream" "8 0" \
   "$(q '.summary | "\(.measured) \(.mirror_unread)"')" "jq .summary OUT/status.json"
 check "mirror.created is latest's org.opencontainers.image.created, the fraction cut; null when latest names none" \
   "2026-10-14T00:30:00Z null" \
@@ -448,7 +469,9 @@ redirect x86_64/core/core.db 302 "$(blob_url "$net/up.test/x86_64/core/core.db")
 redirect x86_64/extra/extra.db 302 "$(blob_url "$work/extra-mirror.db")"
 
 # The median answer time of the Worker leaves the download out: it moves a
-# whole file. The 7 probes take 0.1 to 0.7 s, the download 9 s.
+# whole file. Seven probes take 0.1 to 0.7 s and the other targets' probes the
+# default 0.012 s; the two downloads take 9 s. The median stays well under 1 s,
+# so the downloads are left out.
 i=0
 for p in x86_64/core/core.db x86_64/core/acl-2.3.2-1-x86_64.pkg.tar.zst x86_64/extra/extra.db \
   x86_64/extra/alpha-1-1-x86_64.pkg.tar.zst aarch64/core/core.db loong64/core/core.db x86_64/multilib/multilib.db; do
@@ -463,7 +486,7 @@ out="$work/run-median"
 mkdir -p "$out"
 rc=0
 collect "$out" || rc=$?
-check "worker: the median answer time is of the 7 probes, 0.4 s; the 9 s download is left out" "0 8 0.4 400" \
+check "worker: the median answer time leaves the 9 s download out" "0 12 0.2 200" \
   "$rc $(q '"\(.worker.probes) \(.worker.median_seconds)"') $(jq -r '.w.ms' "$out/history.jsonl")" \
   "$RP; jq '.worker, [.targets[].worker[] | select(. != null) | .seconds]' OUT/status.json"
 find "$net/worker.test" "$blobs" -name '*.time' -exec rm -f {} +
@@ -507,7 +530,7 @@ rm "$net/ghcr.io/v2/test/mirror/x86_64/extra/manifests/latest.code"
 check "a registry that answers 503 for one target: the collect measures and exits 0" 0 "$rc" "$RP"
 check "x86_64-extra: latest answers 503: mirror state error, coverage unknown" "error null" \
   "$(q '.targets[] | select(.target == "x86_64-extra") | "\(.mirror.state) \(.coverage)"')" "jq .targets OUT/status.json"
-check "summary: 1 promoted, 3 measured, 1 not read from the registry, 4 of 8 files" "1 3 1 4 8" \
+check "summary: 1 promoted, 7 measured, 1 not read from the registry, 4 of 15 files" "1 7 1 4 15" \
   "$(q '.summary | "\(.promoted) \(.measured) \(.mirror_unread) \(.mirrored_files) \(.upstream_files)"')" "jq .summary OUT/status.json"
 check "history: x86_64-extra keeps its last measured files, marked carried" "5 3 1500 600 1" \
   "$(jq -rs '.[-1].x["x86_64-extra"] | "\(.n) \(.m) \(.b) \(.mb) \(.k)"' "$out/history.jsonl")" "tail -n 1 OUT/history.jsonl | jq ."
@@ -526,7 +549,7 @@ rc=0
 collect "$out" "$((NOW + 3600))" || rc=$?
 mv "$net/ghcr.io.off" "$net/ghcr.io"
 check "a registry that does not resolve: the collect measures and exits 0" 0 "$rc" "$RP"
-check "summary: no registry read: 0 promoted, 5 not read, 0 measured, every sum unknown" "0 5 0 null null null null null" \
+check "summary: no registry read: 0 promoted, 9 not read, 0 measured, every sum unknown" "0 9 0 null null null null null" \
   "$(q '.summary | "\(.promoted) \(.mirror_unread) \(.measured) \(.mirrored_files) \(.upstream_files) \(.mirrored_bytes) \(.upstream_bytes) \(.coverage_files)"')" \
   "jq .summary OUT/status.json"
 check "summary: no registry read: last_synced is unknown" null "$(q .summary.last_synced)" "jq .summary OUT/status.json"
@@ -859,6 +882,32 @@ say(not bad and svgs == spec["svgs"],
     "all %d SVG files parse as XML, each with a title and its own dark style" % spec["svgs"],
     "found %d; %s" % (svgs, "; ".join(bad)))
 
+# Every chart class that encodes a palette slot must name a rule chart_style
+# defines: a line or legend stroke is l0..l8, lxN or ref; a filled slot (a bar
+# or a line-chart end dot) is s0..s8 or sxN. A class such as ls1 (l + a fill
+# class) or a raw negative slot s-1 or l-1 names no rule, so the mark loses its
+# colour.
+cls_bad = []
+for dirpath, _, names in os.walk(os.path.join(site, "charts")):
+    for f in sorted(names):
+        p = os.path.join(dirpath, f)
+        try:
+            root = ET.parse(p).getroot()
+        except ET.ParseError:
+            continue
+        for e in root.iter():
+            cls = (e.get("class") or "").split()
+            if "line" in cls:
+                for c in cls:
+                    if c not in ("line", "ref") and not re.fullmatch(r"l(?:x[0-9]+|[0-9]+)", c):
+                        cls_bad.append("%s: %r" % (os.path.relpath(p, site), e.get("class")))
+            for c in cls:
+                if re.match(r"^[sl]-[0-9]", c):
+                    cls_bad.append("%s: %r" % (os.path.relpath(p, site), e.get("class")))
+say(not cls_bad,
+    "every chart mark names a defined slot class (no ls1, s-1 or l-1)",
+    "; ".join(sorted(set(cls_bad))))
+
 for name, words in sorted(spec["badges"].items()):
     p = os.path.join(site, "badges", name + ".svg")
     try:
@@ -1095,6 +1144,41 @@ for a in arches:
         bad.append("%s: text %r" % (a, t))
 say(not bad, "a size badge for each architecture (%s) parses as XML" % " ".join(arches), "; ".join(bad))
 
+# The legend of charts/coverage.svg gives each architecture a swatch class. A
+# named architecture has a colour of the palette; one that is not in
+# ARCH_ORDER gets the grey of slot 0, and no named architecture may share it.
+# Two architectures sharing a swatch would make the chart unreadable, and a
+# named architecture silently turned grey would lose its identity on a page
+# whose every other architecture has a colour.
+legend = {}
+for name in ("coverage", "size"):
+    t = open(os.path.join(site, "charts", name + ".svg"), encoding="utf-8").read()
+    # s1..s8 are the palette, s0 is the plain grey, and sx0, sx1 are the grey
+    # steps an architecture outside ARCH_ORDER gets when the palette is full.
+    for m in re.finditer(r'<rect[^>]*class="(s\d+|sx\d+)"[^>]*/>\s*<text[^>]*class="lg">([a-z0-9_]+)</text>', t):
+        legend.setdefault(name, {})[m.group(2)] = m.group(1)
+other = spec.get("other_arch")
+shared = sorted(k for k, v in legend.get("coverage", {}).items() if v == "s0" and k != other)
+# Two architectures outside ARCH_ORDER must not be the same swatch either: the
+# palette is full, so neither has a colour of the eight, and one grey shared
+# between them would make two series the same colour on every chart.
+outside = sorted(k for k, v in legend.get("coverage", {}).items() if v.startswith("sx") or v == "s0")
+outside_classes = [legend["coverage"][k] for k in outside]
+named = [a for a in arches if a != other]
+say(other in legend.get("coverage", {}),
+    "the architecture outside ARCH_ORDER is on the page, with a swatch of its own",
+    "legend of coverage: %s" % legend.get("coverage"))
+say(legend.get("coverage", {}).get(other) not in (None, "", "s0"),
+    "an architecture outside ARCH_ORDER is given a grey step of its own, not the plain grey",
+    "%s is %s" % (other, legend.get("coverage", {}).get(other)))
+say(len(set(outside_classes)) == len(outside_classes),
+    "two architectures outside ARCH_ORDER get two different swatches",
+    "%s: %s" % (" ".join(outside), " ".join(outside_classes)))
+say(len(set(legend.get("coverage", {}).get(a) for a in named)) == len(named),
+    "every named architecture has a swatch of its own, and none of them is the grey",
+    "named swatches: %s" % " ".join("%s=%s" % (a, legend.get("coverage", {}).get(a)) for a in named))
+say(not shared, "no named architecture shares the grey swatch", "shared: %s" % " ".join(shared))
+
 with open(os.path.join(site, "history.json"), encoding="utf-8") as f:
     h = json.load(f)
 say(isinstance(h, list) and len(h) == spec["history"], "history.json holds %d point(s)" % spec["history"],
@@ -1136,7 +1220,8 @@ spec() {
   jq -nc --argjson charts "$CHARTS" --argjson cases "$1" --argjson history "$2" --argjson speed "$3" \
     --argjson over "$over" '{
     charts: $charts, bench_cases: $cases, history: $history,
-    svgs: (($charts | length) * 2 + 15),
+    other_arch: "sparc64",
+    svgs: (($charts | length) * 2 + 25),
     files: (["index.html", "status.json", "history.json", "bench.json"]
             + ($charts | map("charts/\(.).svg")) + ($charts | map("charts/narrow/\(.).svg"))),
     badges: {
@@ -1145,33 +1230,43 @@ spec() {
       "x86_64-multilib": ["x86_64-multilib", "not mirrored"],
       "aarch64-core": ["aarch64-core", "not mirrored"],
       "loong64-core": ["loong64-core", "not mirrored"],
+      "powerpc64le-base": ["powerpc64le-base", "not mirrored"],
+      "powerpc64le-base-any": ["powerpc64le-base-any", "not mirrored"],
+      "sparc64-core": ["sparc64-core", "not mirrored"],
+      "ppc64-core": ["ppc64-core", "not mirrored"],
       "x86_64": ["x86_64", "77.7%", "3.0 h", "2 of 3 measured"],
       "aarch64": ["aarch64", "not mirrored"],
       "loong64": ["loong64", "not mirrored"],
-      "all": ["mirror", "53.8%", "2/5 repos", "4 of 5 measured"],
+      "powerpc64le": ["powerpc64le", "not mirrored"],
+      "sparc64": ["sparc64", "not mirrored"],
+      "ppc64": ["ppc64", "not mirrored"],
+      "all": ["mirror", "35%", "2/9 repos", "8 of 9 measured"],
       "synced": ["synced", "2 h ago"],
       "size": ["size", "2.4 KiB"],
       "size-x86_64": ["x86_64 size", "2.4 KiB"],
       "size-aarch64": ["aarch64 size", "not mirrored"],
       "size-loong64": ["loong64 size", "not mirrored"],
+      "size-powerpc64le": ["powerpc64le size", "not mirrored"],
+      "size-sparc64": ["sparc64 size", "not mirrored"],
+      "size-ppc64": ["ppc64 size", "not mirrored"],
       "speed": $speed},
     badges_without: {"x86_64-core": ["measured"], "speed": ["ago", "date unknown"], "size": ["measured"]},
     chart_text: {
-      coverage: ["Coverage by repository", "53.8%", "in 4 of 5 repositories", "x86_64", "aarch64", "loong64", "core", "extra", "multilib", "upstream only"],
+      coverage: ["Coverage by repository", "35%", "in 8 of 9 repositories", "x86_64", "aarch64", "loong64", "powerpc64le", "sparc64", "ppc64", "core", "extra", "multilib", "base", "base-any", "upstream only"],
       freshness: ["Snapshot age", "3.0 h", "sync every 3 h", "not mirrored yet", "matches upstream"],
-      size: ["Size by repository", "GiB", "in 4 of 5 repositories", "x86_64 · 1.6 KiB of 2.4 KiB, 2 of 3 measured",
-             "aarch64 · 0 B of 2.9 KiB", "loong64 · 0 B of 2.9 KiB"],
+      size: ["Size by repository", "GiB", "in 8 of 9 repositories", "x86_64 · 1.6 KiB of 2.4 KiB, 2 of 3 measured",
+             "aarch64 · 0 B of 2.9 KiB", "loong64 · 0 B of 2.9 KiB", "powerpc64le · 0 B of 730 B", "sparc64 · 0 B of 2.9 KiB", "ppc64 · 0 B of 2.9 KiB"],
       "history-coverage": ["Coverage, last 30 days", "x86_64", "aarch64", "Time, UTC"],
       "history-age": ["Snapshot age, last 30 days", "sync every 3 h", "log scale"]},
     page_text: ([
-      "over the 4 of 5 repositories measured in this run. 1 could not be read.",
-      "of 13 upstream, in 4 of 5 repositories",
+      "over the 8 of 9 repositories measured in this run. 1 could not be read.",
+      "of 20 upstream, in 8 of 9 repositories",
       "Failed probes in 2 runs in a row, over 50 minutes or more, open the worker-down issue.",
       "Measured 2026-10-14 03:00 UTC", "The mirror last changed at 2026-10-14 00:30 UTC",
       "so the synced badge says 2 h ago.",
       "x86_64-core ok 100% 4 4 0 0.00 3.0 h 2 h ago 0 min 2026-10-14 00:00 UTC",
       "epsilon-1-1-x86_64.pkg.tar.zst 0.00 3.0 h 3 h ago 1.0 h 2026-10-14 00:00 UTC",
-      "A sum counts only the repositories read on that side: upstream in 4 of 5.",
+      "A sum counts only the repositories read on that side: upstream in 8 of 9.",
       "https://up.test/loong64/core 1 db_server(s) not taken https://down.test/loong64/core : curl 6",
       "pkg-containers.githubusercontent.com hit ok"]
       + ($over.page_text_more // []))}
@@ -1218,20 +1313,20 @@ render "$in5" "$work/site5" "$(spec 0 2 '["pacman speed", "no data"]' '{
     "x86_64-core": ["x86_64-core", "100%", "4.0 h"],
     "x86_64-extra": ["x86_64-extra", "unknown"],
     "x86_64": ["x86_64", "100%", "4.0 h", "1 of 3 measured"],
-    "all": ["mirror", "50%", "1/5 repos", "3 of 5 measured"],
+    "all": ["mirror", "26.6%", "1/9 repos", "7 of 9 measured"],
     "synced": ["synced", "3 h ago"],
-    "size": ["size", "1000 B", "4 of 5 measured"],
+    "size": ["size", "1000 B", "8 of 9 measured"],
     "size-x86_64": ["x86_64 size", "1000 B", "2 of 3 measured"]},
   "badges_without": {"size": []},
   "chart_text": {
-    "coverage": ["Coverage by repository", "50%", "in 3 of 5 repositories", "registry not read"],
+    "coverage": ["Coverage by repository", "26.6%", "in 7 of 9 repositories", "registry not read"],
     "freshness": ["Snapshot age", "4.0 h", "sync every 3 h", "not mirrored yet", "matches upstream"],
-    "size": ["Size by repository", "in 3 of 5 repositories", "x86_64 · 1000 B of 1000 B, 1 of 3 measured"]},
+    "size": ["Size by repository", "in 7 of 9 repositories", "x86_64 · 1000 B of 1000 B, 1 of 3 measured"]},
   "page_text": [
-    "over the 3 of 5 repositories measured in this run. 2 could not be read.",
-    "1 of 4 read", "1 not read from the registry; 1 match upstream now",
+    "over the 7 of 9 repositories measured in this run. 2 could not be read.",
+    "1 of 8 read", "1 not read from the registry; 1 match upstream now",
     "x86_64 2026-10-14 03:00 UTC 77.7% 77.7%",
-    "A sum counts only the repositories read on that side: the mirror in 4 of 5 and upstream in 4 of 5."]}')"
+    "A sum counts only the repositories read on that side: the mirror in 8 of 9 and upstream in 8 of 9."]}')"
 
 # No registry read at all (run6): every group is unknown, never "not
 # mirrored", and no sum reads as 0.
@@ -1242,11 +1337,18 @@ render "$in6" "$work/site6" "$(spec 0 2 '["pacman speed", "no data"]' '{
   "badges": {
     "x86_64-core": ["x86_64-core", "unknown"], "x86_64-extra": ["x86_64-extra", "unknown"],
     "x86_64-multilib": ["x86_64-multilib", "unknown"], "aarch64-core": ["aarch64-core", "unknown"],
-    "loong64-core": ["loong64-core", "unknown"],
+    "loong64-core": ["loong64-core", "unknown"], "sparc64-core": ["sparc64-core", "unknown"],
+    "ppc64-core": ["ppc64-core", "unknown"],
     "x86_64": ["x86_64", "unknown"], "aarch64": ["aarch64", "unknown"], "loong64": ["loong64", "unknown"],
+    "powerpc64le-base": ["powerpc64le-base", "unknown"],
+    "powerpc64le-base-any": ["powerpc64le-base-any", "unknown"],
+    "powerpc64le": ["powerpc64le", "unknown"], "sparc64": ["sparc64", "unknown"], "ppc64": ["ppc64", "unknown"],
     "all": ["mirror", "unknown"], "synced": ["synced", "unknown"], "size": ["size", "unknown"],
     "size-x86_64": ["x86_64 size", "unknown"], "size-aarch64": ["aarch64 size", "unknown"],
-    "size-loong64": ["loong64 size", "unknown"]},
+    "size-loong64": ["loong64 size", "unknown"],
+    "size-powerpc64le": ["powerpc64le size", "unknown"],
+    "size-sparc64": ["sparc64 size", "unknown"],
+    "size-ppc64": ["ppc64 size", "unknown"]},
   "badges_without": {"x86_64": ["not mirrored"], "all": ["not mirrored"], "size": ["not mirrored"],
                      "size-x86_64": ["not mirrored"]},
   "chart_text": {
@@ -1255,7 +1357,7 @@ render "$in6" "$work/site6" "$(spec 0 2 '["pacman speed", "no data"]' '{
     "size": ["Size by repository", "unknown"]},
   "page_text": [
     "Coverage is not known: no repository could be read on both sides in this run.",
-    "the registry did not answer for any of the 5", "Files in the mirror unknown",
+    "the registry did not answer for any of the 9", "Files in the mirror unknown",
     "Size in the mirror unknown"]}')"
 
 # A bench from 2026-08-01, 73 days before the measurement: the badge and the

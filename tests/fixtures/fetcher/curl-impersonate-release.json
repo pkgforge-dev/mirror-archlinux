@@ -1,0 +1,13 @@
+{
+  "tag_name": "v-test",
+  "assets": [
+    {"name": "curl-impersonate-v-test.x86_64-linux-musl.tar.gz", "browser_download_url": "https://example.test/curl-x86_64-linux-musl.tar.gz"},
+    {"name": "libcurl-impersonate-v-test.x86_64-linux-gnu.tar.gz", "browser_download_url": "https://example.test/libcurl-x86_64-linux-gnu.tar.gz"},
+    {"name": "curl-impersonate-v-test.x86_64-linux-android.tar.gz", "browser_download_url": "https://example.test/curl-x86_64-linux-android.tar.gz"},
+    {"name": "curl-impersonate-v-test.x86_64-linux-gnu.tar.gz", "browser_download_url": "https://example.test/curl-x86_64-linux-gnu.tar.gz"},
+    {"name": "curl-impersonate-v-test.aarch64-linux-gnu.tar.gz", "browser_download_url": "https://example.test/curl-aarch64-linux-gnu.tar.gz"},
+    {"name": "curl-impersonate-v-test.x86_64-macos.tar.gz", "browser_download_url": "https://example.test/curl-x86_64-macos.tar.gz"},
+    {"name": "curl-impersonate-v-test.aarch64-linux-musl.tar.gz", "browser_download_url": "https://example.test/curl-aarch64-linux-musl.tar.gz"},
+    {"name": "libcurl-impersonate-v-test.aarch64-linux-gnu.tar.gz", "browser_download_url": "https://example.test/libcurl-aarch64-linux-gnu.tar.gz"}
+  ]
+}

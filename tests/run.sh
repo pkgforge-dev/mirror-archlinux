@@ -122,10 +122,27 @@ for s in $suites; do
     total_files=$((total_files + 1))
     printf '\n# ===== %s/%s =====\n' "$s" "$n"
     start="$SECONDS"
-    if ! bash "$t"; then
+    # The output is kept, because a file that asserts nothing prints no plan
+    # and a file that exits 0 on an early path prints a plan it never got to.
+    # Both exit 0, and both are silent, so the status alone is not a verdict.
+    # The capture goes under TMPDIR, never under tests/, so a static test that
+    # scans the tree with find does not see or race on it.
+    out_file="$(mktemp "${TMPDIR:-/tmp}/mirror-run.out.XXXXXX")"
+    rc=0
+    bash "$t" > "$out_file" 2>&1 || rc=$?
+    cat "$out_file"
+    if [ "$rc" -ne 0 ]; then
+      failed_files=$((failed_files + 1))
+      failed_names+=("$s/$n")
+    elif ! grep -qE '^1\.\.[0-9]+' "$out_file"; then
+      # No plan line: the file ran to the end and asserted nothing, or it
+      # never reached summary. tests/lib/harness.sh fails a file that reaches
+      # summary with no assertions, so this is the other way out.
+      printf '# %s/%s: no TAP plan line, so it asserted nothing\n' "$s" "$n"
       failed_files=$((failed_files + 1))
       failed_names+=("$s/$n")
     fi
+    rm -f "$out_file"
     printf '# ----- %s/%s took %d s\n' "$s" "$n" "$((SECONDS - start))"
   done
 done

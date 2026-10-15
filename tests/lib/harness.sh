@@ -196,12 +196,17 @@ script_has_shebang() {
   [ "$(LC_ALL=C head -c 2 "$1")" = '#!' ]
 }
 
-# Every file the repository ships under client/ and scripts/, by path
-# relative to REPO_ROOT. A __pycache__ directory is never shipped.
+# Every file the repository ships under client/, fetchers/ and scripts/, by path
+# relative to REPO_ROOT. A __pycache__ directory is never shipped, and a
+# node_modules under fetchers/ belongs to a tool install, not to the tree.
+#
+# fetchers/ is here so the shell and python rules reach it. A directory the
+# static tests do not read is a directory nothing checks.
 shipped_files() {
   (
     cd "$REPO_ROOT" || exit 2
-    find client scripts -type f ! -path '*/__pycache__/*' | LC_ALL=C sort
+    find client fetchers scripts -type f ! -path '*/__pycache__/*' \
+      ! -path '*/node_modules/*' | LC_ALL=C sort
   )
 }
 
@@ -230,9 +235,32 @@ shipped_python() {
   shipped_files | _files_of_kind python
 }
 
+# shipped_scripts_and_modules: the shipped files a static test must read, being
+# the shell scripts and the python.
+#
+# shipped_other is for a file that looks like a program and that no static test
+# reads, so it fails 70-python. A README or a .mjs module is not that: it is
+# prose or a program in a language this repository does not ship, and a test
+# that failed on it would be refusing a document. So a file with no interpreter
+# line and no .sh or .py suffix is data, and it is listed here instead.
+shipped_scripts_and_modules() {
+  shipped_files | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    k="$(script_kind "$REPO_ROOT/$f")"
+    case "$k" in
+      sh | bash | python) printf '%s\n' "$f" ;;
+      other)
+        case "$f" in
+          *.sh | *.py) printf '%s\n' "$f" ;;
+        esac
+        ;;
+    esac
+  done
+}
+
 # Shipped files that are neither, which no static test reads.
 shipped_other() {
-  shipped_files | _files_of_kind other
+  shipped_scripts_and_modules | _files_of_kind other
 }
 
 # Every file under tests/, by path relative to REPO_ROOT.

@@ -224,7 +224,7 @@ A signature request never writes `,down.<host>`. pacman ignores a failed optiona
 
 ### An absent database signature
 
-⚠ pacman sleeps 2 s after every download that fails, also for an optional signature. No upstream of this mirror publishes a database signature, so each repository costs 2 s on every `-Sy`.
+⚠ pacman sleeps 2 s after every download that fails, also for an optional signature. Only the six ArchPOWER targets of this mirror publish a database signature; for the other fifteen each repository costs 2 s on every `-Sy`.
 
 Under the sandbox, OUTPUT is in a `download-XXXXXX` directory. pacman 7.0 and 7.1 unlink a zero-byte file there, and then read the signature as missing (libalpm `dload.c` `finalize_download_file`). So when the manifest has no signature layer, the wrapper writes an empty OUTPUT and exits 0. There is then no pause.
 

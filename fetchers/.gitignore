@@ -1,0 +1,5 @@
+# Installed clients (fetchers/<name>/install.sh): never committed.
+*/node_modules/
+*/venv/
+*/dist/
+*/package-lock.json

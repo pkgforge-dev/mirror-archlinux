@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#
+# Can this host run the chromium client here? The full Chrome-for-Testing
+# build of the playwright package, and node, are both needed.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+command -v node > /dev/null || exit 1
+[ -d "$HERE/node_modules/playwright" ] || exit 1
+exec node "$HERE/probe.mjs"
