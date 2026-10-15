@@ -42,10 +42,23 @@ Environment: `FETCHER_CLIENTS` (the order), `FETCHER_CACHE` (the cache root,
 `FETCHER_SUMMARY` (a TSV log of every attempt), `FETCHER_QUIET` (`1` for
 quiet).
 
-The order is `curl curl-impersonate chromium cloak-browser playwright`. curl is
-first, so a host that answers curl costs one curl call. The client that read a
-host last is kept in `FETCHER_CACHE/hosts/<host>` and is tried first the next
-time, so a host that needs a browser pays for the browser once.
+The order is `curl-impersonate curl-impersonate-rv chromium chromium-rv`. Each of
+the two browser-profile engines is tried twice: first against the origin, then as
+its `-rv` variant through the `api.rv.pkgforge.dev` read-through proxy, which
+dials the origin from its own network, so a runner the origin refuses still
+reads. `curl-impersonate` is a curl with a browser's TLS and HTTP/2 profile;
+`chromium` is a full browser for an origin that needs one. Plain curl is left
+out: an origin behind Cloudflare refuses the runner's own address and
+fingerprint, so a plain-curl call is a wasted round trip before the profile that
+answers. The client that read a host last is kept in `FETCHER_CACHE/hosts/<host>`
+and is tried first the next time, so a host that needs the proxy or the browser
+pays for finding it once.
+
+A `-rv` variant is not a separate program: it runs its engine (`curl-impersonate`
+or `chromium`) unchanged against the rewritten URL `<FETCHER_RV_BASE>/<origin
+url>`, so the engine's fingerprint, headers, deadlines and structural checks are
+the same as the direct call. `FETCHER_RV_BASE` defaults to
+`https://api.rv.pkgforge.dev`.
 
 `--signature` uses `gpgv` and not `gpg`. `gpgv` verifies and does not import,
 so a check here cannot change the trust store it verified against. The
@@ -87,13 +100,16 @@ A name that no build defines is refused before any request. The per-host
 preference is moved into place, so two callers that read the same host at once
 do not half-write it.
 
-The dispatch is one program per client, and no two clients share one:
+Each engine is one program; a `-rv` variant runs the same program against the
+proxied URL:
 
 | client | program |
 | --- | --- |
-| `curl` | `curl` |
+| `curl` | `curl` (a known client, but not in the default order) |
 | `curl-impersonate` | `curl-impersonate/fetch.sh` |
+| `curl-impersonate-rv` | `curl-impersonate/fetch.sh`, URL through the proxy |
 | `chromium` | `node chromium/fetch.mjs` |
+| `chromium-rv` | `node chromium/fetch.mjs`, URL through the proxy |
 | `cloak-browser` | `node cloak-browser/fetch.mjs` |
 | `playwright` | `playwright/venv/bin/python playwright/fetch.py` |
 
@@ -101,11 +117,13 @@ The dispatch is one program per client, and no two clients share one:
 
 | client | what it is | install |
 | --- | --- | --- |
-| `curl` | the system curl, used first | system |
-| `curl-impersonate` | [lexiforest/curl-impersonate](https://github.com/lexiforest/curl-impersonate), a maintained curl that sends one browser's TLS and HTTP/2 profile | `fetchers/curl-impersonate/install.sh` |
+| `curl-impersonate` | [lexiforest/curl-impersonate](https://github.com/lexiforest/curl-impersonate), a maintained curl that sends one browser's TLS and HTTP/2 profile; tried first | `fetchers/curl-impersonate/install.sh` |
+| `curl-impersonate-rv` | the same engine through the `api.rv.pkgforge.dev` read-through proxy, which dials the origin from its own network, so a runner the origin refuses still reads | (comes with `curl-impersonate`) |
 | `chromium` | the playwright package and its full Chrome-for-Testing build; the request is an in-page `fetch()`, so it uses Chromium's own network stack and cookies | `fetchers/chromium/install.sh` |
-| `cloak-browser` | [CloakHQ/CloakBrowser](https://github.com/CloakHQ/CloakBrowser), a Chromium build with its client profile set in the engine | `fetchers/cloak-browser/install.sh` |
-| `playwright` | [feder-cr/invisible_playwright](https://github.com/feder-cr/invisible_playwright) | `fetchers/playwright/install.sh` |
+| `chromium-rv` | the Chromium engine through the same read-through proxy | (comes with `chromium`) |
+| `cloak-browser` | [CloakHQ/CloakBrowser](https://github.com/CloakHQ/CloakBrowser), a Chromium build with its client profile set in the engine; known, but not in the default order | `fetchers/cloak-browser/install.sh` |
+| `playwright` | [feder-cr/invisible_playwright](https://github.com/feder-cr/invisible_playwright); known, but not in the default order | `fetchers/playwright/install.sh` |
+| `curl` | the system curl; a known client for `--client curl`, but left out of the default order | system |
 
 `fetchers/install.sh [--check] [CLIENT...]` runs the installers. With no
 argument it installs every client. `--check` installs nothing: it reports each
@@ -186,17 +204,17 @@ fetchers/drift.sh --env                          # the tool versions, for a log
 
 ## Measured
 
-- 2026-10-15, residential network: `curl` reads `base.db` of all three
-  ArchPOWER arches and of `base-any` with one call each, and passes the `db`
-  check. The four `.db.sig` files pass the `sig` check.
-- The unit tests (`tests/unit/80-fetchers.sh`) run the manager against a curl
-  stand-in and a faked curl-impersonate, node and venv-python, so client
-  selection, the fallback order, the structural, sha256 and size checks, the
-  deadline, the dispatch of each client to its own program, the availability
-  cache and the version resolver are covered without a network or a browser. A
-  browser client itself is not started by the tests.
-- `fetchers/self-check.sh --strict` ran against the live ArchPOWER signature
-  from a residential network on 2026-10-15: the manager and `curl` read it; the
-  other clients were not installed here. `fetchers/fetcher.sh` read `base.db`
-  of all three arches and of `base-any`, and all four `.db.sig`, with one call
-  each.
+- 2026-10-15, residential network: a direct request reads the files — `curl`
+  reads `base.db` of all three ArchPOWER arches and of `base-any` with one call
+  each and passes the `db` check, and the four `.db.sig` pass the `sig` check. So
+  the files are known good; what a GitHub runner meets is not a bad file but the
+  origin refusing the runner's own address, which the order answers with
+  `curl-impersonate` against the origin and then through the `api.rv.pkgforge.dev`
+  proxy.
+- The unit tests (`tests/unit/80-fetchers.sh`) run the manager against a faked
+  `curl-impersonate`, node and venv-python and a `curl` stand-in, so client
+  selection, the fallback from an engine to its `-rv` proxy variant, the
+  structural, sha256 and size checks, the deadline, the dispatch of each client
+  to its own program, the `-rv` URL rewrite, the availability cache and the
+  version resolver are covered without a network or a browser. A browser client
+  itself is not started by the tests.

@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-#
-# Can this host run the jina client? It needs curl. The reader's own reach is
-# tested at fetch time, not here.
-set -euo pipefail
-command -v curl > /dev/null

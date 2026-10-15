@@ -5,12 +5,15 @@
 #
 #   fetchers/fetcher.sh [OPTIONS] URL OUT
 #
-# The default order is curl, curl-impersonate, chromium, cloak-browser,
-# playwright (fetchers/lib.sh). curl is tried first, so a host that answers
-# curl costs one curl call. A host that answered another client before starts
-# at that client: the answer of each host is kept in the cache, and a client
-# that passed a structural check is the one the next call for that host tries
-# first.
+# The default order is curl-impersonate, curl-impersonate-rv, chromium,
+# chromium-rv (fetchers/lib.sh): each of the two browser-profile engines is
+# tried against the origin and then, as its "-rv" variant, through the
+# api.rv.pkgforge.dev read-through proxy, which dials the origin from its own
+# network. Plain curl is left out: an origin behind Cloudflare refuses the
+# runner's address, so a plain-curl call is a wasted round trip. A host that
+# answered a client before starts at that client: the answer of each host is
+# kept in the cache, and a client that passed a structural check is the one the
+# next call for that host tries first.
 #
 # A client that reads the body but fails the structural check is not an answer:
 # the next client is tried. A client that the server answers 404 or 410 for

@@ -25,10 +25,19 @@ set -euo pipefail
 url="$1"
 out="$2"
 printf '%s\n' "$url" >> "${FAKE_CI_CALLS:?}"
-if [ "${FAKE_CI_RC:-0}" -ne 0 ]; then
-  exit "${FAKE_CI_RC}"
+# The "-rv" variant hands this same program the URL rewritten through the proxy
+# base, so it reads as "https://<base>/https://<origin>" and holds two schemes.
+# A scenario tells the two apart to make the direct call fail and the proxied
+# one answer: FAKE_CI_RV_RC / FAKE_CI_RV_BODY drive the proxied call,
+# FAKE_CI_RC / FAKE_CI_BODY the direct one.
+case "$url" in
+  *://*://*) rc="${FAKE_CI_RV_RC:-0}"; body="${FAKE_CI_RV_BODY:-${FAKE_CI_BODY:?}}" ;;
+  *) rc="${FAKE_CI_RC:-0}"; body="${FAKE_CI_BODY:?}" ;;
+esac
+if [ "$rc" -ne 0 ]; then
+  exit "$rc"
 fi
-cp "${FAKE_CI_BODY:?}" "$out"
+cp "$body" "$out"
 exit 0
 EOF
 chmod 0755 "$work/fetchers/curl-impersonate/available" "$work/fetchers/curl-impersonate/fetch.sh"
@@ -78,9 +87,12 @@ rule() {
   printf '%s %s %s\n' "$1" "$2" "$3" >> "$work/fakecurl/rules"
 }
 
-# run CLIENT-ARGS... -> runs the fetchers copy, with its own cache and summary
+# run CLIENT-ARGS... -> runs the fetchers copy, with its own cache and summary.
+# FETCHER_RV_BASE is a test-local base, so a proxied URL is an obvious
+# "https://rv.test/https://origin/..." and never reaches a real host.
 run() {
   FETCHER_CACHE="$work/cache" FETCHER_SUMMARY="$work/summary.tsv" \
+    FETCHER_RV_BASE="https://rv.test" \
     FAKE_CI_BODY="${FAKE_CI_BODY:-$good_db}" FAKE_CI_CALLS="$work/ci.calls" \
     "$work/fetchers/fetcher.sh" "$@"
 }
@@ -89,62 +101,68 @@ run() {
 # Which clients can run, and what --list says
 #---------------------------------------------------------------------------#
 got="$(FETCHER_CACHE="$work/list-cache" "$work/fetchers/fetcher.sh" --list | tr '\n' ' ' | sed 's/ $//')"
-check "fetcher --list names the clients that answer here" "curl curl-impersonate rv-proxy jina" "$got" \
+check "fetcher --list names the clients that answer here" "curl-impersonate curl-impersonate-rv" "$got" \
   "fetchers/fetcher.sh --list"
 
 #---------------------------------------------------------------------------#
-# A host that answers curl: curl is used, once, and the host is remembered
+# A host that answers curl-impersonate: it is used, once, against the origin,
+# and the host is remembered. Plain curl is not in the order, so it is silent.
 #---------------------------------------------------------------------------#
 behaviour 200 good.db
-rc=0
-run --expect db https://fast.test/base.db "$work/fast.db" > /dev/null 2>&1 || rc=$?
-check "a host that answers curl is read" "0 $(sha256sum "$good_db" | cut -d ' ' -f 1)" \
-  "$rc $(sha256sum "$work/fast.db" | cut -d ' ' -f 1)" \
-  "fetchers/fetcher.sh --expect db https://fast.test/base.db OUT"
-check "the client that read the host is remembered" curl "$(cat "$work/cache/hosts/fast.test" 2> /dev/null)" \
-  "cat \$FETCHER_CACHE/hosts/fast.test"
-check "curl read the host with one call" 1 "$(awk 'END { print NR + 0 }' "$work/fakecurl/calls")" \
-  "cat \$FAKE_CURL_DIR/calls"
-check "the summary names the host, the client and the outcome" 1 \
-  "$(awk -F '\t' '$1 == "fast.test" && $2 == "curl" && $3 == "ok" { n++ } END { print n + 0 }' "$work/summary.tsv")" \
-  "cat \$FETCHER_SUMMARY"
-check "no curl-impersonate call was made" 0 "$(awk 'END { print NR + 0 }' "$work/ci.calls")" \
-  "cat \$FAKE_CI_CALLS"
-
-#---------------------------------------------------------------------------#
-# A host that answers curl with an interstitial: curl-impersonate reads it,
-# and the next call for the same host starts with it
-#---------------------------------------------------------------------------#
-behaviour 200 good.db
-rule interstitial 403 nonbody.html
 : > "$work/ci.calls"
 rc=0
-run --expect db https://interstitial.test/base.db "$work/interstitial.db" > /dev/null 2>&1 || rc=$?
-check "a 403 from curl falls back to curl-impersonate" "0 $(sha256sum "$good_db" | cut -d ' ' -f 1)" \
-  "$rc $(sha256sum "$work/interstitial.db" | cut -d ' ' -f 1)" \
-  "fetchers/fetcher.sh --expect db https://interstitial.test/base.db OUT"
-check "the host is then remembered as curl-impersonate" curl-impersonate \
-  "$(cat "$work/cache/hosts/interstitial.test" 2> /dev/null)" "cat \$FETCHER_CACHE/hosts/interstitial.test"
-check "curl-impersonate read the host with one call" 1 "$(awk 'END { print NR + 0 }' "$work/ci.calls")" \
-  "cat \$FAKE_CI_CALLS"
-: > "$work/fakecurl/calls"
+run --expect db https://fast.test/base.db "$work/fast.db" > /dev/null 2>&1 || rc=$?
+check "a host that answers curl-impersonate is read" "0 $(sha256sum "$good_db" | cut -d ' ' -f 1)" \
+  "$rc $(sha256sum "$work/fast.db" | cut -d ' ' -f 1)" \
+  "fetchers/fetcher.sh --expect db https://fast.test/base.db OUT"
+check "the client that read the host is remembered" curl-impersonate \
+  "$(cat "$work/cache/hosts/fast.test" 2> /dev/null)" "cat \$FETCHER_CACHE/hosts/fast.test"
+check "curl-impersonate read the host with one call against the origin" "1 0" \
+  "$(awk 'END { print NR + 0 }' "$work/ci.calls") $(awk '/:\/\/.*:\/\// { n++ } END { print n + 0 }' "$work/ci.calls")" \
+  "cat \$FAKE_CI_CALLS, direct URL only"
+check "the summary names the host, the client and the outcome" 1 \
+  "$(awk -F '\t' '$1 == "fast.test" && $2 == "curl-impersonate" && $3 == "ok" { n++ } END { print n + 0 }' "$work/summary.tsv")" \
+  "cat \$FETCHER_SUMMARY"
+check "no plain-curl call was made" 0 "$(awk 'END { print NR + 0 }' "$work/fakecurl/calls")" \
+  "cat \$FAKE_CURL_DIR/calls"
+
+#---------------------------------------------------------------------------#
+# A host the origin refuses the runner for: curl-impersonate direct fails, the
+# -rv variant reads it through the proxy, and the host is remembered as -rv so
+# the next call starts there
+#---------------------------------------------------------------------------#
+behaviour 200 good.db
+: > "$work/ci.calls"
 rc=0
-run --expect db https://interstitial.test/base.db "$work/interstitial2.db" > /dev/null 2>&1 || rc=$?
-check "the next call for that host starts at curl-impersonate" "0 0" \
-  "$rc $(awk 'END { print NR + 0 }' "$work/fakecurl/calls")" \
-  "the remembered client is tried first, so curl is not called again"
+FAKE_CI_RC=1 FAKE_CI_RV_RC=0 \
+  run --retries 1 --expect db https://blocked.test/base.db "$work/blocked.db" > /dev/null 2>&1 || rc=$?
+check "a direct refusal falls back to the proxy variant" "0 $(sha256sum "$good_db" | cut -d ' ' -f 1)" \
+  "$rc $(sha256sum "$work/blocked.db" | cut -d ' ' -f 1)" \
+  "fetchers/fetcher.sh --expect db https://blocked.test/base.db OUT"
+check "the host is then remembered as curl-impersonate-rv" curl-impersonate-rv \
+  "$(cat "$work/cache/hosts/blocked.test" 2> /dev/null)" "cat \$FETCHER_CACHE/hosts/blocked.test"
+check "the proxy variant read it with a proxied URL" 1 \
+  "$(awk '/:\/\/.*:\/\// { n++ } END { print n + 0 }' "$work/ci.calls")" \
+  "cat \$FAKE_CI_CALLS, one URL through the proxy"
+: > "$work/ci.calls"
+rc=0
+FAKE_CI_RV_RC=0 \
+  run --retries 1 --expect db https://blocked.test/base.db "$work/blocked2.db" > /dev/null 2>&1 || rc=$?
+check "the next call for that host starts at the proxy variant" "0 1 1" \
+  "$rc $(awk 'END { print NR + 0 }' "$work/ci.calls") $(awk 'NR == 1 && /:\/\/.*:\/\// { n++ } END { print n + 0 }' "$work/ci.calls")" \
+  "the remembered -rv client is tried first, so the origin is not asked again"
 
 #---------------------------------------------------------------------------#
 # A 404 is the server's answer, not a client that needs changing
 #---------------------------------------------------------------------------#
 behaviour 200 good.db
-rule gone 404 nonbody.html
 : > "$work/ci.calls"
 rc=0
-run --expect db https://host.test/gone/base.db "$work/gone.db" > /dev/null 2>&1 || rc=$?
+FAKE_CI_RC=4 \
+  run --retries 1 --expect db https://host.test/gone/base.db "$work/gone.db" > /dev/null 2>&1 || rc=$?
 check "a 404 ends the call with status 4" 4 "$rc" "fetchers/fetcher.sh --expect db URL OUT"
-check "a 404 does not try a second client" 0 "$(awk 'END { print NR + 0 }' "$work/ci.calls")" \
-  "cat \$FAKE_CI_CALLS"
+check "a 404 does not try another client or the proxy" 1 "$(awk 'END { print NR + 0 }' "$work/ci.calls")" \
+  "cat \$FAKE_CI_CALLS, the one direct call and no fallback"
 
 #---------------------------------------------------------------------------#
 # The structural check: a body that is not what was asked for is refused
@@ -152,25 +170,28 @@ check "a 404 does not try a second client" 0 "$(awk 'END { print NR + 0 }' "$wor
 behaviour 200 notatar
 FAKE_CI_BODY="$work/fakecurl/notatar"
 rc=0
-run --expect db https://bad.test/base.db "$work/bad.db" > /dev/null 2>&1 || rc=$?
+run --retries 1 --expect db https://bad.test/base.db "$work/bad.db" > /dev/null 2>&1 || rc=$?
 check "a body that is not a database is refused" 1 "$rc" \
   "fetchers/fetcher.sh --expect db URL OUT"
-FAKE_CI_BODY="$good_db"
+FAKE_CI_BODY="$work/fakecurl/many.db"
 behaviour 200 many.db
 rc=0
 run --expect db https://many.test/base.db "$work/many.out" > /dev/null 2>&1 || rc=$?
 check "a database with an early desc member is read" "0 $(sha256sum "$work/fakecurl/many.db" | cut -d ' ' -f 1)" \
   "$rc $(sha256sum "$work/many.out" | cut -d ' ' -f 1)" \
   "fetchers/fetcher.sh --expect db URL OUT"
+FAKE_CI_BODY="$work/fakecurl/good.sig"
 behaviour 200 good.sig
 rc=0
 run --expect sig https://sig.test/x.sig "$work/x.sig" > /dev/null 2>&1 || rc=$?
 check "an OpenPGP signature passes the sig check" 0 "$rc" "fetchers/fetcher.sh --expect sig URL OUT"
+FAKE_CI_BODY="$work/fakecurl/bad.sig"
 behaviour 200 bad.sig
 rc=0
 run --expect sig https://sig.test/x.sig "$work/y.sig" > /dev/null 2>&1 || rc=$?
 check "a body that is not a signature packet is refused" 1 "$rc" \
   "fetchers/fetcher.sh --expect sig URL OUT"
+FAKE_CI_BODY="$good_db"
 printf '<!DOCTYPE html>\n<html><body>not the file</body></html>\n' > "$work/fakecurl/page.html"
 printf 'a plain body\n' > "$work/fakecurl/text.txt"
 behaviour 200 page.html
@@ -238,7 +259,7 @@ check "--help names the options and exits 0" "0 1" \
 
 explain_out="$(FETCHER_CACHE="$work/cache" "$work/fetchers/fetcher.sh" --explain https://explain.test/a 2>&1)"
 check "--explain names the order and the availability" "1 1" \
-  "$(printf '%s\n' "$explain_out" | awk '/^order: curl/ { n++ } END { print n + 0 }') $(printf '%s\n' "$explain_out" | awk -F '\t' '$1 == "curl" && $2 == "available" { n++ } END { print n + 0 }')" \
+  "$(printf '%s\n' "$explain_out" | awk '/^order: curl-impersonate curl-impersonate-rv/ { n++ } END { print n + 0 }') $(printf '%s\n' "$explain_out" | awk -F '\t' '$1 == "curl-impersonate" && $2 == "available" { n++ } END { print n + 0 }')" \
   "fetchers/fetcher.sh --explain URL"
 check "--explain names the host and no cached preference" 2 \
   "$(printf '%s\n' "$explain_out" | awk '/^host: explain.test$/ { n++ } /^preferred: none$/ { n++ } END { print n + 0 }')" \
@@ -359,7 +380,7 @@ mkdir -p "$work/cache/hosts"
 printf 'nonsense-client\n' > "$work/cache/hosts/badpref.test"
 pref_out="$(FETCHER_CACHE="$work/cache" "$work/fetchers/fetcher.sh" --explain https://badpref.test/a 2>&1)"
 check "an unknown cached client is ignored" 1 \
-  "$(printf '%s\n' "$pref_out" | awk '/^order: curl curl-impersonate/ { n++ } END { print n + 0 }')" \
+  "$(printf '%s\n' "$pref_out" | awk '/^order: curl-impersonate curl-impersonate-rv/ { n++ } END { print n + 0 }')" \
   "fetchers/fetcher.sh --explain URL with a host preference that is not a client"
 
 #---------------------------------------------------------------------------#
@@ -425,15 +446,33 @@ check "cloak-browser runs fetch.mjs through node" 1 \
   "$(awk '/^node .*cloak-browser\/fetch\.mjs$/ { n++ } END { print n + 0 }' "$work/dispatch")" "cat \$FAKE_DISPATCH"
 check "playwright runs fetch.py through its venv python" 1 \
   "$(awk '/^python .*playwright\/fetch\.py$/ { n++ } END { print n + 0 }' "$work/dispatch")" "cat \$FAKE_DISPATCH"
+
+#---------------------------------------------------------------------------#
+# A -rv variant runs its engine's own program against the proxied URL
+#---------------------------------------------------------------------------#
+: > "$work/ci.calls"
+behaviour 200 good.db
+rc=0
+run --client curl-impersonate-rv --no-cache --expect db https://viarv.test/base.db "$work/viarv.out" > /dev/null 2>&1 || rc=$?
+check "curl-impersonate-rv reads the origin through the proxied URL" "0 1" \
+  "$rc $(awk '/^https:\/\/rv\.test\/https:\/\/viarv\.test\/base\.db$/ { n++ } END { print n + 0 }' "$work/ci.calls")" \
+  "fetchers/fetcher.sh --client curl-impersonate-rv URL OUT"
+: > "$work/dispatch"
+rc=0
+run --client chromium-rv --no-cache --expect db https://viarv.test/base.db "$work/viarv2.out" > /dev/null 2>&1 || rc=$?
+check "chromium-rv runs fetch.mjs through node" "0 1" \
+  "$rc $(awk '/^node .*chromium\/fetch\.mjs$/ { n++ } END { print n + 0 }' "$work/dispatch")" \
+  "fetchers/fetcher.sh --client chromium-rv URL OUT"
+
 rc=0
 "$work/fetchers/install.sh" --check chromium > /dev/null 2>&1 || rc=$?
 check "install.sh --check passes once the client is available" 0 "$rc" "fetchers/install.sh --check chromium"
 
 rc=0
 sc="$("$work/fetchers/self-check.sh" --strict https://selfcheck.test/base.db 2>&1)" || rc=$?
-check "self-check reads the URL through every available client" "0 8" \
+check "self-check reads the URL through every available client" "0 5" \
   "$rc $(printf '%s\n' "$sc" | awk '/: read it$/ { n++ } END { print n + 0 }')" \
-  "fetchers/self-check.sh --strict https://selfcheck.test/base.db, with seven clients that answer"
+  "fetchers/self-check.sh --strict https://selfcheck.test/base.db, the manager and its four clients"
 
 rc=0
 "$work/fetchers/ci.sh" --help > /dev/null 2>&1 || rc=$?

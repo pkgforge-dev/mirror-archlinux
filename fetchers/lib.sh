@@ -19,12 +19,23 @@ FETCHER_CACHE="${FETCHER_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mirror-archlinux
 # FETCHER_HEADERS, one per line.
 HEADERS=()
 
-# The clients, in the order auto mode tries them: the cheapest first, so a
-# host that answers curl costs one curl call, and a host that answers only a
-# full Chromium pays for it. A host with a known answer starts at the client
-# that answered it last.
+# The clients, in the order auto mode tries them. Plain curl is left out on
+# purpose: an origin behind Cloudflare refuses the runner's own address and
+# fingerprint, so a plain-curl call is a wasted round trip before the browser
+# profile that answers. Each engine is tried twice, first against the origin and
+# then through the api.rv.pkgforge.dev read-through proxy (the "-rv" variant),
+# which dials the origin from its own network: curl-impersonate (a curl with a
+# browser's TLS and HTTP/2 profile) direct, curl-impersonate through the proxy,
+# then a full Chromium direct and through the proxy. A host with a known answer
+# starts at the client that answered it last.
 # shellcheck disable=SC2034 # read by fetcher.sh and drift.sh
-FETCHER_CLIENTS_DEFAULT="curl curl-impersonate rv-proxy chromium jina cloak-browser playwright"
+FETCHER_CLIENTS_DEFAULT="curl-impersonate curl-impersonate-rv chromium chromium-rv"
+
+# The read-through proxy the "-rv" client variants dial through. It fetches the
+# origin URL from its own network and hands the body back, so a runner the
+# origin refuses still reads. The engine and its fingerprint are unchanged; only
+# the URL it asks for is rewritten to "<base>/<origin url>".
+FETCHER_RV_BASE="${FETCHER_RV_BASE:-https://api.rv.pkgforge.dev}"
 
 fetcher_log() {
   printf 'fetcher: %s\n' "$*" >&2
@@ -179,17 +190,32 @@ sig_verify() {
   return "$rc"
 }
 
+# A memo of availability answers for this process, keyed by engine. An "-rv"
+# variant shares its base engine's answer, so a --list or --explain that holds
+# both an engine and its "-rv" does not run the probe twice, and --no-cache
+# (which skips the on-disk cache) still asks each engine once per run rather than
+# once per variant. It is reset per process, so it never outlives a probe.
+declare -A FETCHER_AVAIL_MEMO=()
+
 # client_available NAME -> 0 when NAME can run here. The answer is kept for
 # FETCHER_AVAILABLE_TTL seconds (default 300; 0 asks every time, and
 # FETCHER_NO_AVAILABLE_CACHE=1 asks every time too), because a browser probe
 # starts node or python and costs more than the fetch it guards.
 client_available() {
   local name="$1" script rc=0 stamp now ttl="${FETCHER_AVAILABLE_TTL:-300}" cache
+  # An "-rv" variant runs the same engine through the proxy, so it can run
+  # wherever the engine can: the suffix is dropped and the engine is probed.
+  name="${name%-rv}"
   case "$name" in
     curl) has_cmd curl; return $? ;;
-    curl-impersonate | chromium | cloak-browser | playwright | rv-proxy | jina) ;;
+    curl-impersonate | chromium | cloak-browser | playwright) ;;
     *) return 1 ;;
   esac
+  # Already answered for this engine in this process: an -rv variant and its
+  # base never probe twice, whatever the on-disk cache says.
+  if [ -n "${FETCHER_AVAIL_MEMO[$name]+set}" ]; then
+    return "${FETCHER_AVAIL_MEMO[$name]}"
+  fi
   case "$ttl" in
     '' | *[!0-9]*) ttl=0 ;;
   esac
@@ -217,6 +243,7 @@ client_available() {
       '' | *[!0-9]*) rc= ;;
       *)
         if [ "$rc" != '' ] && [ $((now - stamp)) -lt "$ttl" ]; then
+          FETCHER_AVAIL_MEMO[$name]="$rc"
           return "$rc"
         fi
         ;;
@@ -238,6 +265,7 @@ client_available() {
       fi
     fi
   fi
+  FETCHER_AVAIL_MEMO[$name]="$rc"
   return "$rc"
 }
 
@@ -263,7 +291,7 @@ retry_sleep() {
 # refused.
 client_known() {
   case "$1" in
-    curl | curl-impersonate | chromium | cloak-browser | playwright | rv-proxy | jina) return 0 ;;
+    curl | curl-impersonate | curl-impersonate-rv | chromium | chromium-rv | cloak-browser | playwright) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -275,6 +303,17 @@ client_known() {
 # reach the client.
 client_run() {
   local name="$1" url="$2" out="$3" log="$4" referer="${5:-}" secs="${FETCHER_MAX_TIME:-300}" dead=() cap=() hdrs=() h
+  # An "-rv" variant reads the same URL through the api.rv.pkgforge.dev
+  # read-through proxy, which dials the origin from its own network, so a runner
+  # the origin refuses still reads. The engine and its fingerprint stay the same:
+  # only the URL it asks for is the proxied one, and then the dispatch below is
+  # the engine's own, unchanged.
+  case "$name" in
+    *-rv)
+      name="${name%-rv}"
+      url="${FETCHER_RV_BASE:-https://api.rv.pkgforge.dev}/$url"
+      ;;
+  esac
   dead=(timeout -k 5 "$((secs + 5))")
   if [ "${FETCHER_MAX_BYTES:-0}" -gt 0 ]; then
     cap=(--max-filesize "$FETCHER_MAX_BYTES")
@@ -297,13 +336,6 @@ client_run() {
       ;;
     curl-impersonate)
       FETCHER_MAX_TIME="$secs" "${dead[@]}" "$FETCHER_HOME/curl-impersonate/fetch.sh" \
-        "$url" "$out" "${HEADERS[@]}" > "$log" 2>&1
-      ;;
-    rv-proxy | jina)
-      # A read-through proxy: it dials the origin itself, so the client keeps
-      # its own deadlines and reads through fetch.sh, as curl-impersonate does.
-      FETCHER_MAX_TIME="$secs" FETCHER_CONNECT_TIMEOUT="${FETCHER_CONNECT_TIMEOUT:-20}" \
-        "${dead[@]}" "$FETCHER_HOME/$name/fetch.sh" \
         "$url" "$out" "${HEADERS[@]}" > "$log" 2>&1
       ;;
     chromium | cloak-browser)

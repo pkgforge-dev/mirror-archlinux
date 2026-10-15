@@ -46,7 +46,18 @@ if [ "$check" -eq 1 ]; then
   done
   exit "$rc"
 fi
+# An "-rv" variant has no installer of its own: it runs its base engine against
+# the proxy, so the list is reduced to the engines to install and
+# "curl-impersonate curl-impersonate-rv" installs curl-impersonate once.
+engines=""
 for c in $clients; do
+  c="${c%-rv}"
+  case " $engines " in
+    *" $c "*) ;;
+    *) engines="$engines $c" ;;
+  esac
+done
+for c in $engines; do
   case "$c" in
     curl) continue ;;
     curl-impersonate | chromium | cloak-browser | playwright) ;;
