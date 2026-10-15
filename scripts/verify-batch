@@ -402,8 +402,12 @@ if [ -n "$keyrings" ] && [ -n "$keyring_repo" ]; then
     drop="$(sed -n 's/.*Remove \([^?]*\)?.*/\1/p' /tmp/keyring.log | sort -u | tr '\n' ' ')"
     if [ -n "${drop// /}" ]; then
       printf 'keyring: the target keyring replaces %s; removing it, then installing\n' "$drop" >> /tmp/keyring.log
+      rm_rc=0
       # shellcheck disable=SC2086 # the names are one per word, on purpose
-      pac -Rdd $drop >> /tmp/keyring.log 2>&1 || true
+      pac -Rdd $drop >> /tmp/keyring.log 2>&1 || rm_rc=$?
+      # The removal's status is kept, not hidden: a removal that failed still
+      # lets the install below run, and that install is what decides the verdict.
+      [ "$rm_rc" -eq 0 ] || printf 'keyring: removing %s exited %s; the install below decides\n' "$drop" "$rm_rc" >> /tmp/keyring.log
       rc=0
       pac -Sdd "${kr[@]/#/$keyring_repo/}" >> /tmp/keyring.log 2>&1 || rc=$?
     fi
