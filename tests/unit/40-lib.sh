@@ -202,6 +202,125 @@ else
 fi
 
 #---------------------------------------------------------------------------#
+# A database tar cannot read whole fails, and fails in every reader.
+#
+# Three cases, because they fail in different places:
+#   truncated    tar reads the members before the cut and then errors. The
+#                record set it produced looks exactly like a smaller repository.
+#   zstd         the PowerPC databases are zstd (measured 2026-10-15: the first
+#                four bytes of powerpc64le base.db are 28 b5 2f fd). GNU tar
+#                shells out for zstd, so a host without the program reads none
+#                of it. busybox tar cannot read it at all.
+#   notatar      bytes that are not an archive at all.
+#
+# Each must give a non-zero status and leave no record file. The status is read
+# from PIPESTATUS, and `local` resets PIPESTATUS, so the capture has to be the
+# first command after the pipeline. That is the fault this block was written
+# for: with the array declared first, every case reported 0.
+#---------------------------------------------------------------------------#
+if case "$tar_version" in *'GNU tar'*) true ;; *) false ;; esac; then
+  # mkbig N -> a database with N packages, big enough that a cut lands inside it
+  mkbig() {
+    local n="$1" d="$work/big-$1" p
+    rm -rf "$d"
+    for ((p = 0; p < n; p++)); do
+      mkdir -p "$d/p$p-1-1"
+      printf '%%FILENAME%%\np%s-1-1-any.pkg.tar.zst\n\n%%NAME%%\np%s\n\n%%VERSION%%\n1-1\n\n%%ARCH%%\nany\n\n%%SHA256SUM%%\n%s\n\n%%CSIZE%%\n10\n\n%%BUILDDATE%%\n1700000000\n\n' \
+        "$p" "$p" "$SHA" > "$d/p$p-1-1/desc"
+    done
+    (cd "$d" && tar -czf "$work/big-$1.db" -- *)
+    printf '%s\n' "$work/big-$1.db"
+  }
+
+  whole="$(mkbig 40)"
+  rc=0
+  in_lib db_records "$whole" "$work/big-ok.tsv" > /dev/null 2>&1 || rc=$?
+  check "a whole database gives 40 records and a zero status" "0 40" \
+    "$rc $(awk 'END { print NR + 0 }' "$work/big-ok.tsv")" "bash -c '. scripts/lib.sh; db_records DB OUT'"
+
+  # Truncated at half: tar reads the first packages, then errors with status 2.
+  cut_db="$work/cut.db"
+  head -c "$(($(wc -c < "$whole") / 2))" "$whole" > "$cut_db"
+  rc=0
+  in_lib db_records "$cut_db" "$work/cut.tsv" > /dev/null 2>&1 || rc=$?
+  check "a truncated database gives a non-zero status, not a partial record set" 1 "$rc" \
+    "bash -c '. scripts/lib.sh; db_records $cut_db OUT' (tar ended 2, premature end)"
+  check "a truncated database leaves no record file" "absent" \
+    "$([ -e "$work/cut.tsv" ] && echo present || echo absent)" "bash -c '. scripts/lib.sh; db_records $cut_db OUT'; ls OUT"
+
+  rc=0
+  in_lib db_members "$cut_db" > /dev/null 2>&1 || rc=$?
+  check "db_members gives a non-zero status on a truncated database" 1 "$rc" \
+    "bash -c '. scripts/lib.sh; db_members $cut_db'"
+
+  rc=0
+  in_lib db_check "$cut_db" "$work/cut-check.tsv" > /dev/null 2>&1 || rc=$?
+  check "db_check refuses a truncated database" 1 "$rc" \
+    "bash -c '. scripts/lib.sh; db_check $cut_db OUT'"
+
+  # Bytes that are not an archive.
+  printf 'this is not a tar archive at all\n' > "$work/notatar.db"
+  rc=0
+  in_lib db_records "$work/notatar.db" "$work/notatar.tsv" > /dev/null 2>&1 || rc=$?
+  check "db_records gives a non-zero status on bytes that are not an archive" 1 "$rc" \
+    "bash -c '. scripts/lib.sh; db_records $work/notatar.db OUT'"
+
+  # A zstd database, which is what all six PowerPC targets serve. tar needs the
+  # zstd program for it, so the case that matters is a host without it.
+  if command -v zstd > /dev/null && command -v tar > /dev/null; then
+    zdb="$work/zstd.db"
+    # The member list names the fixture directory itself: a `-- *` on this line
+    # expands against the test's own directory, not the fixture's.
+    (cd "$work/big-40" && tar --use-compress-program zstd -cf "$zdb" -- *)
+    if [ -s "$zdb" ] && [ "$(od -An -tx1 -N4 "$zdb" | tr -d ' \n')" = 28b52ffd ]; then
+      # The magic is measured here and asserted below, so a tar that silently
+      # wrote something else cannot pass as a zstd database.
+      magic="$(od -An -tx1 -N4 "$zdb" | tr -d ' \n')"
+      rc=0
+      in_lib db_records "$zdb" "$work/zstd.tsv" > /dev/null 2>&1 || rc=$?
+      check "a zstd database is read whole, magic 28b52ffd" "0 40 28b52ffd" \
+        "$rc $(awk 'END { print NR + 0 }' "$work/zstd.tsv") $magic" \
+        "bash -c '. scripts/lib.sh; db_records $zdb OUT'; od -An -tx1 -N4 $zdb"
+      rc=0
+      in_lib db_check "$zdb" "$work/zstd-check.tsv" > /dev/null 2>&1 || rc=$?
+      check "db_check accepts a zstd database" 0 "$rc" \
+        "bash -c '. scripts/lib.sh; db_check $zdb OUT'"
+
+      # With no zstd available tar cannot start the decompressor. That must be
+      # a non-zero status with the program named, not 0 records.
+      #
+      # A directory of programs is the wrong instrument here: on this host bash
+      # and zstd are both in /usr/bin, so any PATH that reaches the shell also
+      # reaches zstd, and the case cannot be set up by removing a directory.
+      # So zstd is shadowed by a program of the same name that refuses, which
+      # is exactly what a host without it looks like to tar.
+      stub="$work/no-zstd"
+      mkdir -p "$stub"
+      cat > "$stub/zstd" << 'STUB'
+#!/bin/sh
+printf 'zstd: stub, this host has no zstd\n' >&2
+exit 127
+STUB
+      chmod +x "$stub/zstd"
+      rc=0
+      why="$(PATH="$stub:$PATH" bash -c '. "$1"; db_records "$2" "$3"' _ "$LIB" "$zdb" "$work/nozstd.tsv" 2>&1)" || rc=$?
+      check "a zstd database with no zstd program gives a non-zero status" 1 "$rc" \
+        "bash -c '. scripts/lib.sh; PATH=$stub db_records DB OUT'"
+      case "$why" in
+        *zstd*) ok "and the message names the zstd program" ;;
+        *) fail "and the message names the zstd program" "$why" "bash -c '. scripts/lib.sh; PATH=$stub db_records DB OUT'" ;;
+      esac
+    else
+      skip "a zstd database is read whole" "tar could not write one with zstd here"
+    fi
+  else
+    skip "a zstd database is read whole" "zstd or tar is not on PATH"
+  fi
+else
+  ok "skipped: an unreadable database fails, and this tar is $tar_version"
+fi
+
+#---------------------------------------------------------------------------#
 # Behind: compared per package by build date. Fixtures are Arch's archived
 # core.db of four days, reduced to name and build date: 10-02 and 10-03 share
 # their newest build date and differ in bytes, and so do 10-10 and 10-11. The
@@ -230,6 +349,122 @@ for pair in "02 03" "10 11"; do
 done
 cp "$work/a.tsv" "$work/a-again.tsv"
 check "a database is not behind itself" "0 0" "$(in_lib behind "$work/a.tsv" "$work/a-again.tsv")" "bash -c '. scripts/lib.sh; behind A COPY-OF-A'"
+
+#---------------------------------------------------------------------------#
+# The signature of a signed database, checked with gpgv before it is used.
+#
+# Four cases, and the keys are made here so the test needs no network and no
+# keyring from an image:
+#   good      a signature by the key the keyring holds
+#   other     a signature by a second key, which the keyring does not hold
+#   changed   one byte changed in the .sig
+#   wrong     the .sig of one file beside the bytes of another
+# And one refusal with no keyring file at all, which is what a target whose
+# keyring_image could not be read gives.
+#---------------------------------------------------------------------------#
+if need_tool gpg "the signature of a signed database is checked with gpgv, with keys made here"; then
+  # mkkey NAME -> a keyring file holding one signing key, and the GNUPGHOME
+  # beside it that can sign with it
+  mkkey() {
+    local name="$1"
+    local home="$work/gnupg-$name"
+    rm -rf "$home"
+    mkdir -p "$home"
+    chmod 700 "$home"
+    cat > "$work/key-$name.batch" << EOF
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Key-Usage: sign
+Name-Real: $name
+Name-Email: $name@example.invalid
+Expire-Date: 0
+%commit
+EOF
+    GNUPGHOME="$home" gpg --batch --quiet --gen-key "$work/key-$name.batch" > "$work/key-$name.log" 2>&1
+    GNUPGHOME="$home" gpg --batch --quiet --export > "$work/key-$name.gpg"
+  }
+  printf 'package bytes for the signature test\n' > "$work/signed.db"
+  printf 'other package bytes\n' > "$work/other.db"
+
+  mkkey trusted
+  mkkey other
+  sg="$work/sig"
+  mkdir -p "$sg/keyrings"
+  cp "$work/key-trusted.gpg" "$sg/keyrings/trusted.gpg"
+  cp "$work/signed.db" "$sg/upstream.db"
+
+  # sig_of KEY FILE OUT: a detached signature of FILE, made by KEY's key.
+  # gpg refuses to overwrite an existing signature file, so it is removed first;
+  # several cases re-sign the same output path.
+  sig_of() {
+    rm -f -- "$3"
+    GNUPGHOME="$work/gnupg-$1" gpg --batch --quiet --detach-sign --output "$3" "$2"
+  }
+
+  sig_of trusted "$work/signed.db" "$sg/upstream.db.sig"
+  rc=0
+  why="$(in_lib db_sig_ok "$sg" base db 2>&1)" || rc=$?
+  check "a signature by the key the keyring holds verifies" 0 "$rc" \
+    "bash -c '. scripts/lib.sh; db_sig_ok $sg base db' ($why)"
+
+  # A second key signs the same bytes. The keyring holds only the first.
+  sig_of other "$work/signed.db" "$sg/upstream.db.sig"
+  rc=0
+  why="$(in_lib db_sig_ok "$sg" base db 2>&1)" || rc=$?
+  check "a signature by a key the keyring does not hold is refused" 1 "$rc" \
+    "bash -c '. scripts/lib.sh; db_sig_ok $sg base db' (the keyring holds only key-trusted)"
+  case "$why" in
+    *base.db.sig*) ok "and the refusal names base.db.sig" ;;
+    *) fail "and the refusal names base.db.sig" "$why" "bash -c '. scripts/lib.sh; db_sig_ok $sg base db'" ;;
+  esac
+
+  # One byte changed in the signature.
+  sig_of trusted "$work/signed.db" "$sg/upstream.db.sig"
+  printf 'X' | dd of="$sg/upstream.db.sig" bs=1 seek=60 conv=notrunc status=none 2> /dev/null
+  rc=0
+  why="$(in_lib db_sig_ok "$sg" base db 2>&1)" || rc=$?
+  check "a signature with one byte changed is refused" 1 "$rc" \
+    "bash -c '. scripts/lib.sh; db_sig_ok $sg base db' (byte 60 of the .sig is now X)"
+
+  # The signature of one file beside the bytes of another.
+  cp "$work/signed.db" "$sg/upstream.files"
+  sig_of trusted "$work/other.db" "$sg/upstream.files.sig"
+  rc=0
+  why="$(in_lib db_sig_ok "$sg" base files 2>&1)" || rc=$?
+  check "the signature of another file beside these bytes is refused" 1 "$rc" \
+    "bash -c '. scripts/lib.sh; db_sig_ok $sg base files' (upstream.files.sig signs other.db)"
+  case "$why" in
+    *base.files.sig*) ok "and that refusal names base.files.sig" ;;
+    *) fail "and that refusal names base.files.sig" "$why" "bash -c '. scripts/lib.sh; db_sig_ok $sg base files'" ;;
+  esac
+
+  # No keyring file: what a target whose keyring_image could not be read gives.
+  empty="$work/sig-empty"
+  mkdir -p "$empty/keyrings"
+  cp "$work/signed.db" "$empty/upstream.db"
+  sig_of trusted "$work/signed.db" "$empty/upstream.db.sig"
+  rc=0
+  why="$(in_lib db_sig_ok "$empty" base db 2>&1)" || rc=$?
+  check "with no keyring file the signature cannot be checked, and the database is refused" 1 "$rc" \
+    "bash -c '. scripts/lib.sh; db_sig_ok $empty base db'"
+  case "$why" in
+    *keyring*) ok "and that refusal names the keyring directory" ;;
+    *) fail "and that refusal names the keyring directory" "$why" "bash -c '. scripts/lib.sh; db_sig_ok $empty base db'" ;;
+  esac
+
+  # The acceptance half of the last case: with the keyring there, the same bytes
+  # verify. A check that refuses everything is indistinguishable from one that
+  # works, so the accepting row is what makes the refusing rows mean something.
+  cp "$work/key-trusted.gpg" "$empty/keyrings/trusted.gpg"
+  rc=0
+  in_lib db_sig_ok "$empty" base db > /dev/null 2>&1 || rc=$?
+  check "and the same bytes verify once the keyring is there" 0 "$rc" \
+    "bash -c '. scripts/lib.sh; db_sig_ok $empty base db'"
+else
+  ok "skipped: the signature of a signed database is checked with gpgv"
+fi
+
 
 #---------------------------------------------------------------------------#
 # The write-once rule
@@ -796,5 +1031,30 @@ EOF
     "status $b_rc, $(awk 'END { print NR + 0 }' "$work/trickle.blob-hits") request(s), $([ "$b_took" -lt 10 ] && echo 'within 10 s' || echo "after $b_took s")" \
     "bash -c '. scripts/lib.sh; registry_blob it/repo $BLOB /tmp/out' with MIRROR_REGISTRY=127.0.0.1:$port MIRROR_REGISTRY_SCHEME=http MIRROR_REGISTRY_AUTH=none REG_BLOB_MAX_TIME=3"
 fi
+
+#---------------------------------------------------------------------------#
+# fetch_upstream: MIRROR_FETCHER replaces curl, and its status is mapped
+#---------------------------------------------------------------------------#
+stub="$work/fetcher-stub"
+cat > "$stub" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+out="${@: -1}"
+rc="${STUB_RC:-0}"
+[ "$rc" != 0 ] || printf 'body\n' > "$out"
+exit "$rc"
+EOF
+chmod 0755 "$stub"
+for want in 0 4 1; do
+  rm -f "$work/stub.out"
+  rc=0
+  STUB_RC="$want" bash -c '. "$1"; MIRROR_FETCHER="$2" fetch_upstream https://example.invalid/x.db "$3"' \
+    _ "$LIB" "$stub" "$work/stub.out" > /dev/null 2>&1 || rc=$?
+  wrote=removed
+  [ -f "$work/stub.out" ] && wrote=kept
+  check "fetch_upstream: MIRROR_FETCHER status $want, file $([ "$want" = 0 ] && echo kept || echo removed)" \
+    "$want $([ "$want" = 0 ] && echo kept || echo removed)" "$rc $wrote" \
+    "STUB_RC=$want bash -c '. scripts/lib.sh; MIRROR_FETCHER=$stub fetch_upstream https://example.invalid/x.db OUT'"
+done
 
 summary

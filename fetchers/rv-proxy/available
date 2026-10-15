@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+#
+# Can this host run the rv-proxy client? It needs curl. The proxy's own reach
+# is tested at fetch time, not here: a probe that called the network would cost
+# more than the fetch it guards.
+set -euo pipefail
+command -v curl > /dev/null

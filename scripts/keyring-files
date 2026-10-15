@@ -52,7 +52,10 @@ files() {
   cid="$(timeout 120 "$RUNTIME" create --platform "$2" "$1" true)" ||
     die "could not create a container from $1" "reproduce: $RUNTIME create --platform $2 $1 true"
   timeout 120 "$RUNTIME" cp "$cid:/usr/share/pacman/keyrings/." "$3/" > "$work/cp.log" 2>&1 || rc=$?
-  timeout 60 "$RUNTIME" rm "$cid" > /dev/null || rc=$?
+  # The cleanup has its own status. Reusing rc here would overwrite the copy's
+  # with the removal's, and a copy that worked would be reported as a copy
+  # that failed. scripts/lib.sh keyring_copy does the same and says so.
+  timeout 60 "$RUNTIME" rm "$cid" > /dev/null || log "could not remove container $cid"
   cid=""
   [ "$rc" -eq 0 ] || die "could not copy /usr/share/pacman/keyrings out of $1 (status $rc)" \
     "reproduce: $RUNTIME create --platform $2 $1 true, then $RUNTIME cp ID:/usr/share/pacman/keyrings/. DIR"

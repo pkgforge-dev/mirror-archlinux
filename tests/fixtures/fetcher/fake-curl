@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# A curl stand-in for fetchers/tests/run.sh. It answers from a rules file, so
+# the tests exercise client selection and body validation with no network.
+#
+#   FAKE_CURL_DIR/rules        one "substring code body-file" per line; the
+#                              first substring in the URL wins
+#   FAKE_CURL_DIR/default      "code body-file" when no rule matches
+#   FAKE_CURL_DIR/calls        each URL and code is appended, one per line
+set -euo pipefail
+
+dir="${FAKE_CURL_DIR:?set FAKE_CURL_DIR}"
+out=""
+code=200
+body="$dir/default.body"
+url=""
+want_code=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o | --output)
+      out="$2"
+      shift 2
+      ;;
+    --write-out | -w)
+      want_code=1
+      shift 2
+      ;;
+    --header)
+      printf '%s\n' "$2" >> "$dir/headers"
+      shift 2
+      ;;
+    --referer)
+      printf '%s\n' "$2" >> "$dir/referers"
+      shift 2
+      ;;
+    --max-redirs | --proto | --proto-redir | --connect-timeout | --speed-limit | --speed-time | --max-time | --max-filesize | --user-agent | --config)
+      # The caller passes these; the tests do not read them.
+      shift 2
+      ;;
+    -*)
+      shift
+      ;;
+    *)
+      url="$1"
+      shift
+      ;;
+  esac
+done
+
+matched=0
+if [ -f "$dir/rules" ]; then
+  while read -r sub c f; do
+    [ -n "${sub:-}" ] || continue
+    case "$url" in
+      *"$sub"*)
+        code="$c"
+        body="$dir/$f"
+        matched=1
+        break
+        ;;
+    esac
+  done < "$dir/rules"
+fi
+if [ "$matched" -eq 0 ] && [ -f "$dir/default" ]; then
+  read -r code body < "$dir/default"
+  case "$body" in
+    /*) ;;
+    *) body="$dir/$body" ;;
+  esac
+fi
+if [ -n "$out" ]; then
+  cp "$body" "$out"
+fi
+printf '%s\t%s\n' "$url" "$code" >> "$dir/calls"
+if [ "$want_code" -eq 1 ]; then
+  printf '%s' "$code"
+fi
+[ "$code" = 200 ] || exit 0

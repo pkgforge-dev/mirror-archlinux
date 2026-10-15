@@ -76,6 +76,29 @@ for conf in targets/*.conf; do
     else
       fail "$conf: keyring_image comes with keyring_platform" "no keyring_platform" "reproduce: grep keyring_ $conf"
     fi
+    # The platform has to be the one the image is published for. A wrong
+    # platform still pulls, and it pulls the wrong architecture's keyring
+    # files, so the trust root of verify would be another distribution's.
+    # pacman's $arch and the OCI platform name differ for two families, so
+    # this is a map and not an equality. Measured 2026-10-15 against the
+    # manifests of the seven keyring images in ghcr.io.
+    # The tag marker of keyring_image, not the first in the file: a target
+    # also pins verify_image, and that one is always the same amd64 image.
+    tag="$(grep -B1 '^keyring_image' "$conf" | sed -n 's|^# tag: ||p' | head -1)"
+    plat="$(get "$conf" keyring_platform)"
+    case "$tag" in
+      aarch64) want="linux/arm64" ;;
+      armv7h) want="linux/arm/v7" ;;
+      *) want="linux/$tag" ;;
+    esac
+    if [ "$plat" = "$want" ]; then
+      ok "$conf: keyring_platform $plat is the platform of the $tag image"
+    else
+      fail "$conf: keyring_platform $plat is the platform of the $tag image" "it should be $want" \
+        "the image $tag publishes $want; a wrong platform pulls another architecture's keyring" \
+        "reproduce: curl -sH \"Authorization: Bearer \$(curl -s 'https://ghcr.io/token?scope=repository:pkgforge-dev/archlinux:pull' | jq -r .token)\" \
+        -H 'Accept: application/vnd.oci.image.index.v1+json' https://ghcr.io/v2/pkgforge-dev/archlinux/manifests/$tag | jq -r '.manifests[].platform'"
+    fi
   fi
 
   from="$(get "$conf" keyring_from)"
@@ -134,6 +157,47 @@ if [ -z "$overlap" ]; then
 else
   fail "no target name is another's name, a dash and a digit" "$overlap" \
     "the artifact patterns of sync-target.yml would mix the two chains" "reproduce: ls targets"
+fi
+
+#---------------------------------------------------------------------------#
+# A target that is deleted takes two things with it that nothing else checks:
+# its plan slot and its keyring lines. Both are one-way: the slot stays in
+# sync.yml and the lines stay in targets/keyrings.sha256, and a plan slot with
+# no target is a step that uploads nothing, and a keyring line with no target
+# is a trust root for an architecture nothing installs. Deleting the six
+# PowerPC targets was measured to leave both suites green before these two
+# checks, so they are here.
+#---------------------------------------------------------------------------#
+plan_slots="$(grep -oE 'outputs\.slot[0-9]+' .github/workflows/sync.yml | sort -u | awk 'END { print NR + 0 }')"
+if [ "$plan_slots" -eq "$enabled" ]; then
+  ok "sync.yml has one plan slot per enabled target, and no slot without one ($plan_slots)"
+else
+  fail "sync.yml has one plan slot per enabled target, and no slot without one" \
+    "$plan_slots slot(s) for $enabled enabled target(s)" \
+    "a slot with no target is a step that uploads nothing; a target with no slot is never planned" \
+    "reproduce: grep -c 'outputs.slot' .github/workflows/sync.yml; ls targets/*.conf | wc -l"
+fi
+
+# The keyring file's TAG is the image tag, which is not an architecture name:
+# ppc64le, not powerpc64le. So the check is that each tag is the image tag of
+# some enabled target's keyring_image.
+kr_tags="$(for c in targets/*.conf; do
+  [ -f "$c" ] || continue
+  SCRIPT_NAME=target bash -c '. scripts/lib.sh; target_enabled "$1"' _ "$c" || continue
+  image="$(get "$c" keyring_image)"
+  [ -n "$image" ] || continue
+  t="${image%%@*}"
+  printf '%s\n' "${t##*:}"
+done | sort -u)"
+kr_file_tags="$(awk -F '\t' '!/^#/ && NF == 3 { print $1 }' targets/keyrings.sha256 | sort -u)"
+orphan_kr="$(comm -13 <(printf '%s\n' "$kr_tags") <(printf '%s\n' "$kr_file_tags") 2>/dev/null || true)"
+if [ -z "$orphan_kr" ]; then
+  ok "every keyring line in targets/keyrings.sha256 belongs to an enabled target's keyring_image"
+else
+  fail "every keyring line in targets/keyrings.sha256 belongs to an enabled target's keyring_image" \
+    "no enabled target pins $(printf '%s ' "$orphan_kr")" \
+    "a keyring line with no target is a trust root for an architecture nothing installs" \
+    "reproduce: awk -F \t '!/^#/ && NF==3 {print \$1}' targets/keyrings.sha256 | sort -u; ls targets/"
 fi
 
 summary

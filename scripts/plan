@@ -340,7 +340,13 @@ plan_target() {
       set_state "$dir" error "$repo_path:latest names $layer_digest and serves $promoted_sha"
       return 0
     fi
-    db_records "$dir/promoted.db" "$dir/promoted.tsv"
+    # `if !`, not a bare call: every script here runs set -e, and a promoted
+    # database that does not read would end this shell inside db_records
+    # instead of putting the target in error with a state file.
+    if ! db_records "$dir/promoted.db" "$dir/promoted.tsv"; then
+      set_state "$dir" error "the promoted database $repo_path:latest does not read as a tar archive"
+      return 0
+    fi
   elif [ "$anon_rc" -eq "$REG_STATUS_ABSENT" ] && [ "$auth_rc" != "$REG_STATUS_ERROR" ]; then
     log "$name: nothing promoted yet in $repo_path"
   else
@@ -587,8 +593,28 @@ plan_target() {
   # the same sha256, or pacman -F would describe other packages. A server that
   # fails gives way to the next one with the same bytes.
   #-------------------------------------------------------------------------#
-  local files_ok=0 s sig_rc sig_done cands tried=0 drift db_n left_out
+  local files_ok=0 s sig_rc sig_done cands tried=0 drift db_n left_out signed=no verified
   cands="$(awk -F '\t' -v c="$chosen_sha" '$3 == c { n++ } END { print n + 0 }' "$dir/cand/list.tsv")"
+  # When the database is signed, prepare the trust root once: the keyring files
+  # of keyring_image, under $dir/keyrings. A signature that does not verify
+  # against them is refused like a malformed database, and the next db_server
+  # is tried. PLAN_KEYRING_DIR gives these files directly, so a test checks the
+  # gpgv path with no container pull.
+  if [ "$(target_get "$conf" db_signed)" = yes ]; then
+    signed=yes
+    if [ -n "${PLAN_KEYRING_DIR:-}" ]; then
+      mkdir -p "$dir/keyrings"
+      rc=0
+      cp -r "$PLAN_KEYRING_DIR"/. "$dir/keyrings/" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        set_state "$dir" error "PLAN_KEYRING_DIR=$PLAN_KEYRING_DIR could not be read, so the signatures of $repo cannot be checked"
+        return 0
+      fi
+    elif ! keyring_copy "$dir/keyrings" "$conf"; then
+      set_state "$dir" error "db_signed = yes and the keyring files of keyring_image could not be read, so the signatures of $repo cannot be checked"
+      return 0
+    fi
+  fi
   while IFS=$'\t' read -r idx srv sha; do
     [ "$sha" = "$chosen_sha" ] || continue
     tried=$((tried + 1))
@@ -685,20 +711,33 @@ plan_target() {
       esac
     done
     [ "$sig_done" -eq 1 ] || continue
+    # Check the signatures against the trust root before this server is taken.
+    # A .sig that does not verify is worse than none: a consumer with
+    # DatabaseRequired refuses the database, and the mirror would serve bytes it
+    # cannot vouch for. A server whose .sig does not verify gives way to the
+    # next, as a malformed database does.
+    if [ "$signed" = yes ]; then
+      verified=1
+      for s in db files; do
+        if ! db_sig_ok "$dir" "$repo" "$s"; then
+          warn "$name: $srv/$repo.$s.sig does not verify against the keyring files of keyring_image; the next db_server is tried"
+          verified=0
+          break
+        fi
+      done
+      [ "$verified" -eq 1 ] || continue
+      log "$name: $srv/$repo.db.sig and $srv/$repo.files.sig verify against the keyring files"
+    fi
     files_ok=1
     break
   done < "$dir/cand/list.tsv"
   if [ "$files_ok" -ne 1 ]; then
-    set_state "$dir" error "no db_server that served $repo.db $chosen_sha also served a $repo.files that matches it, and an answer for its signatures$(budget_note)"
+    if [ "$signed" = yes ]; then
+      set_state "$dir" error "no db_server served $repo.db $chosen_sha with a matching $repo.files and signatures that verify against the keyring files of keyring_image$(budget_note)"
+    else
+      set_state "$dir" error "no db_server that served $repo.db $chosen_sha also served a $repo.files that matches it, and an answer for its signatures$(budget_note)"
+    fi
     return 0
-  fi
-  if [ "$(target_get "$conf" db_signed)" = yes ]; then
-    for s in db files; do
-      if [ ! -f "$dir/upstream.$s.sig" ]; then
-        set_state "$dir" error "db_signed = yes and $repo.$s.sig answered 404"
-        return 0
-      fi
-    done
   fi
 
   #-------------------------------------------------------------------------#

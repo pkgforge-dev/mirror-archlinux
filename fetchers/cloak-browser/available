@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#
+# Can this host run the cloak-browser client here? Node and the cloakbrowser
+# package are both needed.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+command -v node > /dev/null || exit 1
+[ -d "$HERE/node_modules/cloakbrowser" ] || exit 1
+exec node "$HERE/probe.mjs"

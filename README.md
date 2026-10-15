@@ -1,6 +1,6 @@
 # mirror-archlinux
 
-Arch Linux and three of its ports, stored on GHCR and checked by pacman before each snapshot is published.
+Arch Linux and four of its ports, stored on GHCR and checked by pacman before each snapshot is published.
 
 [![all](https://pkgforge-dev.github.io/mirror-archlinux/badges/all.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
 [![synced](https://pkgforge-dev.github.io/mirror-archlinux/badges/synced.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
@@ -10,6 +10,9 @@ Arch Linux and three of its ports, stored on GHCR and checked by pacman before e
 [![armv7h](https://pkgforge-dev.github.io/mirror-archlinux/badges/armv7h.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
 [![loong64](https://pkgforge-dev.github.io/mirror-archlinux/badges/loong64.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
 [![riscv64](https://pkgforge-dev.github.io/mirror-archlinux/badges/riscv64.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
+[![powerpc64le](https://pkgforge-dev.github.io/mirror-archlinux/badges/powerpc64le.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
+[![powerpc64](https://pkgforge-dev.github.io/mirror-archlinux/badges/powerpc64.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
+[![powerpc](https://pkgforge-dev.github.io/mirror-archlinux/badges/powerpc.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
 [![speed](https://pkgforge-dev.github.io/mirror-archlinux/badges/speed.svg)](https://pkgforge-dev.github.io/mirror-archlinux/)
 
 ![Share of upstream files in the mirror, per target](https://pkgforge-dev.github.io/mirror-archlinux/charts/coverage.svg)
@@ -75,7 +78,7 @@ pacman tries each Server in turn when a file is not found. Keep `oci://` first: 
 
 ### An absent database signature
 
-⚠ Under an `XferCommand`, pacman pauses 2 s after each failed download, also for an optional `<repo>.db.sig`. No upstream of this mirror publishes a database signature.
+⚠ Under an `XferCommand`, pacman pauses 2 s after each failed download, also for an optional `<repo>.db.sig`. No upstream of this mirror publishes a database signature except ArchPOWER, whose six PowerPC targets serve one and the mirror verifies it with `gpgv`.
 
 With `DownloadUser` set (stock Arch) and pacman 7.0 or 7.1, the wrapper answers an absent database signature with an empty file. pacman removes that file and reads the signature as absent, with no pause. `PACMAN_OCI_EMPTY_SIG=0` turns this answer off.
 
@@ -157,6 +160,12 @@ A target is one repository of one architecture. The table comes from `targets/*.
 | loong64 | extra | Arch Linux for Loong64 (LCPU) | archlinux-keyring, archlinux-lcpu-keyring | `loong64/extra` |
 | riscv64 | core | Arch Linux RISC-V | archlinux-keyring | `riscv64/core` |
 | riscv64 | extra | Arch Linux RISC-V | archlinux-keyring | `riscv64/extra` |
+| powerpc64le | base | ArchPOWER | archpower-keyring | `powerpc64le/base` |
+| powerpc64le | base-any | ArchPOWER | archpower-keyring | `powerpc64le/base-any` |
+| powerpc64 | base | ArchPOWER | archpower-keyring | `powerpc64/base` |
+| powerpc64 | base-any | ArchPOWER | archpower-keyring | `powerpc64/base-any` |
+| powerpc | base | ArchPOWER | archpower-keyring | `powerpc/base` |
+| powerpc | base-any | ArchPOWER | archpower-keyring | `powerpc/base-any` |
 
 pacman checks each package against the keyring of its distribution. A consumer needs that keyring in its own pacman keyring. The badges show which targets have a promoted snapshot.
 
@@ -192,7 +201,7 @@ pacman checks each package against the keyring of its distribution. A consumer n
 
 1. Write `targets/<arch>-<repo>.conf`, where `<arch>` is pacman's `$arch`. Use `key = value` lines and `#` comments.
 2. Run `tests/run.sh static 60-targets`.
-3. Make sure `sync.yml` has a plan upload slot for each enabled target. There are 16 slots.
+3. Make sure `sync.yml` has a plan upload slot for each enabled target. There are 21 slots.
 4. Start a run for the target: `gh workflow run sync.yml -f targets=<arch>-<repo>`.
 
 | key | count | grammar | meaning |

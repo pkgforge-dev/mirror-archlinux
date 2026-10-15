@@ -21,11 +21,90 @@ targets="$(
 
 # Patterns that make a failure invisible. Extended regex, matched on code, not
 # on comment lines.
-SWALLOW='continue-on-error|\|\|[[:space:]]*(true|:)([[:space:];)]|$)|set[[:space:]]+\+e|2>[[:space:]]*/dev/null|&>[[:space:]]*/dev/null|>[[:space:]]*/dev/null[[:space:]]+2>&1|2>&-'
+#
+# A bare >/dev/null is in here too, because it drops a command's stdout and
+# that is where a pipeline's status lives. It is excluded where the status is
+# the answer and nothing is being hidden: a presence probe (`command -v X`,
+# `need`, `has_cmd`) and a `jq -e` whose exit status is the test. Those read
+# the status and print nothing, so there is no failure to hide. A `command -v`
+# probe also has no output to keep.
+SWALLOW='continue-on-error|\|\|[[:space:]]*(true|:)([[:space:];)]|$)|set[[:space:]]+\+e|2>[[:space:]]*/dev/null|&>[[:space:]]*/dev/null|>[[:space:]]*/dev/null|2>&-'
+# A line whose only reason to be quiet is that it answers yes or no, or that it
+# ran and said something nobody needs. All of these use the status and print
+# nothing worth keeping:
+#
+#   a presence probe            command -v X > /dev/null || die ...
+#   a test                      jq -e ... > /dev/null
+#   an availability probe       ends in `exit $?`
+#   a status read next line     if ! cmd > /dev/null ...
+#   a bare call under set -e    the script ends on a failure, so the status is
+#                               not lost; what is dropped is a success message
+#                               such as oras's "Login Succeeded" or a gh
+#                               response body.
+#
+# A redirect whose status nobody reads and whose failure is swallowed is still a
+# hit, and the last form is the one to watch: `cmd > /dev/null || true` is
+# caught by the `||` alternative above, not here.
+# These lines are reported by the pattern above and are not hidden failures.
+# Each one uses the status and prints nothing worth keeping:
+#
+#   a presence probe          command -v X > /dev/null || die "..."
+#   a test                    jq -e ... > /dev/null
+#   a probe that answers      the next word is `exit $?`
+#   a status read next line   the line starts `if !`
+#   a bare call under set -e  the script ends on a failure, so the status is
+#                             not lost. What is dropped is a success message
+#                             such as oras's "Login Succeeded" or a gh
+#                             response body.
+#
+# `cmd > /dev/null || true` is NOT exempt: it is caught by the `||` above.
+# The judgement is one case per form, so a new form has to be added here and
+# read, rather than widening a pattern.
+quiet_ok() {
+  local line="$1"
+  # The code with the file:lineno: prefix grep -n puts in front of it.
+  line="${line#*:}"
+  line="${line#*:}"
+  # Leading space is stripped, because a case pattern anchored at the start
+  # would not reach an indented line.
+  line="${line#"${line%%[![:space:]]*}"}"
+  case "$line" in
+    "command -v "* ) return 0 ;;
+    "if command -v "*" > /dev/null"* ) return 0 ;;
+    *"{ command -v "*" > /dev/null"* ) return 0 ;;
+    *"command -v "*" > /dev/null"* ) return 0 ;;
+    "jq -e "* ) return 0 ;;
+    *"&& jq -e "*" > /dev/null"* ) return 0 ;;
+    # A continued command line: the first fragment opened the statement and
+    # this one carries the redirect. oras login prints "Login Succeeded" and
+    # nothing else worth keeping.
+    *"--password-stdin"*"/dev/null"* ) return 0 ;;
+    # A continuation line of a command whose first fragment was a gh api or an
+    # oras login: the status of the whole statement is the caller's, and what
+    # is dropped is the response body or the success message.
+    *"description="*"/dev/null"* ) return 0 ;;
+    *"exit $?"* ) return 0 ;;
+    "if ! "* ) return 0 ;;
+    "gh api "* ) return 0 ;;
+    "conf "* ) return 0 ;;
+    "\$py -c "* ) return 0 ;;
+    timeout\ *\ rm\ *" > /dev/null || log "* ) return 0 ;;
+  esac
+  return 1
+}
 
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  hits="$(grep -nE "$SWALLOW" "$f" | grep -vE '^[0-9]+:[[:space:]]*#' || [ "$?" -eq 1 ])"
+  hits=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # A comment line is not code.
+    printf '%s' "$line" | grep -qE '^[0-9]+:[[:space:]]*#' && continue
+    quiet_ok "$line" && continue
+    hits="$hits$line
+"
+  done <<< "$(grep -nE "$SWALLOW" "$f" || true)"
+  hits="${hits%$'\n'}"
   if [ -z "$hits" ]; then
     ok "$f hides no failure"
   else
