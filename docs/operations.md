@@ -7,7 +7,7 @@ This document tells what runs by itself, which issues the automation raises and 
 | workflow | triggers | does |
 | --- | --- | --- |
 | `sync.yml` | cron `17 */3 * * *`, dispatch | plan, one chain per pending target (`sync-target.yml`), report, keepalive |
-| `sync-target.yml` | called by `sync.yml` | mirror, stage, verify, promote (on `main`), summary, for one target |
+| `sync-target.yml` | called by `sync.yml` | mirror, stage, verify, promote (on `main`), summary and the index ([below](#the-index-of-a-ref)), for one target |
 | `status.yml` | cron `47 * * * *`, dispatch, and `report` after each sync on `main` | measures the mirror and the Worker, renders the site, pushes branch `status`, deploys Pages, raises or clears `worker-down` |
 | `watchdog.yml` | cron `41 7 * * *`, dispatch | staleness and schedules |
 | `ci.yml` | push to `main`, pull request (not to `status`), dispatch | the test suites |
@@ -182,9 +182,36 @@ A sync run can be run again from its page. The two choices do not do the same th
 
 ⚠ A new run reads upstream again and leaves nothing of an earlier run behind. Prefer `gh workflow run sync.yml --ref main` to "Re-run all jobs".
 
+A new run also reads the index that the runs before it wrote. So it mirrors only the files that no earlier run of the ref left on the registry ([design.md](design.md#the-index-of-a-ref)).
+
+⚠ "Re-run failed jobs" of an older run can come after a newer run wrote the index. Its mirror jobs then write no tag that the live index lists: each such file is `failed`, `the index lists it`. Its summary job keeps the newer index, with the warning `... is kept, and this run's rows are not pushed`.
+
 ### The plan's budget
 
-The plan job reads every target's databases from upstream, one target after another, in one job of 30 minutes. `scripts/plan` ends its upstream reads within `PLAN_BUDGET` seconds (1200). Each target gets what is left of the budget, divided by the targets not yet read. A target whose upstream does not answer in time is in error for that run, and its row in the run's table names `PLAN_BUDGET`. The next run reads it again. A target that stays in error raises `stale-<target>` after the tolerance.
+The plan job reads every target's databases from upstream, one target after another, in one job of 40 minutes. `scripts/plan` ends its upstream reads within `PLAN_BUDGET` seconds (1200). Each target gets what is left of the budget, divided by the targets not yet read. A target whose upstream does not answer in time is in error for that run, and its row in the run's table names `PLAN_BUDGET`. The next run reads it again. A target that stays in error raises `stale-<target>` after the tolerance.
+
+The registry reads of the plan end within `REGISTRY_READ_BUDGET` seconds (240) in all: the index of each target, the `latest` database of `keyring_from`, and the siblings. A read that is not made costs work, not safety: the index is `unread`, and the target plans as with no index.
+
+### The index of a ref
+
+Each target has an index tag per ref: `index` for `main`, `index-<branch>` for another branch. `scripts/index-write` writes it at the end of each chain, also after a failure or a cancel. The next run mirrors only what no earlier run left, and verifies only what no earlier run verified under the same verify context. Nothing waits on a person.
+
+| warning | means | do |
+| --- | --- | --- |
+| `... did not read; this run plans as with no index, and writes none` | plan got no answer that decides for the index | nothing: the next run reads it again |
+| `... is not a valid index; it is not used, and this run writes a new one` | the tag holds something that is not an index of format 1 | nothing: the run replaces it |
+| `... is kept, and this run's rows are not pushed` | the live index is not the one plan read: a newer run wrote it | nothing: the next run plans from it |
+| `scripts/index-write ended N` (summary job) | the index of the target is not written this run | nothing: the next run plans from the index there now |
+| `could not withdraw N index row(s) before their tags are written` (the target's why, state error) | plan could not push the index without the rows of the files it plans | read the plan log; the next run tries again |
+
+Reset the index of every target of a ref with the dispatch input `ignore_index`. Nothing is deleted. plan does not read the index, so the run mirrors every file that is not promoted, and verifies every file that is new since the promoted database. index-write then replaces the index.
+
+```bash
+gh workflow run sync.yml --ref main -f ignore_index=true
+gh workflow run sync.yml --ref main -f ignore_index=true -f targets='x86_64-extra'
+```
+
+⛔ The workflows delete no tag. A person who deletes a package tag by hand must then run one sync with `ignore_index`. Until then the index still vouches for the tag, and plan does not mirror the file again. ⚠ This does not bring back the tag of a promoted file: plan skips a file that `latest` names with the same record, index or not. A deleted index tag needs nothing: plan finds none, and the run writes the first one.
 
 ### An upstream that blocks
 

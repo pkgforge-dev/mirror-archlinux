@@ -3,15 +3,19 @@
 # pacman through the wrapper, promote), then one report.
 #
 # ⛔ A database reaches latest only after every file it names is on the
-# registry and every file new since the promoted database has passed pacman's
-# own checks through the wrapper. Targets are independent: each runs its own
-# chain, and a slow or held target never delays or holds another.
-# docs/design.md has the whole design.
+# registry. Every file new since the promoted database must also have passed
+# pacman's own checks through the wrapper: in this run, or in an earlier run
+# of the same ref, for the same database record and the same verify context
+# (the index of the ref, scripts/index-write). A tag that a row of the index
+# vouches for is not written until plan withdraws the row. Targets are
+# independent: each runs its own chain, and a slow or held target never
+# delays or holds another. docs/design.md has the whole design.
 #
 # promote runs only on main. A run from any other branch does everything else,
-# writes only write-once package tags and its own staging-<branch> tag, and
-# never moves latest. Runs from every branch share one concurrency group, so
-# two runs never write the same tags at once.
+# writes only write-once package tags (it repairs no signature layer), and
+# its own staging-<branch> and index-<branch> tags, and never moves latest.
+# Runs from every branch share one concurrency group, so two runs never write
+# the same tags at once.
 #
 # A re-run: "Re-run failed jobs" keeps the plan and its artifacts. "Re-run all
 # jobs" plans again under a new plan id; a download by name or pattern still
@@ -54,6 +58,10 @@ on:
         description: Targets whose upstream may go back to older builds this run (comma separated)
         type: string
         default: ''
+      ignore_index:
+        description: Do not read the index of each target; this run writes a new one (docs/operations.md)
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -81,12 +89,15 @@ env:
 jobs:
   plan:
     runs-on: ubuntu-24.04
-    # 20 min of plan reads (PLAN_BUDGET), plus the fetcher client install and the
-    # keyring image pulls for the powerpc targets, fit under 40.
+    # 20 min of upstream reads (PLAN_BUDGET) and 4 min of registry reads
+    # (REGISTRY_READ_BUDGET), plus the fetcher client install and the keyring
+    # image pulls for the powerpc targets, fit under 40.
     timeout-minutes: 40
+    # packages: write, because plan withdraws from a target's index the rows
+    # of the files this run writes tags of (scripts/plan step 6b).
     permissions:
       contents: read
-      packages: read
+      packages: write
     outputs:
       targets: ${{ steps.plan.outputs.targets }}
       has_targets: ${{ steps.plan.outputs.has_targets }}
@@ -136,7 +147,14 @@ jobs:
           REGISTRY_TOKEN: ${{ github.token }}
           TARGETS: ${{ inputs.targets }}
           ALLOW_OLDER: ${{ inputs.allow_older }}
+          IGNORE_INDEX: ${{ inputs.ignore_index }}
         run: |
+          # The index tag comes from GITHUB_REF (scripts/lib.sh index_tag).
+          # ignore_index is the reset: nothing is deleted, and the index this
+          # run writes replaces the one there.
+          if [ "$IGNORE_INDEX" = true ]; then
+            export INDEX_READ=0
+          fi
           args=()
           for t in $TARGETS; do
             case "$t" in

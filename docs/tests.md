@@ -22,19 +22,20 @@
 | `static/70-python.sh` | every python file compiles; every file in `client/` and `scripts/` is shell or python |
 | `static/72-test-runner.sh` | `tests/run.sh` finds the files, runs one file, gates a live test, and fails a failed run |
 | `static/75-renovate.sh` | Renovate can move every image pin, and merges only what CI can judge |
-| `unit/10-tag-encoding.sh` | every package file maps to one tag, and no two files share one |
+| `unit/10-tag-encoding.sh` | every package file maps to one tag, and no two files share one; no package tag is `latest`, a date, `staging`, `staging-<slug>`, `index` or `index-<slug>` |
 | `unit/20-json-parser.sh` | the JSON parser reads every legal shape and refuses anything else |
 | `unit/30-wrapper-urls.sh` | one manifest request per URL; a URL it cannot read is refused before the network |
 | `unit/31-run-store.sh` | the run store: key, ownership, sweep, remover, host blacklist, the run's anonymous token |
 | `unit/32-prefetch-plan.sh` | the argument rewrite, the print lines, the signatures written from `%g`, the size of a held `.part` |
-| `unit/40-lib.sh` | the decisions of the sync on fixed inputs |
-| `unit/42-registry-faults.sh` | `stage`, `promote`, `mirror-file` and `verify-batch` against stand-ins for curl, oras and the container runtime: a registry or an image source that fails, refuses or limits them |
+| `unit/40-lib.sh` | the decisions of the sync on fixed inputs; also the tags of a ref (`staging_tag`, `index_tag`), the verify context, `registry_blob_probe` and `results_of_plan` |
+| `unit/42-registry-faults.sh` | `stage`, `promote`, `mirror-file`, `verify-batch` and `index-write` against stand-ins for curl, oras and the container runtime: a registry or an image source that fails, refuses or limits them; the files stage verifies and its smallest canary; the files at fault of a failed batch; the rows, the verify credit and the writer guard of `index-write`; the re-run guard (`index_guard`); the registry sources of `mirror-file`, and `MIRROR_REPAIR` |
 | `unit/45-dispatch-overdue.sh` | `scripts/dispatch-overdue` starts a workflow only when it is active and overdue |
 | `unit/60-status.sh` | `status-collect`, `status-render` and `check-staleness` on fixtures, also with one registry read that fails and with no registry read at all; `check-staleness` within `STALENESS_BUDGET` and `status-collect` within `STATUS_BUDGET`, against a local `db_server` that never answers; both against a first `db_server` that is behind the second, and one that answers 200 with an HTML page; the Worker probe through to the signed URL (one that answers 403, a working host outside `githubusercontent.com`), and the database downloaded through the Worker; the synced badge, the times and the one script of the page, and the size table and badges |
 | `unit/62-issues.sh` | the scripts that raise and clear issues, against a stand-in for `gh` (`tests/fixtures/issues/fake-gh`): `check-status-record`, `check-status-site`, `watch-schedules`, and `report` for `refused-<target>` |
 | `unit/70-plan.sh` | `scripts/plan` on a signed repository: `<repo>.db.sig` and `<repo>.files.sig` are checked with `gpgv` against the keyring files (`PLAN_KEYRING_DIR`) before the database is used; a signature of a key the keyring does not hold, a signature of another file, and a database changed after it was signed each put the target in error |
+| `unit/71-plan-index.sh` | `scripts/plan` with the index of a ref, against a curl stand-in and an oras stand-in: which files it mirrors, verifies and vouches for; the index states `absent`, `unread`, `invalid`, `ignored` and a private index; the withdrawal of index rows before their tags are written; the registry sources of a todo file; one upstream read per URL in a plan; `index_read` and `index_push` alone |
 | `unit/80-fetchers.sh` | `fetchers/fetcher.sh` against a curl stand-in and faked curl-impersonate, node and venv-python clients: client selection, the per-host fallback order, the structural, `--sha256`, `--max-bytes`, `--header` and `--referer` checks, the HTML refusal, the retry backoff, the availability cache, the deadline, the dispatch of each client to its own program, `fetchers/self-check.sh`, `fetchers/install.sh --check`, the curl-impersonate asset choice, `fetchers/ci.sh` and `fetchers/drift.sh` |
-| `integration/10-pipeline.sh` | the whole mirror against its own registry and upstream |
+| `integration/10-pipeline.sh` | the whole mirror against its own registry and upstream, each chain ending in `index-write` as the `summary` job does |
 | `integration/20-client.sh` | the wrapper against its own registry, through faulty proxies |
 | `worker/10-node.sh` | `node --test 'worker/test/*.test.js'` |
 | `worker/live.sh` | a smoke test of the deployed Worker; only with `WORKER_LIVE=1` |
@@ -89,12 +90,13 @@ A test that needs a tool can call `need_tool NAME DESC` (`tests/lib/harness.sh`)
 TESTS_REQUIRE_TOOLS='shellcheck actionlint jq python3' tests/run.sh static
 ```
 
-`50-workflow-policy.sh`, `70-python.sh`, `75-renovate.sh`, `45-dispatch-overdue.sh` and `62-issues.sh` use `need_tool`. The static, unit and worker jobs of CI set `TESTS_REQUIRE_TOOLS`. The integration job does not.
+`50-workflow-policy.sh`, `70-python.sh`, `75-renovate.sh`, `45-dispatch-overdue.sh`, `62-issues.sh` and `71-plan-index.sh` use `need_tool`. The static, unit and worker jobs of CI set `TESTS_REQUIRE_TOOLS`. The integration job does not.
 
 ⚠ Other tests handle an absent tool in their own way:
 
 - `10-shellcheck.sh`, `20-actionlint.sh` and `worker/10-node.sh` fail when their tool is absent.
 - Parts of `30-wrapper-urls.sh` and `31-run-store.sh` (dash), `40-lib.sh` and `60-status.sh` (GNU tar, git, python3) and `40-executable-bits.sh` (git) print a plain `ok` line that says they skipped. `TESTS_REQUIRE_TOOLS` does not turn these into failures.
+- `71-plan-index.sh` skips as a whole, with one `# SKIP` line, when `tar` is not GNU tar.
 - So the `bash-gawk` and `busybox` unit legs pass with parts of `60-status.sh` skipped.
 
 ### Integration options
@@ -160,6 +162,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/10-tag-encoding | a literal `_` before `p`, `c`, `a` or `u` is no longer escaped | not ok: `tag of a_pb-1-1-any.pkg.tar.zst` |
 | unit/10-tag-encoding | upper case kept in tags, which GHCR folds together | not ok: `a name outside the mapping hashes: lshw-B.02.20-3-x86_64.pkg.tar.zst` |
 | unit/10-tag-encoding | the 128-character tag limit off by one | not ok: `a name of 129 characters is hashed` |
+| unit/10-tag-encoding | the hash form `index-<hex>` in place of `fn-<hex>` | 10 not ok, among them `real: no package tag is a reserved database tag`. The test of before the index tags gives 9 not ok, and passes that one |
 | unit/20-json-parser | an escaped newline or tab accepted in a JSON string | not ok: `refused: an escaped newline, which could forge an output line` |
 | unit/20-json-parser | data after the JSON document ignored | not ok: `refused: trailing data` |
 | unit/30-wrapper-urls | an uncompressed `.pkg.tar` read as a database | not ok: `an uncompressed package` |
@@ -284,6 +287,54 @@ The tree itself is never changed. An integration fault runs with its own registr
 | unit/40-lib | `scripts/lib.sh` `registry_token_get` with `--max-time 60` and no whole-call deadline | 3 not ok: `registry_token: the token request gets REG_TOKEN_MAX_TIME, ...` (got `60 none`), `registry_token: a token endpoint that stalls is given up within REG_TOKEN_MAX_TIME, and gives no token` (after 60 s, the length of the fake's stall), and `... a REG_TOKEN_MAX_TIME that is not a number of seconds is refused` (accepted) |
 | unit/42-registry-faults | `scripts/verify-batch` of before the image mirrors | 5 not ok, among them `verify-batch: Docker Hub's pull limit: the digest comes from the first mirror, and the container runs it` (exit 1, verdict `could not pull ... in two attempts of 300 s`) and `verify-batch: a pull limit is not asked again: one pull from Docker Hub, one from the mirror` (two pulls from Docker Hub) |
 | static/60-targets | five edits in a copy: a `docker.io` keyring image, a removed `# tag: aarch64`, another verify digest, renamed plan slots, a `keyring_from` that does not exist | one not ok for each edit, among them `every target verifies in the one image, on linux/amd64` |
+| unit/42-registry-faults | `mirror-file` does not ask the target's own repository on a repush | not ok: `mirror-file: a repush reads the package from the target's own repository, with no upstream request` (got `pushed from https://up.test/core/os/x86_64`, 1 upstream request) |
+| unit/42-registry-faults | `mirror-file` reads `sources.tsv` beside the shard file, not one level up | 7 not ok, among them `mirror-file: the sibling plan names gives the package, with no upstream request; MIRROR_REPAIR=0 stops no push` |
+| unit/42-registry-faults | `mirror-file` takes status 4 of `registry_blob_probe` for an error | not ok: `mirror-file: a sibling that answers 404 is a quiet miss: not marked down, no line names it, and upstream gives the package`, `mirror-file: a sibling that answers 404, and every server 404: absent` (got `failed`) |
+| unit/42-registry-faults | no `throttle_pause` on status 5 | not ok: `mirror-file: a sibling that answers 429 pauses the shard, is not marked down, and the next sibling gives the package` (got no pause) |
+| unit/42-registry-faults | the down mark of a repository is not read | not ok: `mirror-file: a sibling marked down is not asked again by the shard` (got 1 read) |
+| unit/42-registry-faults | the down mark of a repository written under `down_mark`'s host key | 3 not ok, among them `mirror-file: a sibling marked down is not asked again by the shard` |
+| unit/42-registry-faults | the absent rule ignores a registry source that failed | not ok: `mirror-file: a sibling that answers 503, and every server 404: failed, not absent, naming the sibling` (got `absent`) |
+| unit/42-registry-faults | the `MIRROR_REPAIR` check removed | not ok: `mirror-file: MIRROR_REPAIR=0 refuses a repush: failed, with no push, no blob read and no upstream request` (got `pushed`) |
+| unit/42-registry-faults | the check of `index-listed.txt` removed | not ok: `mirror-file, a re-run: a file the live index lists gets no tag, and nothing is read for it` |
+| unit/42-registry-faults | the whole re-run guard of `mirror-file` removed | 2 not ok: the case above, and `mirror-file, a re-run: with the live index unread, no tag is written, and the result says why` |
+| unit/42-registry-faults | upstream also read after a registry source gave the bytes | 5 not ok, among them `mirror-file: a repush reads the package from the target's own repository, with no upstream request` |
+| unit/42-registry-faults | every file counts as listed when the list has a line | not ok: `mirror-file, a re-run: a file the live index does not list is pushed` (got `failed the index lists it`) |
+| unit/42-registry-faults | the unread check placed before the decision | not ok: `mirror-file, a re-run: with the live index unread, a tag that holds its file is present` (got `failed`) |
+| unit/42-registry-faults | `index_listed` lists every row, not the `m` rows | not ok: `index_guard: one read of the live index lists its m rows, sorted, and no a row` |
+| unit/42-registry-faults | `index_guard` writes an empty list when the read fails | 6 not ok, among them `index_guard: a live index that answers 503 is asked 3 times, and is unread` and `mirror-file, a re-run: with the live index unread, no tag is written, and the result says why` |
+| unit/42-registry-faults | an absent index tag taken for a read that failed | not ok: `index_guard: no index tag lists no file` |
+| unit/42-registry-faults | the artifact type check of `index_listed` removed | not ok: `index_guard: a live tag that is not an index of format 1 is unread` |
+| unit/42-registry-faults | the `INDEX_TAG` grammar check of `index_guard` removed | not ok: `index_guard: an INDEX_TAG that is not index or index-<slug> is unread, with no read` (got 3 reads, and a list) |
+| unit/42-registry-faults | one manifest try in `index_listed`, not 3 | not ok: `index_guard: a live index that answers 503 is asked 3 times, and is unread` |
+| unit/42-registry-faults | the `TARGET` check of `index_guard` removed | not ok: `index_guard: a TARGET that is not a target name is unread, with no read` (got no reason) |
+| unit/71-plan-index | todo is `!P`, not `!(P or I)`: the index does not spare a mirror | 9 not ok, among them `matrix: todo is what is not promoted or indexed, absent upstream, or signed now` (3 files too many) |
+| unit/71-plan-index | the withdrawal of step 6b turned off | 5 not ok, among them `matrix: the rows of the todo files are withdrawn: one push of the index` (got 0) and `withdrawal: a push that fails puts the target in error` (got `pending`) |
+| unit/71-plan-index | an index that reads only with the token does not make the package private | 5 not ok, among them `private: the index reads only with the token: ok, and PRIVATE=1` and `private: nothing to mirror, one file to verify: pending with no shard` (got 3 files to mirror: step 4b read the tags with no token) |
+| unit/71-plan-index | the fetch cache keeps nothing | 2 not ok: `fetch cache: base-any.files, its signature and the database's are read once for both targets` (got 2 reads of each), `fetch cache: the .sig of a package that both targets ask again is read once` |
+| unit/71-plan-index | a disabled target counts as a sibling | not ok: `sources: a todo file whose bytes the latest or the index of a sibling holds names it; other bytes, state a and a disabled target do not` |
+| unit/71-plan-index | V with no check of the verify context | not ok: `context: another verify context verifies every indexed file again` (2 files not verified) |
+| unit/71-plan-index | `index_read` keeps both lines of a filename given twice | 2 not ok: `index_read: 2 of 201 lines dropped (a filename twice) is ok, with 199 rows and no b7` (got 201 rows), `index_read: 3 of 202 lines dropped is more than 1%: invalid` (got `ok`) |
+| unit/40-lib | the slug of a branch not cut to 40 characters | not ok: `tags: a 60-character name stops at 40 characters, with no - at the end` |
+| unit/40-lib | the comments of the target file counted in the verify context | not ok: `verify context: an edit of the comments and blank lines of the target file does not change it` |
+| unit/40-lib | `registry_blob_probe` takes `BLOB_UNKNOWN` for an error | not ok: `registry_blob_probe: 404 BLOB_UNKNOWN is 4, with no line` (got 1, with a line) |
+| unit/40-lib, unit/42-registry-faults | `results_of_plan` reads the results of every plan | 2 not ok in 40-lib, among them `results_of_plan: the results.tsv and the lines of this plan, and nothing of another plan`; 4 not ok in 42, among them `index-write: the rows: the vouched files, the files pushed or present, the files absent upstream; no other plan's result` (got the row of n6) |
+| unit/42-registry-faults | stage verifies `todo.tsv`, not `new.tsv` | 2 not ok, among them `stage: the files to verify are new.tsv less the files absent upstream, and the canary` (got `a c`) |
+| unit/42-registry-faults | the smallest canary taken with no read of its tag | 3 not ok, among them `stage: the smallest canary is the smallest file whose tag holds its bytes` (got `b`) |
+| unit/42-registry-faults | the files at fault keep the upstream-refused file | not ok: `verify-batch: a failed batch names its files at fault: the @@sigbad file and the refused one, not the upstream-refused one` (got `c` too) |
+| unit/42-registry-faults | `verdict` does not write `faults-TARGET-BATCH.txt` | 3 not ok, among them `verify-batch: the EXIT trap writes the files at fault so far` |
+| unit/42-registry-faults | the writer guard of `index-write` without its rule a (the live index is the one plan read) | 5 not ok, among them `index-write: the live index is the one plan read: one push of the index` (got 0 pushes) |
+| unit/42-registry-faults | the writer guard lets any live index through | 3 not ok: `index-write: a live index that is not the one plan read is kept, with a warning`, `index-write: a live tag that does not read is kept`, `index-write: plan found no index, and one is live now: kept` |
+| unit/42-registry-faults | `index-write` keeps the rows of the files at fault | 3 not ok, among them `index-write: the rows: the vouched files, the files pushed or present, the files absent upstream; no other plan's result` (got the row of n4) |
+| unit/42-registry-faults | `index-write` writes when plan did not read the index | not ok: `index-write: an index plan did not read is not read or written` |
+| unit/42-registry-faults | `index-write` counts verdicts about another staged digest | 56 of 56 passed: no test held it. With the case added: not ok `index-write: verdicts about another staged digest give no verify credit and remove no file at fault` (n2 and n3 got verified 1, and the row of n4 went) |
+| unit/42-registry-faults | `index-write` takes no unsigned flag from the result | 3 not ok, among them `index-write: verify credit: the files of a passed batch get verified 1; unsigned comes from the result` (got `n7 m 0 0`) |
+| integration/10-pipeline | `index-write` writes no row for a file pushed or present | 14 not ok, among them `held by the mirror: the index names the 2 files the run pushed, not verified` (got no row) and `the next run mirrors only the file that held the target, verifies all 3, and promotes` (it mirrored all 3) |
+| integration/10-pipeline | plan verifies its todo files only, not the indexed files that are not verified | 5 not ok, among them `the next run mirrors nothing, verifies the file of the failed batch, and has no shard` (new.tsv empty) and `it verifies that file and the canaries only, and promotes` (got the canary alone: beta_pc was promoted with no verify) |
+| integration/10-pipeline | `mirror-file` writes the tag of a file that the live index lists | 2 not ok: `run A's shard, run again as attempt 2, does not write the tag of a file the index lists`, `alpha's tag keeps the signature run B wrote` (the tag moved) |
+| integration/10-pipeline | `index-write` keeps the rows of the files at fault | 4 not ok, among them `index-write drops the row of the file at fault` and `alpha's signature layer is its %PGPSIG% again, with the same package blob, and the target is promoted` (the next run mirrored nothing; verify failed again, and nothing was promoted) |
+| integration/10-pipeline | `mirror-file` does not ask the target's own repository on a repush | not ok: `the next run mirrors alpha alone, with the package blob from its own repository` (got `pushed from http://127.0.0.1:<port>/x86_64/test-tamper`) |
+| integration/10-pipeline | the writer guard of `index-write` lets any live index through | 2 not ok: `run A's index-write ends 0, and keeps the index of run B` (the tag moved), `run A's index-write says that it keeps the live index` |
+| integration/10-pipeline | `index_push` titles the database layer of the index `<repo>.db`, not `ref.db` | 13 not ok, among them `a Server line at :index: the wrapper gives no test.db` (exit 0: the wrapper served the layer) and `run A plans alpha, signed again, and first withdraws its row from the index` (the index read as invalid). ⚠ 7 of the 13 come from the first verify of x86_64-test, which ended before its verdict with 3 runs on one host; the fault does not reach that step |
 
 ### status
 
@@ -387,7 +438,9 @@ The tree itself is never changed. An integration fault runs with its own registr
 | worker/test (ghcr) | a refusal of the kept token returned as is | not ok: `a kept token that GHCR refuses is replaced once; with no new token the 502 names the kept token` |
 | worker/test (ghcr) | the 502 names `Bearer QQ==` when the kept token was refused | not ok: `a kept token that GHCR refuses is replaced once; with no new token the 502 names the kept token` |
 | worker/test (ghcr) | the 64 KiB byte cap removed | not ok: `a manifest over 64 KiB with no or a false content-length is cut at 64 KiB` |
-| worker/test (paths) | `TAG_RE` accepts every tag | not ok: `any other tag gets 404 with no subrequest, staging included` |
+| worker/test (paths) | `TAG_RE` accepts every tag | not ok: `any other tag gets 404 with no subrequest, staging and index included` |
+| worker/test (paths) | `TAG_RE` accepts `index` | not ok: `any other tag gets 404 with no subrequest, staging and index included` |
+| worker/test (paths) | `TAG_RE` accepts `index-` and letters | not ok: the same test, on `x86_64/core:index-wip` |
 | worker/test (paths) | no `decodeURIComponent` | not ok: `a percent-encoded file name is decoded before its tag is made` |
 | worker/test (paths) | HEAD answered with the GET body | not ok: `HEAD gets the same answer as GET, with no body` |
 | worker/test (tags) | the `_u` escape only for `p`, `c`, `a` | not ok: `tagOf matches client/pacman-oci --tags for every name in tests/fixtures/filenames.txt` |
@@ -395,7 +448,7 @@ The tree itself is never changed. An integration fault runs with its own registr
 | worker/10-node | a node shim that reports v20.18.0 | not ok: `node is 22 or newer` |
 | worker/live | run against the deployed version 1 | 3 of 28 not ok: `:staging` gets 302, `%2B` gets 404 |
 
-74 faults, each applied alone to a copy of `worker/`, were each caught. Every one of the 59 node tests was seen to fail at least once.
+76 faults, each applied alone to a copy of `worker/`, were each caught. Every one of the 59 node tests was seen to fail at least once.
 
 ### policy and tools
 
@@ -475,6 +528,11 @@ These are not code faults. They are hostile or broken inputs, built by `tests/fi
 | with no `%PGPSIG%`, a signature layer that is not upstream's `.sig`, written after stage | verify fails: the mirror is at fault |
 | with no `%PGPSIG%`, a `.sig` that upstream makes again, the database the same | planned alone; its layer repaired with the same package blob; promoted |
 | more `.sig` files made again in one sample than `SIGCHECK_ESCALATE` | every file with a detached signature only is planned, with a warning |
+| a run that a `db_server` with no answer holds for one file | the index names the files it pushed; the next run mirrors only that file, verifies all of them, and promotes |
+| a batch that fails with no file at fault: its `VERIFY_BUDGET` ends before its container starts | the index keeps the verify credit of the batches that passed; the next run mirrors nothing, verifies the file of that batch and the canaries, and promotes |
+| a signature layer changed on the registry after the stage, under a file the index names | verify names the file at fault, and its row goes; the next run repairs the layer with the package blob of its own repository, and promotes |
+| the mirror job and `index-write` of an older run, run again after a newer run wrote the index | the re-run writes no tag that the index lists; the newer index is kept |
+| a Server line at `:index` | the wrapper gives no database |
 | a manifest whose bytes are not the pinned digest | refused by the wrapper |
 | a manifest with two layers of one name | refused by the wrapper |
 | a package manifest with no signature layer | refused by the wrapper, with a message |

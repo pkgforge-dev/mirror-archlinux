@@ -124,10 +124,12 @@ check_set() {
   check "$label: no tag carries upper case" 0 "$(cut -f 2 "$pairs" | awk '/[A-Z]/ { n++ } END { print n + 0 }')" \
     "client/pacman-oci --tags < $names | cut -f 2 | grep '[A-Z]'"
 
+  # The database tags: latest, the dates, staging and staging-<slug>, and the
+  # index of a ref, index and index-<slug> (scripts/lib.sh index_tag).
   local reserved
-  reserved="$(cut -f 2 "$pairs" | awk '/^(latest|staging)$/ || /^[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]$/ { n++ } END { print n + 0 }')"
+  reserved="$(cut -f 2 "$pairs" | awk '/^(latest|staging|index)$/ || /^(staging|index)-[a-z0-9]+(-[a-z0-9]+)*$/ || /^[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]$/ { n++ } END { print n + 0 }')"
   check "$label: no package tag is a reserved database tag" 0 "$reserved" \
-    "client/pacman-oci --tags < $names | cut -f 2 | grep -E '^(latest|staging|[0-9.]{10})\$'"
+    "client/pacman-oci --tags < $names | cut -f 2 | grep -E '^(latest|staging|index|(staging|index)-[a-z0-9-]+|[0-9.]{10})\$'"
 }
 
 synthetic > "$work/synthetic.txt"

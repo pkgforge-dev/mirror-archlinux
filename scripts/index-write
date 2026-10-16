@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+#
+# Write the index of one target (scripts/lib.sh, "The index of a ref"): what
+# this run left on the registry, so that the next run does not do it again.
+#
+#   scripts/index-write PLAN RESULTS STAGE VERIFY TARGET
+#
+# PLAN is scripts/plan's output (at least PLAN/TARGET). RESULTS holds the
+# target's mirror shard outputs at any depth (lib.sh results_of_plan). STAGE
+# is scripts/stage's output, VERIFY holds the verdicts of scripts/verify-batch
+# at any depth. STAGE and VERIFY may be empty or missing: a chain that stopped
+# early still leaves the files it mirrored.
+#
+# Nothing is written for a target that the plan did not mark pending, or
+# whose index plan did not read (INDEX_STATE unread, a warning).
+#
+# The rows, one per file, sorted by filename: filename state verified unsigned.
+#   each line of PLAN/TARGET/vouched.tsv: state m, with its flags
+#   each todo file with the result pushed or present: state m, verified 0,
+#     unsigned 1 when the detail starts "unsigned: "
+#   each todo file with the result absent: state a, 0, 0
+# A todo file with another result, or with none, gets no row. Only the
+# results of this plan count (PLAN/TARGET/plan-id), one per todo file, as
+# scripts/stage counts them.
+#
+# Verify credit, only when STAGE/TARGET is staged from this plan. For each
+# batch of STAGE/TARGET/batches, the first verify-TARGET-N.tsv under VERIFY
+# (as scripts/promote reads it), when it is about the staged DIGEST:
+#   passed  the m rows of the files of the batch get verified 1
+#   failed  the m rows of the files in faults-TARGET-N.txt beside the verdict
+#           go, so the next run reads their tags again. A failed batch with
+#           no such file changes nothing: its rows keep verified 0.
+# Any other verdict, or none, changes nothing.
+#
+# ⛔ The writer guard. Just before the push, the live index tag is read with
+# the workflow's token. The push goes ahead only when one of these holds:
+#   a. the live manifest is the one plan read, or the one its withdrawal
+#      pushed (INDEX_DIGEST; INDEX_STATE ok or invalid)
+#   b. there is no live tag, and plan found none (INDEX_STATE absent)
+#   c. INDEX_STATE is ignored: a reset, and the new index replaces any
+#   d. the live index names this plan (dev.pkgforge.mirror.plan-id): an
+#      earlier attempt of this run wrote it
+# A live index of this plan also gives verified 1 to each m row of the same
+# filename that it holds as verified, whichever rule lets the push go ahead.
+# Anything else, a live read that fails too, keeps the live tag, with a
+# warning: a newer run may have written it. The sync concurrency group lets
+# no two runs write at once, so only a re-run of an older run can come
+# between.
+#
+# The manifest (lib.sh index_push): the layer ref.db is PLAN/TARGET/
+# upstream.db. The annotations are dev.pkgforge.mirror.index-format=1,
+# plan-id, fetched (the plan's FETCHED), db-sha256 (of ref.db),
+# verify-context (the plan's INDEX_CONTEXT_OUT), run, and
+# org.opencontainers.image.source.
+#
+# Environment: MIRROR_NAMESPACE, REGISTRY_USER, REGISTRY_TOKEN, INDEX_RATE_WAIT
+# (lib.sh index_push).
+#
+# Exit status: 0 the index is written, or there is nothing to write, or the
+# guard keeps the live tag; 1 the index could not be written.
+set -euo pipefail
+SCRIPT_NAME=index-write
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+need curl jq awk sha256sum timeout
+
+plan="${1:-}"
+results="${2:-}"
+stage="${3:-}"
+verify="${4:-}"
+target="${5:-}"
+if [ ! -d "$plan" ] || [ -z "$results" ] || [ -z "$stage" ] || [ -z "$verify" ] || [ -z "$target" ]; then
+  die "usage: scripts/index-write PLAN RESULTS STAGE VERIFY TARGET"
+fi
+case "$target" in
+  *[!a-z0-9_.-]*) die "TARGET is a target name, not '$target'" ;;
+esac
+pdir="$plan/$target"
+[ -f "$pdir/state" ] || die "the plan has no state for $target" "reproduce: ls $pdir"
+plan_state="$(cat "$pdir/state")"
+if [ "$plan_state" != pending ]; then
+  log "$target is $plan_state in the plan; there is no index to write"
+  exit 0
+fi
+for f in plan-id meta.env records.tsv todo.tsv vouched.tsv upstream.db; do
+  [ -f "$pdir/$f" ] || die "the plan of $target has no $f" "reproduce: ls $pdir"
+done
+[ -n "$MIRROR_NAMESPACE" ] || die "MIRROR_NAMESPACE is not set"
+if [ "$MIRROR_REGISTRY_AUTH" != none ] && [ -z "${REGISTRY_TOKEN:-}" ]; then
+  die "REGISTRY_TOKEN is not set; the index is read and pushed with it"
+fi
+
+# meta KEY -> the value of KEY in PLAN/TARGET/meta.env, read as data
+meta() {
+  awk -v k="$1" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { print v }' "$pdir/meta.env"
+}
+plan_id="$(cat "$pdir/plan-id")"
+index_tag="$(meta INDEX_TAG)"
+index_state="$(meta INDEX_STATE)"
+index_digest="$(meta INDEX_DIGEST)"
+context_out="$(meta INDEX_CONTEXT_OUT)"
+fetched="$(meta FETCHED)"
+[ -n "$plan_id" ] || die "$pdir/plan-id is empty"
+[[ "$index_tag" =~ ^index(-[a-z0-9]+(-[a-z0-9]+)*)?$ ]] || die "$pdir/meta.env: INDEX_TAG must be index or index-<slug>, not '$index_tag'"
+case "$index_state" in
+  ok | absent | invalid | unread | ignored) ;;
+  *) die "$pdir/meta.env: INDEX_STATE must be ok, absent, invalid, unread or ignored, not '$index_state'" ;;
+esac
+[[ "$index_digest" =~ ^(sha256:[0-9a-f]{64})?$ ]] || die "$pdir/meta.env: INDEX_DIGEST is not sha256:<64 hex>: '$index_digest'"
+[[ "$context_out" =~ ^([0-9a-f]{64})?$ ]] || die "$pdir/meta.env: INDEX_CONTEXT_OUT is not 64 hex digits: '$context_out'"
+[[ "$fetched" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die "$pdir/meta.env: FETCHED is not ISO 8601 UTC: '$fetched'"
+if [ "$index_state" = unread ]; then
+  warn "$target: plan did not read the tag $index_tag (INDEX_STATE unread), so this run writes no index" \
+    "the next run reads the index as it is now"
+  exit 0
+fi
+conf="$TARGETS_DIR/$target.conf"
+target_check "$conf"
+repo_path="$(target_repository "$conf")"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/push" "$work/live" "$work/bin"
+
+#---------------------------------------------------------------------------#
+# The rows
+#---------------------------------------------------------------------------#
+results_of_plan "$results" "$plan_id" "$work/results.tsv"
+awk -F '\t' -v OFS='\t' '
+  FILENAME == ARGV[1] { k = $1 SUBSEP $2; st[k] = $3; det[k] = $5; next }
+  {
+    k = $1 SUBSEP $2
+    if (!(k in st)) next
+    if (st[k] == "pushed" || st[k] == "present") {
+      u = (index(det[k], "unsigned: ") == 1) ? 1 : 0
+      print $2, "m", 0, u
+    } else if (st[k] == "absent") {
+      print $2, "a", 0, 0
+    }
+  }
+' "$work/results.tsv" "$pdir/todo.tsv" > "$work/rows.tsv"
+awk -F '\t' -v OFS='\t' '{ print $1, "m", $2, $3 }' "$pdir/vouched.tsv" >> "$work/rows.tsv"
+log "$target: $(awk 'END { print NR + 0 }' "$pdir/vouched.tsv") row(s) vouched by the plan, $(awk -F '\t' '$2 == "m" { n++ } END { print n + 0 }' "$work/rows.tsv") file(s) on the registry in all, $(awk -F '\t' '$2 == "a" { n++ } END { print n + 0 }' "$work/rows.tsv") absent upstream, of $(awk 'END { print NR + 0 }' "$pdir/todo.tsv") todo file(s)"
+
+#---------------------------------------------------------------------------#
+# Verify credit
+#---------------------------------------------------------------------------#
+sdir="$stage/$target"
+: > "$work/passed-names.txt"
+: > "$work/faults.txt"
+staged_digest=""
+if [ ! -f "$sdir/state" ]; then
+  log "$target: no stage result; no file gets verify credit"
+elif [ "$(cat "$sdir/state")" != staged ]; then
+  log "$target: the stage is $(cat "$sdir/state"); no file gets verify credit"
+elif [ ! -f "$sdir/plan-id" ] || [ "$(cat "$sdir/plan-id")" != "$plan_id" ]; then
+  log "$target: the stage is not of plan $plan_id; no file gets verify credit"
+else
+  staged_digest="$(sed -n 's/^DIGEST=//p' "$sdir/staged.env")"
+  [[ "$staged_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "$sdir/staged.env: DIGEST is not sha256:<64 hex>: '$staged_digest'"
+fi
+if [ -n "$staged_digest" ]; then
+  passed=0
+  failed=0
+  for b in "$sdir"/batches/*.txt; do
+    [ -e "$b" ] || continue
+    n="$(basename "$b" .txt)"
+    v=""
+    if [ -d "$verify" ]; then
+      v="$(find "$verify" -name "verify-$target-$n.tsv" -type f | sed -n 1p)"
+    fi
+    if [ -z "$v" ]; then
+      log "batch $n: no verdict; it changes nothing"
+      continue
+    fi
+    result="$(cut -f 3 "$v")"
+    vdigest="$(cut -f 5 "$v")"
+    if [ "$vdigest" != "$staged_digest" ]; then
+      log "batch $n: the verdict is about $vdigest, not the staged $staged_digest; it changes nothing"
+      continue
+    fi
+    case "$result" in
+      passed)
+        passed=$((passed + 1))
+        cat "$b" >> "$work/passed-names.txt"
+        ;;
+      failed)
+        failed=$((failed + 1))
+        faults="$(dirname "$v")/faults-$target-$n.txt"
+        if [ -f "$faults" ]; then
+          cat "$faults" >> "$work/faults.txt"
+        else
+          log "batch $n failed and names no file at fault ($faults); its rows keep verified 0"
+        fi
+        ;;
+      *) log "batch $n: the verdict '$result' changes nothing" ;;
+    esac
+  done
+  log "$target: $passed batch(es) passed and $failed failed for $staged_digest; $(awk 'END { print NR + 0 }' "$work/faults.txt") file(s) at fault"
+fi
+# Names to filenames through the stage's records. A failed batch's files at
+# fault lose their m rows; a passed batch's files get verified 1.
+records="$sdir/records.tsv"
+if [ ! -f "$records" ]; then
+  records="$pdir/records.tsv"
+fi
+awk -F '\t' -v OFS='\t' '
+  FILENAME == ARGV[1] { file[$2] = $1; next }
+  FILENAME == ARGV[2] { if ($0 in file) good[file[$0]] = 1; next }
+  FILENAME == ARGV[3] { bad[$0] = 1; next }
+  $2 == "m" && ($1 in bad) { next }
+  $2 == "m" && ($1 in good) { $3 = 1 }
+  { print }
+' "$records" "$work/passed-names.txt" "$work/faults.txt" "$work/rows.tsv" > "$work/rows-credit.tsv"
+
+#---------------------------------------------------------------------------#
+# The writer guard, then the push
+#---------------------------------------------------------------------------#
+rc=0
+oras_bin="$("$REPO_ROOT/scripts/install-oras" "$work/bin")" || rc=$?
+[ "$rc" -eq 0 ] || die "could not install oras (scripts/install-oras ended $rc)"
+ORAS_CONFIG="$work/oras-auth.json"
+oras_login "$oras_bin" "$ORAS_CONFIG" || rc=$?
+[ "$rc" -eq 0 ] || die "oras could not log in to $MIRROR_REGISTRY (status $rc)"
+
+rc=0
+registry_manifest "$repo_path" "$index_tag" "$work/live/manifest.json" || rc=$?
+live_digest=""
+live_plan=""
+case "$rc" in
+  "$REG_STATUS_OK")
+    live_digest="sha256:$(sha256sum "$work/live/manifest.json" | cut -d ' ' -f 1)"
+    live_plan="$(jq -r '.annotations["dev.pkgforge.mirror.plan-id"]? // "" | tostring' "$work/live/manifest.json")"
+    live_note="$live_digest, plan $live_plan"
+    ;;
+  "$REG_STATUS_ABSENT") live_note="no tag" ;;
+  *) live_note="no answer (status $rc)" ;;
+esac
+if [ "$index_state" = ignored ]; then
+  why="the plan did not read the index (INDEX_STATE ignored), and this index replaces any ($live_note)"
+elif [ "$rc" -eq "$REG_STATUS_OK" ] && [ "$live_digest" = "$index_digest" ]; then
+  why="the live index is the one the plan read ($index_digest)"
+elif [ "$rc" -eq "$REG_STATUS_ABSENT" ] && [ "$index_state" = absent ]; then
+  why="there is no index yet, as the plan found"
+elif [ "$rc" -eq "$REG_STATUS_OK" ] && [ "$live_plan" = "$plan_id" ]; then
+  why="an earlier attempt of this plan wrote the live index ($live_digest)"
+else
+  warn "$target: $repo_path:$index_tag is kept, and this run's rows are not pushed: the live index ($live_note) is not the one the plan read (INDEX_STATE $index_state${index_digest:+, $index_digest})" \
+    "a newer run may have written it; the next run plans from it" \
+    "reproduce: curl -s -H 'Authorization: Bearer QQ==' -H 'Accept: application/vnd.oci.image.manifest.v1+json' $REG_URL/v2/$repo_path/manifests/$index_tag"
+  exit 0
+fi
+log "$target: the guard lets this run write $repo_path:$index_tag: $why"
+
+LC_ALL=C sort "$work/rows-credit.tsv" > "$work/push/index.tsv"
+# d: a live index of this plan gives its verified 1 to each m row of the same
+# filename. This holds whichever rule lets the push go ahead.
+if [ "$rc" -eq "$REG_STATUS_OK" ] && [ "$live_plan" = "$plan_id" ]; then
+  read -r d _ t <<< "$(manifest_layer "$work/live/manifest.json" index.tsv)"
+  if [[ ! "${d:-}" =~ ^sha256:[0-9a-f]{64}$ ]] || [ "${t:-}" != "$INDEX_TSV_MEDIA_TYPE" ]; then
+    log "$target: the live index has no index.tsv layer of $INDEX_TSV_MEDIA_TYPE; no verified flag is kept from it"
+  elif ! REG_BLOB_MAX_TIME=60 REG_TOKEN_MAX_TIME=60 registry_blob "$repo_path" "$d" "$work/live/index.tsv"; then
+    log "$target: the index.tsv of the live index did not read; no verified flag is kept from it"
+  else
+    awk -F '\t' -v OFS='\t' '
+      FILENAME == ARGV[1] { if (NF == 4 && $2 == "m" && $3 == "1") v[$1] = 1; next }
+      $2 == "m" && ($1 in v) { $3 = 1 }
+      { print }
+    ' "$work/live/index.tsv" "$work/push/index.tsv" > "$work/push/index.merged"
+    mv -f "$work/push/index.merged" "$work/push/index.tsv"
+    log "$target: the live index of this plan gives verified 1 to $(awk -F '\t' '$2 == "m" && $3 == "1" { n++ } END { print n + 0 }' "$work/push/index.tsv") row(s) in all"
+  fi
+fi
+
+# The rows' own check: 4 fields, the grammar of each, a filename of the
+# plan's records, each filename once
+if ! awk -F '\t' '
+  FILENAME == ARGV[1] { named[$1] = 1; next }
+  {
+    good = (NF == 4 && ($1 in named) && ($2 == "m" || $2 == "a") && ($3 == "0" || $3 == "1") && ($4 == "0" || $4 == "1") && ($2 == "m" || ($3 == "0" && $4 == "0")))
+    if (!good) { printf "line %d: %s\n", FNR, $0; bad = 1 }
+    if (seen[$1]++) { printf "line %d: %s is named twice\n", FNR, $1; bad = 1 }
+  }
+  END { exit bad }
+' "$pdir/records.tsv" "$work/push/index.tsv" > "$work/check.txt"; then
+  die "$target: the rows fail their own check, so nothing is pushed" "$(sed -n 1,5p "$work/check.txt")"
+fi
+
+cp "$pdir/upstream.db" "$work/push/ref.db"
+db_sha="$(sha256sum "$work/push/ref.db" | cut -d ' ' -f 1)"
+source_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}"
+if ! index_push "$oras_bin" "$repo_path" "$index_tag" "$work/push" \
+  "dev.pkgforge.mirror.index-format=1" \
+  "dev.pkgforge.mirror.plan-id=$plan_id" \
+  "dev.pkgforge.mirror.fetched=$fetched" \
+  "dev.pkgforge.mirror.db-sha256=$db_sha" \
+  "dev.pkgforge.mirror.verify-context=$context_out" \
+  "dev.pkgforge.mirror.run=${GITHUB_RUN_ID:-local}" \
+  "org.opencontainers.image.source=$source_url"; then
+  warn "$target: $repo_path:$index_tag is not written; the next run plans from the index there now"
+  exit 1
+fi
+log "$target: $repo_path:$index_tag holds $(awk 'END { print NR + 0 }' "$work/push/index.tsv") row(s): $(awk -F '\t' '$2 == "m" { m++; if ($3 == "1") v++; if ($4 == "1") u++ } $2 == "a" { a++ } END { printf "%d on the registry, %d of them verified and %d unsigned; %d absent upstream", m, v, u, a }' "$work/push/index.tsv")"

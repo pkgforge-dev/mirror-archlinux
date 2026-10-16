@@ -80,11 +80,13 @@ test('latest, YYYY.MM.DD, db-HEX, files-HEX and @sha256 pins are served', () =>
     assert.deepEqual(w.errors, []);
   }));
 
-test('any other tag gets 404 with no subrequest, staging included', () =>
+test('any other tag gets 404 with no subrequest, staging and index included', () =>
   inWorld(async (w) => {
     const tags = [
       'staging',
       'staging-wip',
+      'index',
+      'index-wip',
       'LATEST',
       'Latest',
       '2026.10',

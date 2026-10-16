@@ -26,7 +26,7 @@ pacman uses its own downloader with this Server. `ParallelDownloads`, resume and
 
 FILE is `REPO.db`, `REPO.files`, a package file, or one of these with `.sig`. FILE can be percent-encoded. The Worker decodes it, then checks its character set again. ARCH has at most 32 characters. The decoded FILE has at most 255. The query string is ignored.
 
-A package file and its `.sig` always come from the package's own tag, whatever reference the URL names. Any other tag, `staging` included, gets 404 with no subrequest. A pin or a `db-` or `files-` tag with upper-case hex gets 404 too. Any other path gets 404 with no subrequest.
+A package file and its `.sig` always come from the package's own tag, whatever reference the URL names. Any other tag, `staging` and `index` included, gets 404 with no subrequest. A pin or a `db-` or `files-` tag with upper-case hex gets 404 too. Any other path gets 404 with no subrequest.
 
 The Worker checks the format of a `YYYY.MM.DD`, `db-HEX` or `files-HEX` tag only. It does not check that the database of a `db-HEX` manifest has the sha256 HEX. It checks the hash of an `@sha256:` manifest.
 

@@ -23,33 +23,58 @@
 #      while a db_server still serves the promoted one. ALLOW_OLDER (target
 #      names, comma separated) skips the promoted comparison for a deliberate
 #      upstream downgrade.
-#   4. The files the promoted snapshot holds with no signature (its
-#      dev.pkgforge.mirror.unsigned annotation, scripts/stage): each one's
-#      .sig is asked for again. One that upstream signs now is planned again,
-#      so mirror-file adds its signature layer.
-#   4b. The files with the promoted sha256 and no %PGPSIG% on either side,
-#      which step 6 would skip: SIGCHECK_SAMPLE of them, sorted by name, from
-#      an offset that moves on each 3-hour run (MIRROR_NOW fixes the clock).
-#      For each, upstream's .sig (the first server in the target's order that
-#      answers with a signature packet) is compared with the signature layer
-#      of its tag. One that differs is planned again, so mirror-file pushes it
-#      again with the same package blob. When more than SIGCHECK_ESCALATE of
-#      one sample differ, every such file of the target is planned, and the
-#      plan warns. A file whose tag or .sig did not read waits for a later run.
+#   3b. Read the index of this ref (lib.sh index_read, the tag INDEX_TAG),
+#      as step 2 reads latest: anonymously, then with the workflow's token.
+#      A file is "indexed" when the index lists it with state m and its
+#      ref.db record has the same sha256 and %PGPSIG% as the chosen record:
+#      an earlier run of the ref left it on the registry. INDEX_STATE is ok,
+#      absent, invalid (not used), unread (no answer that decides, or
+#      REGISTRY_READ_BUDGET is spent; a warning, and the target plans as with
+#      no index), or ignored (INDEX_READ=0: not read, and the run writes a
+#      new index).
+#   4. The files promoted or indexed with no signature (the
+#      dev.pkgforge.mirror.unsigned annotation of latest, scripts/stage, and
+#      the indexed files with unsigned 1): each one's .sig is asked for again.
+#      One that upstream signs now is planned again, so mirror-file adds its
+#      signature layer.
+#   4b. The files with the promoted or indexed sha256 and no %PGPSIG% on
+#      either side, which step 6 would skip: SIGCHECK_SAMPLE of them, sorted
+#      by name, from an offset that moves on each 3-hour run (MIRROR_NOW fixes
+#      the clock). For each, upstream's .sig (the first server in the
+#      target's order that answers with a signature packet) is compared with
+#      the signature layer of its tag. One that differs is planned again, so
+#      mirror-file pushes it again with the same package blob. When more than
+#      SIGCHECK_ESCALATE of one sample differ, every such file of the target
+#      is planned, and the plan warns. A file whose tag or .sig did not read
+#      waits for a later run.
+#   Steps 4 and 4b run when there is a promoted database or the index reads
+#   ok.
 #   5. The same bytes as the promoted database, and no file planned again by
 #      step 4 or 4b: the target is current.
-#   6. Otherwise every file is skip, when the promoted database names it with
-#      the same sha256 and the same %PGPSIG% (no request made), or todo.
+#   6. Otherwise every file is skip, when the promoted database or the index
+#      names it with the same sha256 and the same %PGPSIG% (no request made),
+#      or todo. A file is todo also when the index lists it as absent
+#      upstream (state a), or when step 4 or 4b plans it again.
 #      scripts/mirror-file reads each todo file's tag before writing it: it
 #      never overwrites a package layer, and it repairs a signature layer that
-#      upstream signed again.
+#      upstream signed again. The files to verify (new.tsv) are the todo
+#      files and every file that is not promoted and not indexed as verified
+#      under this run's verify context (lib.sh verify_context).
+#   6b. Before any tag is written: plan withdraws from the index every row
+#      (state m) of a todo file. It pushes the index again without them, with
+#      the same ref.db and annotations, and reads it back. A push or read back
+#      that fails puts the target in error. oras is installed only for this.
+#   6c. Registry sources: the todo files whose bytes a sibling holds. A
+#      sibling is an enabled target of TARGETS_DIR with a db_server of the
+#      same URL. It holds what its latest database names, and what its index
+#      lists with state m.
 #   7. The todo files of the target go into its own shards: k = the larger of
 #      ceil(bytes / SHARD_BYTES) and ceil(files / SHARD_FILES), at least 1, at
 #      most MAX_SHARDS and the file count; largest file first onto the lightest
 #      shard. A target never waits for another target's shards.
 #
 # ⛔ The plan ends within PLAN_BUDGET seconds of upstream reads (default 1200),
-# below the plan job's timeout-minutes (30). Each target gets a share: what is
+# below the plan job's timeout-minutes (40). Each target gets a share: what is
 # left of the budget, divided by the targets not yet read. A fast target
 # leaves its unused share to the targets after it; a slow one cannot take
 # theirs. Each upstream read ends within its own deadline, or within a part of
@@ -57,6 +82,19 @@
 # it, with n the db_servers not yet read, so a slow first db_server leaves
 # time for the next one and for the files database. A target whose reads do
 # not fit is in error for this run, and its why names PLAN_BUDGET.
+#
+# ⛔ The registry reads of steps 3b, 6 (the latest database of keyring_from,
+# for the verify context) and 6c share one budget for the whole plan,
+# REGISTRY_READ_BUDGET seconds (default 240). A read is not made when the
+# reads before it took the whole budget. Each blob and token read has a
+# deadline of 60 s, or what is left of the budget when that is less. A read
+# that is not made costs work, never safety: the index is unread, the verify
+# context is not known, or a sibling gives no source.
+#
+# Each upstream read of a .files database, a database signature or a package
+# .sig that answers is kept for the rest of the plan (OUT/.fetch-cache,
+# removed at the end). The three base-any targets read the same URLs once.
+# A <repo>.db is never kept.
 #
 # OUT/plan-id               this plan's id: the run, its attempt and a random
 #                           number, also in OUT/<target>/plan-id. Every
@@ -70,16 +108,38 @@
 # OUT/<target>/records.tsv  its records (lib.sh db_records)
 # OUT/<target>/nul.txt      its package directories whose desc is NUL bytes only
 # OUT/<target>/todo.tsv     the files this run mirrors
-# OUT/<target>/unsigned.txt the files promoted with no signature that are not
-#                           planned again: upstream still has no .sig for them,
-#                           or did not answer. scripts/stage lists them again.
+# OUT/<target>/new.tsv      the files this run verifies, work lines too: each
+#                           todo file (action todo), and each other file that
+#                           is not promoted and not indexed as verified under
+#                           VERIFY_CONTEXT (action verify)
+# OUT/<target>/vouched.tsv  filename, verified, unsigned: each indexed file
+#                           that is not todo, for scripts/index-write. verified
+#                           is the index's flag when VERIFY_CONTEXT is not known
+#                           or equals INDEX_CONTEXT, else 0. unsigned is the
+#                           index's flag, or 1 when unsigned.txt names the file.
+# OUT/<target>/sources.tsv  filename, repository: a sibling repository that
+#                           holds the bytes of a todo file (step 6c)
+# OUT/<target>/unsigned.txt the files promoted or indexed with no signature
+#                           that are not planned again: upstream still has no
+#                           .sig for them, or did not answer. scripts/stage
+#                           lists them again.
 # OUT/<target>/shards/<n>.tsv  the work lines of shard n, for scripts/mirror-shard
-# OUT/<target>/meta.env     KEY=VALUE facts stage writes into the manifest
+# OUT/<target>/meta.env     KEY=VALUE facts stage writes into the manifest; for
+#                           a pending target also INDEX_TAG, INDEX_STATE,
+#                           INDEX_DIGEST (sha256:<hex> of the index manifest
+#                           read, or pushed by step 6b; empty unless the state
+#                           is ok or invalid), INDEX_CONTEXT (the
+#                           verify-context of that index), VERIFY_CONTEXT (this
+#                           run's, empty when not known) and INDEX_CONTEXT_OUT
+#                           (VERIFY_CONTEXT, or INDEX_CONTEXT when that is
+#                           empty: the verify-context of the index this run
+#                           writes)
 # OUT/targets.json          {"include":[{"target":T,"shards":[0,1,..]},..]}: the
 #                           pending targets with files to mirror
 # OUT/pending.json          the same shape, "shards":[], for the pending targets
 #                           with no file to mirror (a database that only
-#                           dropped packages): they still stage and verify
+#                           dropped packages, or whose new files the index
+#                           names): they still stage and verify
 # OUT/summary.tsv           target, state, files, MiB, why
 #
 # Work line: target filename tag sha256 csize name action builddate pgpsig, tab
@@ -90,9 +150,12 @@
 # workflow's upload steps read to upload OUT/<target> as plan-<target>.
 #
 # Environment: SHARD_BYTES (default 536870912), SHARD_FILES (400), MAX_SHARDS
-# (32, per target), PLAN_BUDGET (1200 s), SIGCHECK_SAMPLE (64, per target),
-# SIGCHECK_ESCALATE (8), ALLOW_OLDER, MIRROR_NAMESPACE, REGISTRY_USER and
-# REGISTRY_TOKEN (used only to tell a private package from an absent one).
+# (32, per target), PLAN_BUDGET (1200 s), REGISTRY_READ_BUDGET (240 s),
+# SIGCHECK_SAMPLE (64, per target), SIGCHECK_ESCALATE (8), ALLOW_OLDER,
+# INDEX_READ (1; 0 does not read the index), INDEX_TAG and STAGING_TAG (lib.sh
+# index_tag), INDEX_RATE_WAIT (lib.sh index_push), MIRROR_NAMESPACE,
+# REGISTRY_USER and REGISTRY_TOKEN (to tell a private package from an absent
+# one, and to push the index in step 6b).
 #
 # Exit status: 0 planned, whatever state each target is in; 1 no plan could be
 # made at all.
@@ -112,19 +175,35 @@ SHARD_BYTES="${SHARD_BYTES:-536870912}"
 SHARD_FILES="${SHARD_FILES:-400}"
 MAX_SHARDS="${MAX_SHARDS:-32}"
 PLAN_BUDGET="${PLAN_BUDGET:-1200}"
+REGISTRY_READ_BUDGET="${REGISTRY_READ_BUDGET:-240}"
 SIGCHECK_SAMPLE="${SIGCHECK_SAMPLE:-64}"
 SIGCHECK_ESCALATE="${SIGCHECK_ESCALATE:-8}"
-for v in SHARD_BYTES SHARD_FILES MAX_SHARDS PLAN_BUDGET SIGCHECK_SAMPLE SIGCHECK_ESCALATE; do
+for v in SHARD_BYTES SHARD_FILES MAX_SHARDS PLAN_BUDGET REGISTRY_READ_BUDGET SIGCHECK_SAMPLE SIGCHECK_ESCALATE; do
   case "${!v}" in
     '' | *[!0-9]* | 0) die "$v must be a positive integer, not '${!v}'" ;;
   esac
 done
+INDEX_READ="${INDEX_READ:-1}"
+case "$INDEX_READ" in
+  0 | 1) ;;
+  *) die "INDEX_READ must be 0 or 1, not '$INDEX_READ'" ;;
+esac
+INDEX_TAG="$(index_tag)"
 # Whole-transfer deadlines for what plan reads from upstream, in seconds. The
 # largest measured (2026-10-14): x86_64 extra.files, 51452041 bytes.
 DB_MAX_TIME=300
 FILES_MAX_TIME=900
 SIG_MAX_TIME=60
+# The deadline of each registry read that REGISTRY_READ_BUDGET bounds.
+REG_READ_MAX_TIME=60
 run_deadline=$((SECONDS + PLAN_BUDGET))
+# The seconds the registry reads of REGISTRY_READ_BUDGET took so far
+reg_spent=0
+# oras, installed when step 6b first needs it
+oras_bin=""
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/registry"
 
 if [ -n "${GITHUB_RUN_ID:-}" ]; then
   plan_id="$GITHUB_RUN_ID.${GITHUB_RUN_ATTEMPT:-1}.$RANDOM"
@@ -143,9 +222,11 @@ fi
 [ "$#" -gt 0 ] || die "no enabled target" "reproduce: ls $TARGETS_DIR"
 
 mkdir -p "$out"
+rm -rf "$out/.fetch-cache"
+mkdir -p "$out/.fetch-cache"
 fetched="$(iso_now)"
 printf '%s\n' "$plan_id" > "$out/plan-id"
-log "plan $plan_id: $# target(s), PLAN_BUDGET=${PLAN_BUDGET}s"
+log "plan $plan_id: $# target(s), PLAN_BUDGET=${PLAN_BUDGET}s, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s, index tag $INDEX_TAG"
 
 # set_state DIR STATE WHY
 set_state() {
@@ -168,12 +249,23 @@ share_start() {
   budget_cut=0
 }
 
-# fetch_within URL OUT MAX PARTS -> fetch_upstream's status. The deadline is
-# MAX, or what is left of the share divided by PARTS when that is less; with
-# nothing left, status 1 and no request. Sets fetch_max to the deadline used,
-# and budget_cut when a read failed with less time than MAX, or was not made.
+# fetch_within URL OUT MAX PARTS [KEY] -> fetch_upstream's status. The
+# deadline is MAX, or what is left of the share divided by PARTS when that is
+# less; with nothing left, status 1 and no request. Sets fetch_max to the
+# deadline used, and budget_cut when a read failed with less time than MAX,
+# or was not made. KEY, when given, keeps a read that answers (status 0) in
+# OUT/.fetch-cache: a later read with the same KEY copies it, with no request
+# and no time of the share, and sets fetch_max to 0.
 fetch_within() {
-  local url="$1" outfile="$2" own="$3" parts="$4" rc=0
+  local url="$1" outfile="$2" own="$3" parts="$4" key="${5:-}" rc=0 cached=""
+  if [ -n "$key" ]; then
+    cached="$out/.fetch-cache/$(printf '%s' "$key" | sha256sum | cut -d ' ' -f 1)"
+    if [ -f "$cached" ] && cp "$cached" "$outfile"; then
+      fetch_max=0
+      log "$url: read earlier in this plan; that copy is used"
+      return 0
+    fi
+  fi
   fetch_max=$(((share_deadline - SECONDS) / parts))
   if [ "$fetch_max" -gt "$own" ]; then
     fetch_max="$own"
@@ -187,6 +279,10 @@ fetch_within() {
   fetch_upstream "$url" "$outfile" "$fetch_max" || rc=$?
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 4 ] && [ "$fetch_max" -lt "$own" ]; then
     budget_cut=1
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$cached" ] && ! cp "$outfile" "$cached"; then
+    log "$url: the copy for later reads of this plan could not be kept"
+    rm -f -- "$cached"
   fi
   return "$rc"
 }
@@ -210,6 +306,253 @@ nul_note() {
   n="$(awk 'END { print NR + 0 }' "$1/nul.txt")"
   [ "$n" -gt 0 ] || return 0
   printf '; %s package directory(ies) whose desc holds only NUL bytes, passed over: %s' "$n" "$(tr '\n' ' ' < "$1/nul.txt" | sed 's/ $//')"
+}
+
+#---------------------------------------------------------------------------#
+# Registry reads: the index, the keyring of keyring_from, the siblings
+#---------------------------------------------------------------------------#
+# reg_time -> the deadline of the next registry read that REGISTRY_READ_BUDGET
+# bounds: REG_READ_MAX_TIME, or what is left of the budget when that is less;
+# 0 when nothing is left
+reg_time() {
+  local left=$((REGISTRY_READ_BUDGET - reg_spent))
+  if [ "$left" -gt "$REG_READ_MAX_TIME" ]; then
+    left="$REG_READ_MAX_TIME"
+  fi
+  if [ "$left" -lt 1 ]; then
+    left=0
+  fi
+  printf '%s\n' "$left"
+}
+
+# index_of REPO DIR DB...: REPO:$INDEX_TAG into DIR (lib.sh index_read),
+# anonymously first, then with the workflow's token when that is not ok or
+# invalid, as step 2 reads latest. Sets reg_state, and reg_private to 1 when
+# only the token read is ok. The time it takes counts in
+# REGISTRY_READ_BUDGET.
+index_of() {
+  local repo="$1" d="$2" t rc=0 started="$SECONDS"
+  shift 2
+  reg_state=unread
+  reg_private=0
+  t="$(reg_time)"
+  if [ "$t" -eq 0 ]; then
+    log "$repo:$INDEX_TAG: not read, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s is spent"
+    return 0
+  fi
+  reg_state="$(REGISTRY_TOKEN='' REG_BLOB_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" index_read "$repo" "$INDEX_TAG" "$d" "$@")" || rc=$?
+  reg_spent=$((reg_spent + SECONDS - started))
+  if [ "$rc" -ne 0 ]; then
+    reg_state=unread
+  fi
+  case "$reg_state" in
+    ok | invalid) return 0 ;;
+  esac
+  if [ -z "${REGISTRY_TOKEN:-}" ] && [ "$MIRROR_REGISTRY_AUTH" != none ]; then
+    return 0
+  fi
+  t="$(reg_time)"
+  if [ "$t" -eq 0 ]; then
+    log "$repo:$INDEX_TAG: not read with the workflow's token, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s is spent"
+    reg_state=unread
+    return 0
+  fi
+  rc=0
+  started="$SECONDS"
+  reg_state="$(REG_BLOB_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" index_read "$repo" "$INDEX_TAG" "$d" "$@")" || rc=$?
+  reg_spent=$((reg_spent + SECONDS - started))
+  if [ "$rc" -ne 0 ]; then
+    reg_state=unread
+  fi
+  if [ "$reg_state" = ok ]; then
+    reg_private=1
+  fi
+}
+
+# latest_records CONF OUT: the records of the database that latest names in
+# the repository of CONF, into OUT. The read is anonymous, as verify-batch
+# and a consumer read it. Each database is read once per plan, by its layer
+# digest. Sets reg_state: ok, absent (no latest), or unread. The time it
+# takes counts in REGISTRY_READ_BUDGET.
+latest_records() {
+  local started="$SECONDS"
+  reg_state=unread
+  latest_read "$@"
+  reg_spent=$((reg_spent + SECONDS - started))
+}
+
+# latest_read CONF OUT: latest_records, with no count of the time
+latest_read() {
+  local conf="$1" outfile="$2" path frepo t rc=0 d hex m="$tmp/latest.json"
+  path="$(target_repository "$conf")"
+  frepo="$(target_get "$conf" repo)"
+  t="$(reg_time)"
+  if [ "$t" -eq 0 ]; then
+    log "$path:latest: not read, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s is spent"
+    return 0
+  fi
+  REGISTRY_TOKEN='' REG_TOKEN_MAX_TIME="$t" registry_manifest "$path" latest "$m" || rc=$?
+  case "$rc" in
+    "$REG_STATUS_OK") ;;
+    "$REG_STATUS_ABSENT")
+      reg_state=absent
+      return 0
+      ;;
+    *)
+      log "$path:latest did not read (status $rc)"
+      return 0
+      ;;
+  esac
+  read -r d _ _ <<< "$(manifest_layer "$m" "$frepo.db")"
+  if [[ ! "$d" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    warn "$path:latest holds no single $frepo.db layer"
+    return 0
+  fi
+  hex="${d#sha256:}"
+  if [ ! -f "$tmp/registry/$hex.tsv" ]; then
+    t="$(reg_time)"
+    if [ "$t" -eq 0 ]; then
+      log "$path: $frepo.db ($d) not read, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s is spent"
+      return 0
+    fi
+    if ! REGISTRY_TOKEN='' REG_BLOB_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" registry_blob "$path" "$d" "$tmp/registry/$hex.db"; then
+      return 0
+    fi
+    # `if !`: db_records must not be called bare (lib.sh).
+    if ! db_records "$tmp/registry/$hex.db" "$tmp/registry/$hex.part"; then
+      warn "$path:latest names a $frepo.db ($d) that does not read as a tar archive"
+      return 0
+    fi
+    mv -f "$tmp/registry/$hex.part" "$tmp/registry/$hex.tsv"
+    rm -f "$tmp/registry/$hex.db"
+  fi
+  cp "$tmp/registry/$hex.tsv" "$outfile"
+  reg_state=ok
+}
+
+# keyring_records CONF DIR OUT -> 0, with the records verify installs the
+# keyring packages from in OUT (lib.sh verify_context); 1 when they did not
+# read. These are the target's own records (DIR/records.tsv), or with
+# keyring_from the records of the latest database of that target, or the one
+# line none when it has no latest.
+keyring_records() {
+  local conf="$1" dir="$2" outfile="$3" from from_conf
+  from="$(target_get "$conf" keyring_from)"
+  if [ -z "$from" ]; then
+    cp "$dir/records.tsv" "$outfile"
+    return 0
+  fi
+  from_conf="$(dirname "$conf")/$from.conf"
+  target_check "$from_conf"
+  latest_records "$from_conf" "$outfile"
+  case "$reg_state" in
+    ok) return 0 ;;
+    absent)
+      printf 'none\n' > "$outfile"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# oras_ready -> 0 when oras_bin and ORAS_CONFIG are ready to push: oras is
+# installed and logged in once per plan
+oras_ready() {
+  local bin rc=0
+  [ -z "$oras_bin" ] || return 0
+  if [ "$MIRROR_REGISTRY_AUTH" != none ] && [ -z "${REGISTRY_TOKEN:-}" ]; then
+    warn "REGISTRY_TOKEN is not set, and the index cannot be pushed without it"
+    return 1
+  fi
+  bin="$("$REPO_ROOT/scripts/install-oras" "$tmp/bin")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "could not install oras (scripts/install-oras ended $rc)"
+    return 1
+  fi
+  ORAS_CONFIG="$tmp/oras-auth.json"
+  oras_login "$bin" "$ORAS_CONFIG" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "oras could not log in to $MIRROR_REGISTRY (status $rc)"
+    return 1
+  fi
+  oras_bin="$bin"
+}
+
+# index_withdraw REPO DIR -> 0 when REPO:$INDEX_TAG is pushed again without
+# the rows of the files in DIR/withdraw.txt, with the same ref.db and the same
+# annotations (lib.sh index_push), and reads back so. Sets reg_digest to the
+# digest of the manifest read back.
+index_withdraw() {
+  local repo="$1" d="$2" p="$2/push" rc=0 attempt want got n annotations=()
+  rm -rf "$p"
+  mkdir -p "$p"
+  if ! cp "$d/ref.db" "$p/ref.db"; then
+    warn "$repo:$INDEX_TAG: its ref.db could not be copied to $p"
+    return 1
+  fi
+  if ! awk -F '\t' 'FILENAME == ARGV[1] { w[$0] = 1; next } !($1 in w)' "$d/withdraw.txt" "$d/index.tsv" | LC_ALL=C sort > "$p/index.tsv"; then
+    warn "$repo:$INDEX_TAG: the index without the withdrawn rows could not be written to $p"
+    return 1
+  fi
+  # The annotations as they are, NUL separated: a value may hold any byte.
+  n="$(jq '.annotations | length' "$d/manifest.json")"
+  mapfile -d '' -t annotations < <(jq -j '.annotations // {} | to_entries[] | "\(.key)=\(.value)\u0000"' "$d/manifest.json")
+  if [ "${#annotations[@]}" != "$n" ]; then
+    warn "$repo:$INDEX_TAG: $n annotation(s) in its manifest, and ${#annotations[@]} read"
+    return 1
+  fi
+  oras_ready || return 1
+  index_push "$oras_bin" "$repo" "$INDEX_TAG" "$p" "${annotations[@]}" || return 1
+  want="sha256:$(sha256sum "$p/index.tsv" | cut -d ' ' -f 1)"
+  for attempt in 1 2 3 4 5; do
+    rc=0
+    registry_manifest "$repo" "$INDEX_TAG" "$p/manifest.json" || rc=$?
+    if [ "$rc" -eq "$REG_STATUS_OK" ]; then
+      read -r got _ _ <<< "$(manifest_layer "$p/manifest.json" index.tsv)"
+      if [ "$got" = "$want" ]; then
+        reg_digest="sha256:$(sha256sum "$p/manifest.json" | cut -d ' ' -f 1)"
+        return 0
+      fi
+    fi
+    if [ "$attempt" -lt 5 ]; then
+      sleep $((attempt * 2))
+    fi
+  done
+  warn "$repo:$INDEX_TAG does not read back with the index.tsv just pushed ($want) in 5 tries"
+  return 1
+}
+
+# sibling_hints CONF DIR: DIR/sources.tsv, filename and repository, for each
+# todo file whose filename and sha256 a sibling holds. A sibling is an
+# enabled target of TARGETS_DIR, not this one, with a db_server of the same
+# URL. It holds what its latest database names, and what its index lists
+# with state m.
+sibling_hints() {
+  local conf="$1" dir="$2" s="$2/sources" c path n
+  mkdir -p "$s"
+  target_all "$conf" db_server > "$s/servers.txt"
+  for c in "$TARGETS_DIR"/*.conf; do
+    [ -e "$c" ] || continue
+    [ "$(basename "$c")" != "$(basename "$conf")" ] || continue
+    target_all "$c" db_server > "$s/other-servers.txt"
+    n="$(awk 'FILENAME == ARGV[1] { s[$0] = 1; next } ($0 in s) { n++ } END { print n + 0 }' "$s/servers.txt" "$s/other-servers.txt")"
+    [ "$n" -gt 0 ] || continue
+    target_enabled "$c" || continue
+    target_check "$c"
+    path="$(target_repository "$c")"
+    : > "$s/held.tsv"
+    latest_records "$c" "$s/latest.tsv"
+    if [ "$reg_state" = ok ]; then
+      cut -f 1,5 "$s/latest.tsv" >> "$s/held.tsv"
+    fi
+    index_of "$path" "$s/index" "$dir/upstream.db" "$dir"/cand/*.db
+    if [ "$reg_state" = ok ]; then
+      awk -F '\t' -v OFS='\t' 'FILENAME == ARGV[1] { sha[$1] = $5; next } $2 == "m" && ($1 in sha) { print $1, sha[$1] }' \
+        "$s/index/ref.tsv" "$s/index/index.tsv" >> "$s/held.tsv"
+    fi
+    awk -F '\t' -v OFS='\t' -v repo="$path" 'FILENAME == ARGV[1] { h[$1 "\t" $2] = 1; next } (($2 "\t" $4) in h) { print $2, repo }' \
+      "$s/held.tsv" "$dir/todo.tsv" >> "$dir/sources.tsv"
+  done
 }
 
 # shard_target DIR NAME: OUT/<target>/shards/<n>.tsv from its todo.tsv
@@ -247,7 +590,11 @@ prune() {
   rm -f -- "$dir/promoted.db" "$dir/promoted.db.part" "$dir/promoted.tsv" "$dir/pairs.tsv" \
     "$dir/files.tsv" "$dir"/files.tsv.* "$dir/latest.json" "$dir/listed.txt" "$dir/recheck.txt" \
     "$dir/recheck.sig" "$dir/signed-now.txt" "$dir/sigcheck-all.txt" "$dir/sigcheck-sample.tsv" \
-    "$dir/sigcheck-changed.txt" "$dir/sigcheck.json" "$dir/sigcheck.sig" "$dir/files-lagging.txt"
+    "$dir/sigcheck-changed.txt" "$dir/sigcheck.json" "$dir/sigcheck.sig" "$dir/files-lagging.txt" \
+    "$dir/indexed.tsv"
+  # The reads of the index, the keyring records and the siblings: ref.db is
+  # a whole database, and a shard downloads this directory.
+  rm -rf -- "$dir/index" "$dir/sources"
 }
 
 plan_target() {
@@ -259,8 +606,12 @@ plan_target() {
   dir="$out/$name"
   repo_path="$(target_repository "$conf")"
   rm -rf "$dir"
-  mkdir -p "$dir/cand"
+  mkdir -p "$dir/cand" "$dir/index"
   : > "$dir/todo.tsv"
+  : > "$dir/new.tsv"
+  : > "$dir/vouched.tsv"
+  : > "$dir/sources.tsv"
+  : > "$dir/indexed.tsv"
   : > "$dir/meta.env"
   : > "$dir/nul.txt"
   : > "$dir/unsigned.txt"
@@ -418,24 +769,72 @@ plan_target() {
   cp "$dir/cand/$best.tsv.nul" "$dir/nul.txt"
 
   #-------------------------------------------------------------------------#
-  # 4. The files promoted with no signature: does upstream sign them now? Only
-  #    a name of a file the plan would skip counts (same sha256, no %PGPSIG%);
-  #    any other is planned anyway, and mirror-file reads its .sig afresh.
+  # 3b. The index of this ref: the files earlier runs left on the registry.
+  #     indexed.tsv: the ref.db record (8 fields), state, verified, unsigned
+  #     of each valid row.
+  #-------------------------------------------------------------------------#
+  local index_state index_digest="" index_context=""
+  if [ "$INDEX_READ" = 0 ]; then
+    index_state=ignored
+    log "$name: INDEX_READ=0: $repo_path:$INDEX_TAG is not read, and this run writes a new index"
+  else
+    index_of "$repo_path" "$dir/index" "$dir"/cand/*.db "$dir/promoted.db"
+    index_state="$reg_state"
+    if [ "$reg_private" -eq 1 ] && [ "$private" -eq 0 ]; then
+      private=1
+      warn "$name: $repo_path:$INDEX_TAG reads only with the workflow's token; the package is private"
+    fi
+  fi
+  case "$index_state" in
+    ok)
+      index_digest="sha256:$(sha256sum "$dir/index/manifest.json" | cut -d ' ' -f 1)"
+      index_context="$(jq -r '.annotations["dev.pkgforge.mirror.verify-context"] // ""' "$dir/index/manifest.json")"
+      awk -F '\t' -v OFS='\t' 'FILENAME == ARGV[1] { r[$1] = $0; next } ($1 in r) { print r[$1], $2, $3, $4 }' \
+        "$dir/index/ref.tsv" "$dir/index/index.tsv" > "$dir/indexed.tsv"
+      log "$name: $repo_path:$INDEX_TAG ($index_digest) lists $(awk -F '\t' '$9 == "m" { n++ } END { print n + 0 }' "$dir/indexed.tsv") file(s) on the registry, $(awk -F '\t' '$9 == "m" && $10 == "1" { n++ } END { print n + 0 }' "$dir/indexed.tsv") of them verified, and $(awk -F '\t' '$9 == "a" { n++ } END { print n + 0 }' "$dir/indexed.tsv") absent upstream"
+      ;;
+    invalid)
+      index_digest="sha256:$(sha256sum "$dir/index/manifest.json" | cut -d ' ' -f 1)"
+      warn "$name: $repo_path:$INDEX_TAG ($index_digest) is not a valid index; it is not used, and this run writes a new one"
+      ;;
+    absent) log "$name: no index yet at $repo_path:$INDEX_TAG" ;;
+    unread)
+      warn "$name: $repo_path:$INDEX_TAG did not read; this run plans as with no index, and writes none" \
+        "reproduce: curl -s -H 'Authorization: Bearer QQ==' -H 'Accept: application/vnd.oci.image.manifest.v1+json' $REG_URL/v2/$repo_path/manifests/$INDEX_TAG"
+      ;;
+  esac
+
+  #-------------------------------------------------------------------------#
+  # 4. The files promoted or indexed with no signature: does upstream sign
+  #    them now? Only a name of a file the plan would skip counts (the same
+  #    sha256 as promoted or indexed, no %PGPSIG%); any other is planned
+  #    anyway, and mirror-file reads its .sig afresh.
   #-------------------------------------------------------------------------#
   local f src probe_rc answer srcs=()
-  if [ -n "$promoted_sha" ]; then
-    jq -r '.annotations["dev.pkgforge.mirror.unsigned"] // empty' "$dir/latest.json" | tr ' ' '\n' > "$dir/listed.txt"
+  mapfile -t srcs < <(target_sources "$conf")
+  : > "$dir/listed.txt"
+  : > "$dir/recheck.txt"
+  if [ -n "$promoted_sha" ] || [ "$index_state" = ok ]; then
+    {
+      if [ -n "$promoted_sha" ]; then
+        jq -r '.annotations["dev.pkgforge.mirror.unsigned"] // empty' "$dir/latest.json" | tr ' ' '\n'
+      fi
+      awk -F '\t' '
+        FILENAME == ARGV[1] { r[$1] = $5 "\t" $8; next }
+        $9 == "m" && $11 == "1" && ($1 in r) && r[$1] == $5 "\t" $8 { print $1 }
+      ' "$dir/records.tsv" "$dir/indexed.tsv"
+    } > "$dir/listed.txt"
     awk -F '\t' '
       FILENAME == ARGV[1] { if ($0 != "") want[$0] = 1; next }
       FILENAME == ARGV[2] { if ($8 == "") p[$1] = $5; next }
-      ($1 in want) && ($1 in p) && p[$1] == $5 && $8 == "" { print $1 }
-    ' "$dir/listed.txt" "$dir/promoted.tsv" "$dir/records.tsv" > "$dir/recheck.txt"
-    mapfile -t srcs < <(target_sources "$conf")
+      FILENAME == ARGV[3] { if ($9 == "m" && $8 == "") x[$1] = $5; next }
+      ($1 in want) && $8 == "" && ((($1 in p) && p[$1] == $5) || (($1 in x) && x[$1] == $5)) { print $1 }
+    ' "$dir/listed.txt" "$dir/promoted.tsv" "$dir/indexed.tsv" "$dir/records.tsv" > "$dir/recheck.txt"
     while IFS= read -r f; do
       answer=404
       for src in "${srcs[@]}"; do
         probe_rc=0
-        fetch_within "$src/$f.sig" "$dir/recheck.sig" "$SIG_MAX_TIME" 4 || probe_rc=$?
+        fetch_within "$src/$f.sig" "$dir/recheck.sig" "$SIG_MAX_TIME" 4 "$src/$f.sig" || probe_rc=$?
         case "$probe_rc" in
           0)
             if sig_packet "$dir/recheck.sig"; then
@@ -455,12 +854,12 @@ plan_target() {
       rm -f "$dir/recheck.sig"
       case "$answer" in
         200)
-          log "$name: $f was promoted with no signature, and upstream has a .sig for it now; it is planned again"
+          log "$name: $f was promoted or indexed with no signature, and upstream has a .sig for it now; it is planned again"
           printf '%s\n' "$f" >> "$dir/signed-now.txt"
           ;;
         404) printf '%s\n' "$f" >> "$dir/unsigned.txt" ;;
         *)
-          log "$name: $f was promoted with no signature, and its .sig is not known this run: $answer"
+          log "$name: $f was promoted or indexed with no signature, and its .sig is not known this run: $answer"
           printf '%s\n' "$f" >> "$dir/unsigned.txt"
           ;;
       esac
@@ -478,17 +877,19 @@ plan_target() {
   #     same package blob. More than SIGCHECK_ESCALATE of one sample that
   #     differ is a new signing key: every such file is planned this run.
   #     These reads count in the target's share, and stop when half of what
-  #     was left at the start of this step is used.
+  #     was left at the start of this step is used. The files are those
+  #     promoted or indexed, and not listed by step 4.
   #-------------------------------------------------------------------------#
   local signed_late sig_all=0 sig_sampled=0 sig_changed=0 sig_unread=0 sig_offset sig_floor tag_rc lay got m_tag bad_srcs=" "
   signed_late="$(awk 'END { print NR + 0 }' "$dir/signed-now.txt")"
   : > "$dir/sigcheck-changed.txt"
-  if [ -n "$promoted_sha" ]; then
+  if [ -n "$promoted_sha" ] || [ "$index_state" = ok ]; then
     awk -F '\t' '
       FILENAME == ARGV[1] { if ($0 != "") listed[$0] = 1; next }
       FILENAME == ARGV[2] { if ($8 == "") p[$1] = $5; next }
-      !($1 in listed) && ($1 in p) && p[$1] == $5 && $8 == "" { print $1 }
-    ' "$dir/listed.txt" "$dir/promoted.tsv" "$dir/records.tsv" | LC_ALL=C sort > "$dir/sigcheck-all.txt"
+      FILENAME == ARGV[3] { if ($9 == "m" && $8 == "") x[$1] = $5; next }
+      !($1 in listed) && $8 == "" && ((($1 in p) && p[$1] == $5) || (($1 in x) && x[$1] == $5)) { print $1 }
+    ' "$dir/listed.txt" "$dir/promoted.tsv" "$dir/indexed.tsv" "$dir/records.tsv" | LC_ALL=C sort > "$dir/sigcheck-all.txt"
     sig_all="$(awk 'END { print NR + 0 }' "$dir/sigcheck-all.txt")"
   fi
   if [ "$sig_all" -gt 0 ]; then
@@ -529,7 +930,7 @@ plan_target() {
           *" $src "*) continue ;;
         esac
         probe_rc=0
-        fetch_within "$src/$f.sig" "$dir/sigcheck.sig" "$SIG_MAX_TIME" 4 || probe_rc=$?
+        fetch_within "$src/$f.sig" "$dir/sigcheck.sig" "$SIG_MAX_TIME" 4 "$src/$f.sig" || probe_rc=$?
         case "$probe_rc" in
           0)
             if sig_packet "$dir/sigcheck.sig"; then
@@ -619,7 +1020,7 @@ plan_target() {
     [ "$sha" = "$chosen_sha" ] || continue
     tried=$((tried + 1))
     rc=0
-    fetch_within "$srv/$repo.files" "$dir/upstream.files" "$FILES_MAX_TIME" "$((cands - tried + 2))" || rc=$?
+    fetch_within "$srv/$repo.files" "$dir/upstream.files" "$FILES_MAX_TIME" "$((cands - tried + 2))" "$srv/$repo.files $chosen_sha" || rc=$?
     if [ "$rc" -ne 0 ]; then
       log "$name: $srv/$repo.files did not answer within ${fetch_max}s (status $rc)"
       continue
@@ -700,7 +1101,7 @@ plan_target() {
     for s in db files; do
       rm -f "$dir/upstream.$s.sig"
       sig_rc=0
-      fetch_within "$srv/$repo.$s.sig" "$dir/upstream.$s.sig" "$SIG_MAX_TIME" "$((cands - tried + 1))" || sig_rc=$?
+      fetch_within "$srv/$repo.$s.sig" "$dir/upstream.$s.sig" "$SIG_MAX_TIME" "$((cands - tried + 1))" "$srv/$repo.$s.sig $chosen_sha" || sig_rc=$?
       case "$sig_rc" in
         0) log "$name: upstream signs $repo.$s" ;;
         4) ;;
@@ -741,18 +1142,71 @@ plan_target() {
   fi
 
   #-------------------------------------------------------------------------#
-  # 6. Skip or todo. A file of signed-now.txt is todo, whatever its record
-  #    says: one promoted with no signature that upstream signs now (step 4),
-  #    and one whose detached .sig upstream made again (step 4b).
+  # The verify context of this run (lib.sh verify_context). Not known when
+  # the latest database of keyring_from did not read: then no indexed file
+  # counts as verified, and the verified flags of the index carry over.
+  #-------------------------------------------------------------------------#
+  local verify_ctx="" ctx_rc=0
+  keyring_records "$conf" "$dir" "$dir/index/keyrings.tsv" || ctx_rc=$?
+  if [ "$ctx_rc" -eq 0 ]; then
+    verify_ctx="$(verify_context "$conf" "$dir/index/keyrings.tsv")" || ctx_rc=$?
+  fi
+  if [ "$ctx_rc" -ne 0 ]; then
+    verify_ctx=""
+    log "$name: the verify context is not known this run: no indexed file counts as verified, and the verified flags of the index carry over"
+  fi
+
+  #-------------------------------------------------------------------------#
+  # 6. Skip, todo or verify. With P promoted (the same sha256 and %PGPSIG%),
+  #    I indexed (state m, the same record), A indexed as absent upstream
+  #    (state a, the same record), V indexed and verified under this verify
+  #    context, and again a file of signed-now.txt (step 4 or 4b):
+  #      todo     !(P or I) or again or A
+  #      new      (!P and !V) or again or A, so todo is a part of new
+  #      vouched  I and not again
   #-------------------------------------------------------------------------#
   cut -f 1 "$dir/records.tsv" | "$WRAPPER" --tags > "$dir/pairs.tsv"
-  awk -F '\t' -v OFS='\t' -v target="$name" '
+  : > "$dir/todo.tsv"
+  : > "$dir/new.tsv"
+  : > "$dir/vouched.tsv"
+  awk -F '\t' -v OFS='\t' -v target="$name" -v vc="$verify_ctx" -v ic="$index_context" \
+    -v todo="$dir/todo.tsv" -v new="$dir/new.tsv" -v vouched="$dir/vouched.tsv" '
+    BEGIN { vc = vc ""; ic = ic "" }
     FILENAME == ARGV[1] { again[$1] = 1; next }
-    FILENAME == ARGV[2] { promoted[$1] = $5; psig[$1] = $8; next }
-    FILENAME == ARGV[3] { tag[$1] = $2; next }
-    !($1 in again) && ($1 in promoted) && promoted[$1] == $5 && psig[$1] == $8 { next }
-    { print target, $1, tag[$1], $5, $6, $2, "todo", $7, $8 }
-  ' "$dir/signed-now.txt" "$dir/promoted.tsv" "$dir/pairs.tsv" "$dir/records.tsv" > "$dir/todo.tsv"
+    FILENAME == ARGV[2] { p[$1] = $5 "\t" $8; next }
+    FILENAME == ARGV[3] { x[$1] = $5 "\t" $8; xs[$1] = $9; xv[$1] = $10; xu[$1] = $11; next }
+    FILENAME == ARGV[4] { uns[$1] = 1; next }
+    FILENAME == ARGV[5] { tag[$1] = $2; next }
+    {
+      f = $1
+      rec = $5 "\t" $8
+      P = (f in p) && p[f] == rec
+      I = (f in x) && x[f] == rec && xs[f] == "m"
+      A = (f in x) && x[f] == rec && xs[f] == "a"
+      V = I && xv[f] == "1" && vc != "" && vc == ic
+      ag = (f in again)
+      if (!(P || I) || ag || A) {
+        print target, f, tag[f], $5, $6, $2, "todo", $7, $8 > todo
+        print target, f, tag[f], $5, $6, $2, "todo", $7, $8 > new
+      } else if (!P && !V) {
+        print target, f, tag[f], $5, $6, $2, "verify", $7, $8 > new
+      }
+      if (I && !ag) {
+        v = (vc == "" || vc == ic) ? xv[f] : 0
+        u = (f in uns) ? 1 : xu[f]
+        print f, v, u > vouched
+      }
+    }
+  ' "$dir/signed-now.txt" "$dir/promoted.tsv" "$dir/indexed.tsv" "$dir/unsigned.txt" "$dir/pairs.tsv" "$dir/records.tsv"
+  local not_new
+  not_new="$(awk -F '\t' 'FILENAME == ARGV[1] { n[$2] = 1; next } !($2 in n) { c++ } END { print c + 0 }' "$dir/new.tsv" "$dir/todo.tsv")"
+  if [ "$not_new" -ne 0 ]; then
+    set_state "$dir" error "plan's own check failed: $not_new todo file(s) are not in new.tsv, and every todo file must be verified"
+    return 0
+  fi
+  if [ "$index_state" = ok ]; then
+    log "$name: the index spares $(awk 'END { print NR + 0 }' "$dir/vouched.tsv") file(s) a mirror, and $(awk -F '\t' 'FILENAME == ARGV[1] { n[$2] = 1; next } !($1 in n) && $2 == "1" { c++ } END { print c + 0 }' "$dir/new.tsv" "$dir/vouched.tsv") a verify; this run mirrors $(awk 'END { print NR + 0 }' "$dir/todo.tsv") and verifies $(awk 'END { print NR + 0 }' "$dir/new.tsv")"
+  fi
   local resigned
   resigned="$(awk -F '\t' 'FILENAME == ARGV[1] { p[$1] = $5; s[$1] = $8; next } ($2 in p) && p[$2] == $4 && s[$2] != $9 { n++ } END { print n + 0 }' \
     "$dir/promoted.tsv" "$dir/todo.tsv")"
@@ -760,11 +1214,52 @@ plan_target() {
     log "$name: $resigned file(s) keep their bytes and carry a new %PGPSIG%; mirror-file repairs their signature layers"
   fi
   if [ "$signed_late" -gt 0 ]; then
-    log "$name: $signed_late file(s) promoted with no signature have a .sig upstream now; mirror-file adds their signature layers"
+    log "$name: $signed_late file(s) promoted or indexed with no signature have a .sig upstream now; mirror-file adds their signature layers"
   fi
   if [ "$((signed_now - signed_late))" -gt 0 ]; then
     log "$name: $((signed_now - signed_late)) file(s) with a detached signature only are planned again; mirror-file pushes again each one whose .sig differs"
   fi
+
+  #-------------------------------------------------------------------------#
+  # 6b. ⛔ A tag that a row of the index vouches for is not written until
+  #     the row is withdrawn: an index row of a todo file (state m) goes
+  #     before any shard starts. The same ref.db and the same annotations
+  #     stay, so oras uploads only the new index.tsv.
+  #-------------------------------------------------------------------------#
+  local withdraw=0
+  if [ "$index_state" = ok ]; then
+    awk -F '\t' 'FILENAME == ARGV[1] { if ($2 == "m") m[$1] = 1; next } ($2 in m) { print $2 }' \
+      "$dir/index/index.tsv" "$dir/todo.tsv" > "$dir/index/withdraw.txt"
+    withdraw="$(awk 'END { print NR + 0 }' "$dir/index/withdraw.txt")"
+  fi
+  if [ "$withdraw" -gt 0 ]; then
+    if ! index_withdraw "$repo_path" "$dir/index"; then
+      set_state "$dir" error "could not withdraw $withdraw index row(s) before their tags are written ($repo_path:$INDEX_TAG)"
+      return 0
+    fi
+    log "$name: $withdraw row(s) withdrawn from $repo_path:$INDEX_TAG, now $reg_digest; mirror-file may write their tags"
+    index_digest="$reg_digest"
+  fi
+
+  #-------------------------------------------------------------------------#
+  # 6c. Registry sources: the siblings that hold a todo file's bytes
+  #-------------------------------------------------------------------------#
+  : > "$dir/sources.tsv"
+  if [ -s "$dir/todo.tsv" ]; then
+    sibling_hints "$conf" "$dir"
+    if [ -s "$dir/sources.tsv" ]; then
+      log "$name: $(cut -f 1 "$dir/sources.tsv" | sort -u | awk 'END { print NR + 0 }') todo file(s) are on a sibling repository: $(cut -f 2 "$dir/sources.tsv" | sort -u | tr '\n' ' ' | sed 's/ $//')"
+    fi
+  fi
+
+  local ctx_out="$verify_ctx"
+  if [ -z "$ctx_out" ]; then
+    ctx_out="$index_context"
+  fi
+  {
+    printf 'INDEX_TAG=%s\nINDEX_STATE=%s\nINDEX_DIGEST=%s\n' "$INDEX_TAG" "$index_state" "$index_digest"
+    printf 'INDEX_CONTEXT=%s\nVERIFY_CONTEXT=%s\nINDEX_CONTEXT_OUT=%s\n' "$index_context" "$verify_ctx" "$ctx_out"
+  } >> "$dir/meta.env"
 
   #-------------------------------------------------------------------------#
   # 7. This target's shards
@@ -775,7 +1270,7 @@ plan_target() {
   if [ "$sig_changed" -gt 0 ]; then
     sig_note="; $sig_changed detached signature(s) changed upstream"
   fi
-  set_state "$dir" pending "$(awk 'END { print NR + 0 }' "$dir/todo.tsv") file(s) to mirror, $(awk -F '\t' '{ s += $5 } END { printf "%.0f", s / 1048576 }' "$dir/todo.tsv") MiB, in $(find "$dir/shards" -name '*.tsv' | awk 'END { print NR + 0 }') shard(s), database from $chosen_server$sig_note$(nul_note "$dir")"
+  set_state "$dir" pending "$(awk 'END { print NR + 0 }' "$dir/todo.tsv") file(s) to mirror, $(awk 'END { print NR + 0 }' "$dir/new.tsv") to verify, $(awk -F '\t' '{ s += $5 } END { printf "%.0f", s / 1048576 }' "$dir/todo.tsv") MiB, in $(find "$dir/shards" -name '*.tsv' | awk 'END { print NR + 0 }') shard(s), database from $chosen_server$sig_note$(nul_note "$dir")"
 }
 
 left="$#"
@@ -785,7 +1280,9 @@ for conf in "$@"; do
   prune "$out/$(target_get "$conf" arch)-$(target_get "$conf" repo)"
   left=$((left - 1))
 done
+rm -rf "$out/.fetch-cache"
 log "the upstream reads took $((SECONDS + PLAN_BUDGET - run_deadline))s of PLAN_BUDGET=${PLAN_BUDGET}s"
+log "the registry reads of the index, the keyring records and the siblings took ${reg_spent}s of REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s"
 
 #---------------------------------------------------------------------------#
 # The matrices: one entry per pending target, with its shards

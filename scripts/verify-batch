@@ -11,10 +11,18 @@
 #   OUT/verify-TARGET-BATCH.log   everything, with a UTC time on each phase
 #   OUT/refused-TARGET-BATCH.tsv  file reason, one line per upstream-refused
 #                                 package (below); written only when there is one
+#   OUT/faults-TARGET-BATCH.txt   the files at fault, one per line, sorted;
+#                                 written with each failed verdict
 # result is passed or failed. digest is the staged manifest the verdict is
 # about, so a verdict left over from another attempt is never taken for this
 # one. The verdict is written even when the step is killed (EXIT trap), with
 # the packages named at fault so far.
+#
+# The files at fault are each file of a @@sigbad line, and the file of each
+# package of a @@refused line (the stage's records.tsv), less the
+# upstream-refused ones. scripts/index-write removes their rows from the
+# index, so the next run reads their tags again. A failure that names no file
+# gives an empty list.
 #
 # ⭐ pacman checks what it always checks: every file's sha256 against the
 # database and every signature against the distribution's keyring, with its
@@ -109,12 +117,40 @@ mkdir -p "$out"
 report="$out/verify-$target-$batch.tsv"
 log_file="$out/verify-$target-$batch.log"
 refused_file="$out/refused-$target-$batch.tsv"
-rm -f "$report" "$refused_file"
+faults_file="$out/faults-$target-$batch.txt"
+rm -f "$report" "$refused_file" "$faults_file"
 : > "$log_file"
 
+# verdict RESULT DETAIL: the verdict, and with failed the files at fault
 verdict() {
   printf '%s\t%s\t%s\t%s\t%s\n' "$target" "$batch" "$1" "$2" "${DIGEST:-unknown}" > "$report"
+  if [ "$1" = failed ] && ! faults_write; then
+    warn "$target batch $batch: the files at fault could not be written to $faults_file"
+  fi
   log "$target batch $batch: $1: $2"
+}
+
+# faults_write: OUT/faults-TARGET-BATCH.txt from the log so far. The records
+# map a package name to its file, and the upstream-refused files (column 1 of
+# OUT/refused-TARGET-BATCH.tsv) are left out. The three inputs go through one
+# stream, each line marked with its source, so a missing one reads as empty.
+faults_write() {
+  local records="$stage/$target/records.tsv"
+  {
+    if [ -f "$records" ]; then
+      awk -F '\t' '{ print "r\t" $1 "\t" $2 }' "$records"
+    fi
+    if [ -f "$refused_file" ]; then
+      awk -F '\t' '{ print "x\t" $1 }' "$refused_file"
+    fi
+    awk -F '\t' '$1 == "@@sigbad" || $1 == "@@refused" { print $1 "\t" $2 }' "$log_file"
+  } | awk -F '\t' '
+    $1 == "r" { file[$3] = $2; next }
+    $1 == "x" { excused[$2] = 1; next }
+    $1 == "@@sigbad" { bad[$2] = 1; next }
+    $1 == "@@refused" && ($2 in file) { bad[file[$2]] = 1 }
+    END { for (f in bad) if (!(f in excused)) print f }
+  ' | LC_ALL=C sort -u > "$faults_file"
 }
 
 # culprits_so_far -> the packages the log names at fault, one line
