@@ -1295,11 +1295,18 @@ batch_count() {
 #                valid for the bytes. pacman 7.1 takes a key whose primary has
 #                expired for a missing one: it asks a keyserver, then says
 #                "required key missing from keyring" (measured 2026-10-14).
+#   arch         pacman refuses the package for its architecture: a cross-arch
+#                package upstream lists in this repository (ArchPOWER's powerpc64
+#                database carries powerpc64le ones). It is upstream's own defect,
+#                so verify excuses it once the mirror is seen to serve exactly
+#                the database's bytes (scripts/verify-batch upstream_refused).
 #   other        anything else: the wrapper does not serve the package, a
-#                checksum, an architecture, a name pacman does not know
-# A line of the other class wins over any signature line: a package with two
-# faults is not excused for the one that is upstream's. The wrapper's own lines
-# are not read: they are its wording, which may change, not pacman's verdict.
+#                checksum, a name pacman does not know
+# An arch or other line wins over any signature line: a package with two faults
+# is classed by the one that is not a signature. arch wins even over "the
+# wrapper does not serve it", since pacman naming the architecture is the real
+# reason. The wrapper's own lines are not read: they are its wording, which may
+# change, not pacman's verdict.
 #---------------------------------------------------------------------------#
 refusal_reason() {
   awk -v pkg="${2:-}" -v sig="${3:-}" '
@@ -1312,8 +1319,12 @@ refusal_reason() {
         else if (other == "") other = line
         next
       }
-      if (line ~ /invalid or corrupted package \(checksum\)|does not have a valid architecture|package architecture is not valid/) {
+      if (line ~ /invalid or corrupted package \(checksum\)/) {
         if (other == "") other = line
+        next
+      }
+      if (line ~ /does not have a valid architecture|package architecture is not valid/) {
+        if (arch_err == "") arch_err = line
         next
       }
       if (line ~ /missing required signature/) { if (missing == "") missing = line; next }
@@ -1327,7 +1338,8 @@ refusal_reason() {
       if (line ~ /^error: / && line !~ /^error: failed to commit transaction/ && other == "") other = line
     }
     END {
-      if (pkg != "0") print "other\tthe wrapper does not serve the package itself (exit " pkg ")"
+      if (arch_err != "") print "arch\t" arch_err
+      else if (pkg != "0") print "other\tthe wrapper does not serve the package itself (exit " pkg ")"
       else if (other != "") print "other\t" other
       else if (refused != "") print "sig-refused\t" refused
       else if (missing != "") print "sig-missing\t" missing

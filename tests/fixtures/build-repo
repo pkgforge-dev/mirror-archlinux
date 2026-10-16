@@ -44,6 +44,9 @@
 #              database name but whose package file and .sig are removed, so
 #              every server answers 404 for it, as ArchPOWER's powerpc base
 #              names kwayland-server-debug with the file gone (2026-10-16)
+#   pkg-crossarch  here-1-1 (aarch64), and cross-1-1 built for x86_64 but listed
+#              in this aarch64 repository, as ArchPOWER's powerpc64 database
+#              carries powerpc64le packages that pacman refuses (2026-10-16)
 #   files-lag  40 packages with no signature, p01 to p40; p01 to p12 rebuilt
 #              at pkgrel 2, and a files database of before that rebuild, as
 #              when the files database lags during a mass rebuild
@@ -289,6 +292,17 @@ case "$state" in
     mkpkg gone 1-2 any 1700000100 "a package upstream no longer serves"
     repo-add --quiet --include-sigs "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
     rm -f "$repo/gone-1-2-any.pkg.tar.zst" "$repo/gone-1-2-any.pkg.tar.zst.sig"
+    ls -l "$repo"
+    exit 0
+    ;;
+  pkg-crossarch)
+    # here-1-1 is a normal aarch64 package; cross-1-1 is built for x86_64 but
+    # listed in this aarch64 repository, as ArchPOWER's powerpc64 database
+    # carries powerpc64le packages. pacman refuses the cross-arch one for its
+    # architecture; the mirror serves it faithfully and verify excuses it.
+    mkpkg here 1-1 aarch64 1700000000 "an aarch64 package"
+    mkpkg cross 1-1 x86_64 1700000100 "a package built for another architecture"
+    repo-add --quiet --include-sigs "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
     ls -l "$repo"
     exit 0
     ;;

@@ -704,6 +704,27 @@ else
   fail "the stage names the file(s) it skipped as absent" "read out/gone/stage-aarch64-port.log"
 fi
 
+#---------------------------------------------------------------------------#
+# 1e4. A package the database lists for another architecture (upstream mixes
+#      arches, as ArchPOWER's powerpc64 base carries powerpc64le packages):
+#      pacman refuses it, but the mirror serves it faithfully, so verify excuses
+#      it as upstream-refused and the target stages and promotes.
+#---------------------------------------------------------------------------#
+build pkg-crossarch aarch64/port-cross port
+mkdir -p "$work/targets-cross"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/port-cross|; s|/\$arch/\./\$repo$|/$arch/./port-cross|' "$work/targets/aarch64-port.conf" > "$work/targets-cross/aarch64-port.conf"
+TARGETS_DIR="$work/targets-cross" MIRROR_NAMESPACE=it/cross sync cross aarch64-port
+check "a cross-arch package is excused as upstream-refused, and the target stages and promotes" "staged promoted" \
+  "$(state_of cross stage aarch64-port) $(cut -f 2 "$work/out/cross/promote-aarch64-port.tsv" 2> /dev/null)" \
+  "read out/cross/stage-aarch64-port.log out/cross/verify/verify-aarch64-port-0.log out/cross/promote-aarch64-port.log"
+if grep -h -- 'cross-1-1-x86_64.pkg.tar.zst' "$work/out/cross/verify"/refused-aarch64-port-*.tsv 2>/dev/null | grep -q 'arch:'; then
+  ok "verify names the cross-arch package as upstream-refused for its architecture"
+else
+  fail "verify names the cross-arch package as upstream-refused for its architecture" \
+    "read out/cross/verify/refused-aarch64-port-0.tsv out/cross/verify/verify-aarch64-port-0.log"
+fi
+
 # A files database that lags a mass rebuild: 12 of 40 packages at their
 # earlier file names, 24 file names that only one of the two databases names.
 # That is more than the larger of 16 and half the records, and is still the

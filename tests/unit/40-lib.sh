@@ -595,8 +595,10 @@ reason "a package the wrapper does not serve is not excused" \
   "$(printf '%s\n' 'error: failed to commit transaction (failed to retrieve some files)')" 1 1 other
 reason "a checksum is not a signature reason" \
   "$(printf '%s\n' 'error: alpha: signature from "x" is unknown trust' ':: File x is corrupted (invalid or corrupted package (checksum)).')" 0 0 other
-reason "an architecture is not a signature reason" \
-  "$(printf '%s\n' ':: package port-1-1-aarch64 does not have a valid architecture' 'error: failed to prepare transaction (package architecture is not valid)')" 0 0 other
+reason "an architecture is its own class, not a signature reason" \
+  "$(printf '%s\n' ':: package port-1-1-aarch64 does not have a valid architecture' 'error: failed to prepare transaction (package architecture is not valid)')" 0 0 arch
+reason "an architecture wins over the wrapper not serving it, so pacman's real reason is kept" \
+  "$(printf '%s\n' 'error: failed to prepare transaction (package architecture is not valid)')" 1 0 arch
 reason "a failure pacman names no reason for is not excused" "error: something else" 0 0 other
 
 #---------------------------------------------------------------------------#

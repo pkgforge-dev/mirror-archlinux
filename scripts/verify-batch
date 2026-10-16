@@ -667,7 +667,20 @@ upstream_refused() {
       return 0
       ;;
   esac
-  refused_why="pacman refused it for a reason that is not in its signature"
+  # Any other reason pacman gives — a cross-arch package (class arch), or a
+  # similar upstream-data defect — is upstream's, not the mirror's, once the
+  # mirror is seen to serve exactly the file the database names. decide_push read
+  # the tag above: present (the file and its signature) or needsig (the file, for
+  # one upstream signs nowhere) means the mirror holds the database's own bytes,
+  # so a consumer meets the same refusal from upstream directly. Any other
+  # decision (the tag holds other bytes, or none) is the mirror's own fault, and
+  # is not excused.
+  case "$decision" in
+    present | needsig)
+      return 0
+      ;;
+  esac
+  refused_why="the mirror does not serve the database's bytes for it (tag decision: $decision)"
   return 1
 }
 
