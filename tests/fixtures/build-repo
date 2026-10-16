@@ -283,13 +283,15 @@ case "$state" in
     exit 0
     ;;
   pkg-missing)
-    # here-1-1 is served; gone-1-1 stays in the database and the files database,
+    # here-1-1 is served; gone-1-2 stays in the database and the files database,
     # but its package file and .sig are removed, so every server answers 404 for
     # it: upstream's database names a file it no longer serves, as ArchPOWER's
     # powerpc base does for kwayland-server-debug. The mirror skips it as absent
-    # and still promotes the target.
-    mkpkg here 1-1 any 1700000000 "a package upstream serves"
-    mkpkg gone 1-2 any 1700000100 "a package upstream no longer serves"
+    # and still promotes the target. gone is the SMALLEST package, so it would be
+    # verify's canary but for the skip: the target holds if an absent file leaks
+    # into the canary batch, which is how this catches a broken canary exclusion.
+    mkpkg here 1-1 any 1700000000 "$(for i in $(seq 1 25); do printf 'here %s\n' "$i" | sha256sum | cut -d ' ' -f 1; done)"
+    mkpkg gone 1-2 any 1700000100 "x"
     repo-add --quiet --include-sigs "$repo/$db.db.tar.gz" "$repo"/*.pkg.tar.zst
     rm -f "$repo/gone-1-2-any.pkg.tar.zst" "$repo/gone-1-2-any.pkg.tar.zst.sig"
     ls -l "$repo"
