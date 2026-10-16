@@ -34,9 +34,15 @@
 # tried. A signature that is missing or wrong next to the right package bytes is
 # repaired, by pushing again with the same package blob (a repush).
 #
-# ⛔ A push or a repush writes a tag. Two rules come first:
+# ⛔ A push or a repush writes a tag. Three rules come first:
 #   MIRROR_REPAIR=0 (a run on a branch): no repush. The result is failed "a
 #     signature repair is left to main". Unset is 1.
+#   INDEX_STATE (scripts/mirror-shard, from the plan's meta.env) not ok,
+#     absent or invalid: no repush. With unread or ignored, plan withdrew no
+#     index row, and a valid row can vouch for the tag. The result is failed
+#     "a signature repair waits for a run that read the index". Unset is
+#     unknown. A push goes only to an absent tag, which no valid row vouches
+#     for.
 #   GITHUB_RUN_ATTEMPT above 1 (a re-run): no tag of a file that
 #     $WORK/index-listed.txt lists (scripts/mirror-shard). A newer run can
 #     vouch for that tag in the index. The result is failed "the index lists
@@ -54,9 +60,9 @@
 # (lib.sh throttle_pause), then the next source is asked. Any other answer,
 # other bytes too, marks the repository down for the shard
 # ($WORK/down/r-<repository, each / a _>), and no file of the shard asks it
-# again. When a registry source gave no answer that decides, a file that
-# every server answers 404 for is failed, not absent: the registry can hold
-# it.
+# again. The absent rule looks at the upstream servers only: a file that
+# every server answers 404 for, with none that erred or gave other bytes, is
+# absent, whatever a registry source answered.
 #
 # ⭐ The signature layer is the database's own %PGPSIG%, decoded, whenever the
 # database carries one: pacman checks against that copy, and asks for the .sig
@@ -86,7 +92,8 @@
 # GHCR's limit for one upload. MIRROR_RATE_WAIT (seconds; default 1800) bounds
 # the pauses one file takes after a 429 from the registry (below), each of
 # RATE_PAUSE_MIN to RATE_PAUSE_MAX seconds (20 to 60; lib.sh throttle_pause).
-# MIRROR_REPAIR (0 or 1; default 1) and GITHUB_RUN_ATTEMPT (default 1), above.
+# MIRROR_REPAIR (0 or 1; default 1), INDEX_STATE (default unknown) and
+# GITHUB_RUN_ATTEMPT (default 1), above.
 #
 # Exit status: 0 pushed, present or absent, 1 anything else.
 set -euo pipefail
@@ -112,6 +119,10 @@ RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
 case "$RUN_ATTEMPT" in
   '' | *[!0-9]* | 0) die "GITHUB_RUN_ATTEMPT must be a positive integer, not '$RUN_ATTEMPT'" ;;
 esac
+PLAN_INDEX_STATE="${INDEX_STATE:-unknown}"
+if [[ ! "$PLAN_INDEX_STATE" =~ ^[a-z]+$ ]]; then
+  PLAN_INDEX_STATE=unknown
+fi
 
 started="$(date -u +%s)"
 result_file="$RESULTS/$line.tsv"
@@ -285,12 +296,21 @@ esac
 
 #---------------------------------------------------------------------------#
 # ⛔ The decision is push or repush: a tag is written. A run on a branch
-# repairs no signature layer, and a re-run writes no tag that the live index
-# can vouch for.
+# repairs no signature layer, a run whose plan did not read the index repairs
+# none either, and a re-run writes no tag that the live index can vouch for.
 #---------------------------------------------------------------------------#
 if [ "$decision" = repush ] && [ "$REPAIR" = 0 ]; then
   result failed "a signature repair is left to main; $ref holds these package bytes with other layers than the database gives (MIRROR_REPAIR=0)"
   exit 1
+fi
+if [ "$decision" = repush ]; then
+  case "$PLAN_INDEX_STATE" in
+    ok | absent | invalid) ;;
+    *)
+      result failed "a signature repair waits for a run that read the index (INDEX_STATE $PLAN_INDEX_STATE); $ref holds these package bytes with other layers than the database gives"
+      exit 1
+      ;;
+  esac
 fi
 if [ "$RUN_ATTEMPT" -gt 1 ]; then
   if [ ! -f "$WORK/index-listed.txt" ]; then
@@ -403,11 +423,12 @@ if [ -z "$got_from" ]; then
   # Every server answered 404, and none erred or offered other bytes: the file
   # is gone from upstream though its database still names it. Skip it rather than
   # fail, so one stale upstream entry cannot hold the whole target; the mirror
-  # then reflects upstream, where this file is a 404 too, and plan lists it again
-  # so it is picked up if it returns. An error (a server down) or other bytes
-  # (a build in flight) is still a failure, retried next run. So is a
-  # registry source that gave no answer that decides: it can hold the bytes.
-  if [ "$dl_error" -eq 0 ] && [ "$dl_other" -eq 0 ] && [ "$dl_absent" -gt 0 ] && [ -z "$reg_undecided" ]; then
+  # then reflects upstream, where this file is a 404 too. plan plans it again
+  # until a promoted database names it, so it is picked up if it returns. An error (a server down) or other bytes
+  # (a build in flight) is still a failure, retried next run. The rule looks
+  # at the upstream servers only: what a registry source answered does not
+  # change it.
+  if [ "$dl_error" -eq 0 ] && [ "$dl_other" -eq 0 ] && [ "$dl_absent" -gt 0 ]; then
     result absent "every server answers 404 for it ($dl_absent of $n); upstream's database names it but no longer serves the file"
     exit 0
   fi

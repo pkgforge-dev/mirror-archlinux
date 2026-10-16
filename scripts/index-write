@@ -26,7 +26,9 @@
 # Verify credit, only when STAGE/TARGET is staged from this plan. For each
 # batch of STAGE/TARGET/batches, the first verify-TARGET-N.tsv under VERIFY
 # (as scripts/promote reads it), when it is about the staged DIGEST:
-#   passed  the m rows of the files of the batch get verified 1
+#   passed  the m rows of the files of the batch get verified 1, only when
+#           the plan knows the verify context of this run (VERIFY_CONTEXT
+#           not empty). Otherwise each row keeps the flag it carries.
 #   failed  the m rows of the files in faults-TARGET-N.txt beside the verdict
 #           go, so the next run reads their tags again. A failed batch with
 #           no such file changes nothing: its rows keep verified 0.
@@ -35,12 +37,17 @@
 # ⛔ The writer guard. Just before the push, the live index tag is read with
 # the workflow's token. The push goes ahead only when one of these holds:
 #   a. the live manifest is the one plan read, or the one its withdrawal
-#      pushed (INDEX_DIGEST; INDEX_STATE ok or invalid)
-#   b. there is no live tag, and plan found none (INDEX_STATE absent)
-#   c. INDEX_STATE is ignored: a reset, and the new index replaces any
-#   d. the live index names this plan (dev.pkgforge.mirror.plan-id): an
-#      earlier attempt of this run wrote it
-# A live index of this plan also gives verified 1 to each m row of the same
+#      pushed (INDEX_DIGEST, not empty; INDEX_STATE ok, invalid or ignored)
+#   b. there is no live tag, and plan found none (INDEX_STATE absent, or
+#      ignored with INDEX_PRIOR absent)
+#   c. INDEX_STATE is ignored (a reset): only by rule a, b or d. With no
+#      answer to plan's read of the tag (INDEX_DIGEST and INDEX_PRIOR both
+#      empty), nothing is pushed, and a warning says that the reset can be
+#      run again.
+#   d. the live index names this plan (dev.pkgforge.mirror.plan-id), and no
+#      other plan withdrew rows from it since (dev.pkgforge.mirror.withdrawn-by
+#      empty or this plan): an earlier attempt of this run wrote it
+# A live index of rule d also gives verified 1 to each m row of the same
 # filename that it holds as verified, whichever rule lets the push go ahead.
 # Anything else, a live read that fails too, keeps the live tag, with a
 # warning: a newer run may have written it. The sync concurrency group lets
@@ -99,6 +106,8 @@ plan_id="$(cat "$pdir/plan-id")"
 index_tag="$(meta INDEX_TAG)"
 index_state="$(meta INDEX_STATE)"
 index_digest="$(meta INDEX_DIGEST)"
+index_prior="$(meta INDEX_PRIOR)"
+verify_ctx="$(meta VERIFY_CONTEXT)"
 context_out="$(meta INDEX_CONTEXT_OUT)"
 fetched="$(meta FETCHED)"
 [ -n "$plan_id" ] || die "$pdir/plan-id is empty"
@@ -108,6 +117,8 @@ case "$index_state" in
   *) die "$pdir/meta.env: INDEX_STATE must be ok, absent, invalid, unread or ignored, not '$index_state'" ;;
 esac
 [[ "$index_digest" =~ ^(sha256:[0-9a-f]{64})?$ ]] || die "$pdir/meta.env: INDEX_DIGEST is not sha256:<64 hex>: '$index_digest'"
+[[ "$index_prior" =~ ^(absent)?$ ]] || die "$pdir/meta.env: INDEX_PRIOR must be absent or empty, not '$index_prior'"
+[[ "$verify_ctx" =~ ^([0-9a-f]{64})?$ ]] || die "$pdir/meta.env: VERIFY_CONTEXT is not 64 hex digits: '$verify_ctx'"
 [[ "$context_out" =~ ^([0-9a-f]{64})?$ ]] || die "$pdir/meta.env: INDEX_CONTEXT_OUT is not 64 hex digits: '$context_out'"
 [[ "$fetched" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die "$pdir/meta.env: FETCHED is not ISO 8601 UTC: '$fetched'"
 if [ "$index_state" = unread ]; then
@@ -198,6 +209,12 @@ if [ -n "$staged_digest" ]; then
     esac
   done
   log "$target: $passed batch(es) passed and $failed failed for $staged_digest; $(awk 'END { print NR + 0 }' "$work/faults.txt") file(s) at fault"
+  # A verdict holds for the inputs it ran with. With no known verify
+  # context, a pass names no context, so it gives no verified 1.
+  if [ -z "$verify_ctx" ] && [ "$passed" -gt 0 ]; then
+    log "$target: the plan did not know the verify context of this run (VERIFY_CONTEXT is empty): the $passed passed batch(es) give no verified 1, and each row keeps the flag it carries"
+    : > "$work/passed-names.txt"
+  fi
 fi
 # Names to filenames through the stage's records. A failed batch's files at
 # fault lose their m rows; a passed batch's files get verified 1.
@@ -228,23 +245,35 @@ rc=0
 registry_manifest "$repo_path" "$index_tag" "$work/live/manifest.json" || rc=$?
 live_digest=""
 live_plan=""
+live_withdrawn=""
 case "$rc" in
   "$REG_STATUS_OK")
     live_digest="sha256:$(sha256sum "$work/live/manifest.json" | cut -d ' ' -f 1)"
     live_plan="$(jq -r '.annotations["dev.pkgforge.mirror.plan-id"]? // "" | tostring' "$work/live/manifest.json")"
-    live_note="$live_digest, plan $live_plan"
+    live_withdrawn="$(jq -r '.annotations["dev.pkgforge.mirror.withdrawn-by"]? // "" | tostring' "$work/live/manifest.json")"
+    live_note="$live_digest, plan $live_plan${live_withdrawn:+, rows withdrawn by plan $live_withdrawn}"
     ;;
   "$REG_STATUS_ABSENT") live_note="no tag" ;;
   *) live_note="no answer (status $rc)" ;;
 esac
-if [ "$index_state" = ignored ]; then
-  why="the plan did not read the index (INDEX_STATE ignored), and this index replaces any ($live_note)"
-elif [ "$rc" -eq "$REG_STATUS_OK" ] && [ "$live_digest" = "$index_digest" ]; then
+# d: an earlier attempt of this plan wrote the live index, and no other plan
+# withdrew rows from it since. A withdrawal keeps the plan-id of the index it
+# changes, and names its own plan in withdrawn-by.
+ours=0
+if [ "$rc" -eq "$REG_STATUS_OK" ] && [ "$live_plan" = "$plan_id" ] && { [ -z "$live_withdrawn" ] || [ "$live_withdrawn" = "$plan_id" ]; }; then
+  ours=1
+fi
+if [ "$rc" -eq "$REG_STATUS_OK" ] && [ -n "$index_digest" ] && [ "$live_digest" = "$index_digest" ]; then
   why="the live index is the one the plan read ($index_digest)"
-elif [ "$rc" -eq "$REG_STATUS_ABSENT" ] && [ "$index_state" = absent ]; then
+elif [ "$rc" -eq "$REG_STATUS_ABSENT" ] && { [ "$index_state" = absent ] || { [ "$index_state" = ignored ] && [ "$index_prior" = absent ]; }; }; then
   why="there is no index yet, as the plan found"
-elif [ "$rc" -eq "$REG_STATUS_OK" ] && [ "$live_plan" = "$plan_id" ]; then
+elif [ "$ours" -eq 1 ]; then
   why="an earlier attempt of this plan wrote the live index ($live_digest)"
+elif [ "$index_state" = ignored ] && [ -z "$index_digest" ] && [ "$index_prior" != absent ]; then
+  warn "$target: $repo_path:$index_tag is not written: the plan's read of the tag gave no answer (INDEX_STATE ignored), so the index that this reset replaces is not known (live: $live_note)" \
+    "the reset can be run again; the next run plans from the index there now" \
+    "reproduce: curl -s -H 'Authorization: Bearer QQ==' -H 'Accept: application/vnd.oci.image.manifest.v1+json' $REG_URL/v2/$repo_path/manifests/$index_tag"
+  exit 0
 else
   warn "$target: $repo_path:$index_tag is kept, and this run's rows are not pushed: the live index ($live_note) is not the one the plan read (INDEX_STATE $index_state${index_digest:+, $index_digest})" \
     "a newer run may have written it; the next run plans from it" \
@@ -254,9 +283,10 @@ fi
 log "$target: the guard lets this run write $repo_path:$index_tag: $why"
 
 LC_ALL=C sort "$work/rows-credit.tsv" > "$work/push/index.tsv"
-# d: a live index of this plan gives its verified 1 to each m row of the same
-# filename. This holds whichever rule lets the push go ahead.
-if [ "$rc" -eq "$REG_STATUS_OK" ] && [ "$live_plan" = "$plan_id" ]; then
+# d: a live index of this plan, with no other plan's withdrawal since, gives
+# its verified 1 to each m row of the same filename. This holds whichever
+# rule lets the push go ahead.
+if [ "$ours" -eq 1 ]; then
   read -r d _ t <<< "$(manifest_layer "$work/live/manifest.json" index.tsv)"
   if [[ ! "${d:-}" =~ ^sha256:[0-9a-f]{64}$ ]] || [ "${t:-}" != "$INDEX_TSV_MEDIA_TYPE" ]; then
     log "$target: the live index has no index.tsv layer of $INDEX_TSV_MEDIA_TYPE; no verified flag is kept from it"

@@ -98,7 +98,9 @@ jobs:
     runs-on: ubuntu-24.04
     # 20 min of upstream reads (PLAN_BUDGET) and 4 min of registry reads
     # (REGISTRY_READ_BUDGET), plus the fetcher client install and the keyring
-    # image pulls for the powerpc targets, fit under 40.
+    # image pulls for the powerpc targets, fit under 40. The registry budget
+    # stops each new read; one read in progress can run past it by up to
+    # about 4 min (lib.sh registry_get_manifest: 60 s, 3 retries).
     timeout-minutes: 40
     # packages: write, because plan withdraws from a target's index the rows
     # of the files this run writes tags of (scripts/plan step 6b).
@@ -158,7 +160,7 @@ jobs:
         run: |
           # The index tag comes from GITHUB_REF (scripts/lib.sh index_tag).
           # ignore_index is the reset: nothing is deleted, and the index this
-          # run writes replaces the one there.
+          # run writes replaces the one plan saw there (scripts/index-write).
           if [ "$IGNORE_INDEX" = true ]; then
             export INDEX_READ=0
           fi

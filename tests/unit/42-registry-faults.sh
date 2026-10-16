@@ -9,7 +9,9 @@
 # the rows, the verify credit and the writer guard of index-write. Last, the
 # re-run guard of mirror-shard (lib.sh index_guard), and in mirror-file: the
 # sources of the package bytes (its own repository on a repush, the siblings
-# plan names, upstream), MIRROR_REPAIR=0 and the re-run guard.
+# plan names, upstream), the absent rule, MIRROR_REPAIR=0, the repush rule
+# (INDEX_STATE) and the re-run guard; then the INDEX_STATE that mirror-shard
+# reads from the plan's meta.env and gives mirror-file.
 set -euo pipefail
 # shellcheck source=../lib/harness.sh
 . "$REPO_ROOT/tests/lib/harness.sh"
@@ -36,8 +38,9 @@ cat > "$FAKE/bin/curl" << 'EOF'
 #                    or not given; no line is no answer
 #   */v2/REPO/blobs/*  from $FAKE/blobs.tsv, REPO<TAB>CODE<TAB>BODY-FILE, the
 #                    first line of REPO; with no line, as any other URL
-#   any other URL    $FAKE/up/<last path element, less a sha256: prefix>
-#                    with 200, or 404
+#   any other URL    $FAKE/up/<last path element, less a sha256: prefix>:
+#                    the code in that file's .code, or 200 with the file,
+#                    or 404
 # With --write-out, prints the HTTP code.
 out="" auth="" url="" cred="" wo="" blob=""
 while [ "$#" -gt 0 ]; do
@@ -82,6 +85,9 @@ case "$url" in
     if [ -n "$blob" ]; then
       cp "$FAKE/${blob#*$'\t'}" "$out"
       code="${blob%%$'\t'*}"
+    elif [ -f "$f.code" ]; then
+      printf 'service unavailable\n' > "$out"
+      code="$(cat "$f.code")"
     elif [ -f "$f" ]; then
       cp "$f" "$out"
       code=200
@@ -177,7 +183,7 @@ export MIRROR_REGISTRY_AUTH=token
 export MIRROR_REGISTRY_SCHEME=https
 export REGISTRY_TOKEN=secret
 unset GITHUB_ACTIONS GITHUB_OUTPUT GITHUB_REF GITHUB_REF_NAME GITHUB_RUN_ID GITHUB_RUN_ATTEMPT MIRROR_REPAIR \
-  STAGING_TAG INDEX_TAG REGISTRY_TOKEN_CACHE
+  STAGING_TAG INDEX_TAG REGISTRY_TOKEN_CACHE INDEX_STATE
 
 # reset ANSWERS AFTER-PUSH 429S: the registry's answers now and after a push,
 # and how many oras calls get a 429 first. No blob has an answer of its own
@@ -238,8 +244,13 @@ rc="$(stage_run anon404)"
 check "stage: an anonymous read that the registry refuses sets private, with one read" "0 private 1" \
   "$rc $(cat "$work/stage-anon404/x86_64-core/state" 2> /dev/null) $(anon_reads)" "$ST; cat $work/stage-anon404.err"
 
-# The anonymous read answers: staged.
-reset '' 'Bearer QQ==\t200\tpushed.json\n' 0
+# The anonymous read answers: staged. The tag of a holds its bytes, so a is
+# the smallest canary.
+jq -cn --arg d "sha256:$(printf a | sha256sum | cut -d ' ' -f 1)" \
+  '{schemaVersion: 2, layers: [{mediaType: "application/vnd.pkgforge.archlinux.pkg.v1", digest: $d, size: 10, annotations: {"org.opencontainers.image.title": "a-1-1-any.pkg.tar.zst"}}]}' \
+  > "$FAKE/tag-a-first.json"
+TAG_A='Bearer QQ==\t200\ttag-a-first.json\ta-1-1-any.pkg.tar.zst\n'
+reset '' "${TAG_A}Bearer QQ==\t200\tpushed.json\n" 0
 rc="$(stage_run anon200)"
 check "stage: an anonymous read that answers stages the target" "0 staged" \
   "$rc $(cat "$work/stage-anon200/x86_64-core/state" 2> /dev/null)" "$ST; cat $work/stage-anon200.err"
@@ -263,7 +274,7 @@ pushes() {
   awk -v r="$1" '$1 == "push" && index($0, " " r " ") { n++ } END { print n + 0 }' "$FAKE/oras.log"
 }
 
-reset '' 'Bearer QQ==\t200\tpushed.json\n' 3
+reset '' "${TAG_A}Bearer QQ==\t200\tpushed.json\n" 3
 rc="$(stage_run 429)"
 check "stage: three 429s on the staging push: three pauses, four pushes of the staging tag, staged" "0 3 4 staged" \
   "$rc $(pauses "$work/stage-429.err") $(pushes ghcr.io/it/mirror/x86_64/core:staging) $(cat "$work/stage-429/x86_64-core/state" 2> /dev/null)" \
@@ -418,6 +429,23 @@ if grep -q 'there is no smallest canary' "$work/vstage-nocanary.err"; then
 else
   fail "stage: no smallest canary is a warning" "$(cat "$work/vstage-nocanary.err")" "$VST"
 fi
+check "stage: no canary, and files to verify: batch 0 gets them, as any batch does" "0.txt 2" \
+  "$(cd "$work/vstage-nocanary/x86_64-core/batches" 2> /dev/null && ls) $(awk 'END { print NR + 0 }' "$work/vstage-nocanary/x86_64-core/batches/0.txt" 2> /dev/null)" \
+  "$VST; ls $work/vstage-nocanary/x86_64-core/batches"
+
+# No canary, and nothing to verify: no batch, and the target is held.
+mv "$vp/todo.tsv" "$work/todo.tsv.kept"
+mv "$vp/new.tsv" "$work/new.tsv.kept"
+: > "$vp/todo.tsv"
+: > "$vp/new.tsv"
+reset "$ans" "$ans" 0
+rc="$(vstage_run empty)"
+mv "$work/todo.tsv.kept" "$vp/todo.tsv"
+mv "$work/new.tsv.kept" "$vp/new.tsv"
+check "stage: no canary and nothing to verify: held, with no batch and no verify job" \
+  "0 held|nothing to verify, and no canary tag reads|0|{\"include\":[]}" \
+  "$rc $(cat "$work/vstage-empty/x86_64-core/state" 2> /dev/null)|$(cat "$work/vstage-empty/x86_64-core/why" 2> /dev/null)|$(find "$work/vstage-empty/x86_64-core/batches" -name '*.txt' 2> /dev/null | awk 'END { print NR + 0 }')|$(cat "$work/vstage-empty/verify-matrix.json" 2> /dev/null)" \
+  "$VST with an empty todo.tsv and new.tsv; cat $work/vstage-empty.err"
 
 #---------------------------------------------------------------------------#
 # verify-batch: Docker Hub limits the pull of the verify image. The same
@@ -603,10 +631,12 @@ for n in 3 4 5 6 7 9; do
 done > "$ip/todo.tsv"
 printf 'n1-1-1-any.pkg.tar.zst\t1\t0\nn2-1-1-any.pkg.tar.zst\t0\t0\nn8-1-1-any.pkg.tar.zst\t0\t0\n' > "$ip/vouched.tsv"
 ICTX="$(printf 'a verify context' | sha256sum | cut -d ' ' -f 1)"
-# imeta STATE DIGEST: the plan's meta.env, with that INDEX_STATE and INDEX_DIGEST
+# imeta STATE DIGEST [PRIOR]: the plan's meta.env, with that INDEX_STATE,
+# INDEX_DIGEST and INDEX_PRIOR. VERIFY_CONTEXT is $IVC when it is set, else
+# ICTX.
 imeta() {
-  printf 'TARGET=x86_64-core\nFETCHED=2026-10-15T00:00:00Z\nINDEX_TAG=index\nINDEX_STATE=%s\nINDEX_DIGEST=%s\nINDEX_CONTEXT=%s\nVERIFY_CONTEXT=%s\nINDEX_CONTEXT_OUT=%s\n' \
-    "$1" "$2" "$ICTX" "$ICTX" "$ICTX" > "$ip/meta.env"
+  printf 'TARGET=x86_64-core\nFETCHED=2026-10-15T00:00:00Z\nINDEX_TAG=index\nINDEX_STATE=%s\nINDEX_DIGEST=%s\nINDEX_PRIOR=%s\nINDEX_CONTEXT=%s\nVERIFY_CONTEXT=%s\nINDEX_CONTEXT_OUT=%s\n' \
+    "$1" "$2" "${3:-}" "$ICTX" "${IVC-$ICTX}" "$ICTX" > "$ip/meta.env"
 }
 printf 'ip1\n' > "$work/iresults/0/plan-id"
 {
@@ -629,8 +659,9 @@ printf 'n8\n' > "$is/batches/2.txt"
 printf 'x86_64-core\t0\tpassed\t2 package(s)\t%s\n' "$sdigest" > "$work/iverify/v0/verify-x86_64-core-0.tsv"
 printf 'x86_64-core\t1\tfailed\tthe batch failed its checks\t%s\n' "$sdigest" > "$work/iverify/v1/verify-x86_64-core-1.tsv"
 printf 'n4-1-1-any.pkg.tar.zst\n' > "$work/iverify/v1/faults-x86_64-core-1.txt"
-# live_index NAME PLAN-ID [ROWS]: $FAKE/live-NAME.json, an index manifest of
-# that plan; with ROWS, an index.tsv layer that $FAKE/up serves
+# live_index NAME PLAN-ID [ROWS [WITHDRAWN-BY]]: $FAKE/live-NAME.json, an
+# index manifest of that plan; with ROWS, an index.tsv layer that $FAKE/up
+# serves; with WITHDRAWN-BY, the plan that withdrew rows from it
 live_index() {
   local layers='[]' sha
   if [ -n "${3:-}" ]; then
@@ -639,13 +670,15 @@ live_index() {
     layers="$(jq -cn --arg d "sha256:$sha" --argjson s "$(wc -c < "$3" | tr -d ' ')" \
       '[{mediaType: "application/vnd.pkgforge.archlinux.index.v1+tsv", digest: $d, size: $s, annotations: {"org.opencontainers.image.title": "index.tsv"}}]')"
   fi
-  jq -cn --arg p "$2" --argjson l "$layers" \
+  jq -cn --arg p "$2" --argjson l "$layers" --arg w "${4:-}" \
     '{schemaVersion: 2, mediaType: "application/vnd.oci.image.manifest.v1+json", artifactType: "application/vnd.pkgforge.archlinux.index.v1", layers: $l,
-      annotations: {"dev.pkgforge.mirror.index-format": "1", "dev.pkgforge.mirror.plan-id": $p}}' > "$FAKE/live-$1.json"
+      annotations: ({"dev.pkgforge.mirror.index-format": "1", "dev.pkgforge.mirror.plan-id": $p}
+        + (if $w == "" then {} else {"dev.pkgforge.mirror.withdrawn-by": $w} end))}' > "$FAKE/live-$1.json"
 }
 live_index older older.1.1
 live_index newer newer.1.1
 LIVE_OLDER="sha256:$(sha256sum "$FAKE/live-older.json" | cut -d ' ' -f 1)"
+LIVE_NEWER="sha256:$(sha256sum "$FAKE/live-newer.json" | cut -d ' ' -f 1)"
 INDEX_REF=ghcr.io/it/mirror/x86_64/core:index
 # iw_run NAME: scripts/index-write, its stderr in $work/iw-NAME.err
 iw_run() {
@@ -696,6 +729,16 @@ printf 'DIGEST=%s\nTAG=staging\n' "$sdigest" > "$is/staged.env"
 check "index-write: verdicts about another staged digest give no verify credit and remove no file at fault" \
   "0 n1 m 1 0|n2 m 0 0|n3 m 0 0|n4 m 0 0|n5 a 0 0|n7 m 0 1|n8 m 0 0|" "$rc $(rows)" "$IW; cat $work/iw-otherdigest.err"
 
+# The plan did not know the verify context (VERIFY_CONTEXT empty): a batch
+# that passed gives no verified 1, and each row keeps its carried flag. The
+# file at fault still loses its row.
+IVC='' imeta ok "$LIVE_OLDER"
+reset 'Bearer QQ==\t200\tlive-older.json\tindex\n' '' 0
+rc="$(iw_run noctx)"
+imeta ok "$LIVE_OLDER"
+check "index-write: with no verify context, a passed batch gives no verified 1; the carried flags stay" \
+  "0 n1 m 1 0|n2 m 0 0|n3 m 0 0|n5 a 0 0|n7 m 0 1|n8 m 0 0|" "$rc $(rows)" "$IW with VERIFY_CONTEXT empty; cat $work/iw-noctx.err"
+
 # Another index is live: kept.
 reset 'Bearer QQ==\t200\tlive-newer.json\tindex\n' '' 0
 rc="$(iw_run newer)"
@@ -721,6 +764,20 @@ rc="$(iw_run ours)"
 check "index-write: a live index of this plan is replaced, and keeps its verified 1 for the same file" \
   "0 1 n1 m 1 0|n2 m 1 0|n3 m 1 0|n5 a 0 0|n7 m 1 1|n8 m 0 0|" "$rc $(pushes "$INDEX_REF") $(rows)" "$IW; cat $work/iw-ours.err"
 
+# The live index names this plan, and another plan withdrew rows from it
+# since: it is not this plan's own. Kept.
+live_index oursw ip1 "$work/ours-rows.tsv" newer.1.1
+reset 'Bearer QQ==\t200\tlive-oursw.json\tindex\n' '' 0
+rc="$(iw_run oursw)"
+check "index-write: a live index of this plan that another plan withdrew rows from is kept" "0 0 yes" \
+  "$rc $(pushes "$INDEX_REF") $(kept oursw && echo yes || echo no)" "$IW; cat $work/iw-oursw.err"
+# withdrawn-by names this plan: still this plan's own.
+live_index oursself ip1 "$work/ours-rows.tsv" ip1
+reset 'Bearer QQ==\t200\tlive-oursself.json\tindex\n' '' 0
+rc="$(iw_run oursself)"
+check "index-write: a live index of this plan, withdrawn by this plan, is replaced and keeps its verified 1" \
+  "0 1 n1 m 1 0|n2 m 1 0|n3 m 1 0|n5 a 0 0|n7 m 1 1|n8 m 0 0|" "$rc $(pushes "$INDEX_REF") $(rows)" "$IW; cat $work/iw-oursself.err"
+
 # Plan did not read the index: nothing is read or pushed.
 imeta unread ''
 reset 'Bearer QQ==\t200\tlive-older.json\tindex\n' '' 0
@@ -739,11 +796,33 @@ rc="$(iw_run absentnow)"
 check "index-write: plan found no index, and one is live now: kept" "0 0 yes" \
   "$rc $(pushes "$INDEX_REF") $(kept absentnow && echo yes || echo no)" "$IW; cat $work/iw-absentnow.err"
 
-# INDEX_READ=0: the new index replaces any.
-imeta ignored ''
+# INDEX_READ=0, a reset: the new index replaces the one plan saw, and no
+# other. With no answer to plan's read of the tag, nothing is pushed.
+imeta ignored "$LIVE_NEWER"
 reset 'Bearer QQ==\t200\tlive-newer.json\tindex\n' '' 0
 rc="$(iw_run ignored)"
-check "index-write: an index plan ignored is replaced" "0 1" "$rc $(pushes "$INDEX_REF")" "$IW; cat $work/iw-ignored.err"
+check "index-write: a reset replaces the index plan saw" "0 1" "$rc $(pushes "$INDEX_REF")" "$IW; cat $work/iw-ignored.err"
+imeta ignored "$LIVE_OLDER"
+reset 'Bearer QQ==\t200\tlive-newer.json\tindex\n' '' 0
+rc="$(iw_run ignorednewer)"
+check "index-write: a reset keeps an index that a newer run wrote after plan saw another" "0 0 yes" \
+  "$rc $(pushes "$INDEX_REF") $(kept ignorednewer && echo yes || echo no)" "$IW; cat $work/iw-ignorednewer.err"
+imeta ignored '' absent
+reset 'Bearer QQ==\t404\tunknown.json\tindex\nBearer tok1\t404\tunknown.json\tindex\n' '' 0
+rc="$(iw_run ignoredabsent)"
+check "index-write: a reset where plan saw no tag, and there is none: written" "0 1" "$rc $(pushes "$INDEX_REF")" "$IW; cat $work/iw-ignoredabsent.err"
+reset 'Bearer QQ==\t200\tlive-newer.json\tindex\n' '' 0
+rc="$(iw_run ignoredabsentnow)"
+check "index-write: a reset where plan saw no tag, and one is live now: kept" "0 0 yes" \
+  "$rc $(pushes "$INDEX_REF") $(kept ignoredabsentnow && echo yes || echo no)" "$IW; cat $work/iw-ignoredabsentnow.err"
+imeta ignored ''
+reset 'Bearer QQ==\t200\tlive-newer.json\tindex\n' '' 0
+rc="$(iw_run ignorednoanswer)"
+case "$rc $(pushes "$INDEX_REF"):$(cat "$work/iw-ignorednoanswer.err")" in
+  "0 0:"*"is not written: the plan's read of the tag gave no answer (INDEX_STATE ignored)"*"the reset can be run again"*) ok "index-write: a reset whose read of the tag got no answer writes nothing, and says the reset can be run again" ;;
+  *) fail "index-write: a reset whose read of the tag got no answer writes nothing, and says the reset can be run again" \
+    "exit $rc, $(pushes "$INDEX_REF") push(es)" "$(cat "$work/iw-ignorednoanswer.err")" "$IW" ;;
+esac
 
 # A target the plan did not mark pending has no index to write.
 imeta ok "$LIVE_OLDER"
@@ -902,13 +981,38 @@ names() {
 }
 MF="RESULTS=R WORK=W ORAS=<stand-in> PATH=<stand-ins>:\$PATH scripts/mirror-file PLAN/x86_64-core/shards/0.tsv"
 
-# A repush: the target's own repository holds the package blob.
+# A repush: the target's own repository holds the package blob. The plan
+# read the index (INDEX_STATE ok).
 : > "$mp/sources.tsv"
 reset 'Bearer QQ==\t200\ttag-b-nosig.json\n' "$after" 0
 printf '%s\t200\tblob-b\n' "$OWN" > "$FAKE/blobs.tsv"
-rc="$(mf_run own 1)"
+rc="$(mf_run own 1 INDEX_STATE=ok)"
 check "mirror-file: a repush reads the package from the target's own repository, with no upstream request" \
-  "0 pushed from ghcr.io/$OWN 0 1" "$rc $(mf_result own 1) $(up_gets) $(pushes "$REF_B")" "$MF 1; cat $work/mf-own.err $FAKE/calls.log"
+  "0 pushed from ghcr.io/$OWN 0 1" "$rc $(mf_result own 1) $(up_gets) $(pushes "$REF_B")" "INDEX_STATE=ok $MF 1; cat $work/mf-own.err $FAKE/calls.log"
+
+# The repush rule: a repush only after a plan that read the index. absent and
+# invalid allow it, as ok does above.
+for s in absent invalid; do
+  reset 'Bearer QQ==\t200\ttag-b-nosig.json\n' "$after" 0
+  printf '%s\t200\tblob-b\n' "$OWN" > "$FAKE/blobs.tsv"
+  rc="$(mf_run "state-$s" 1 INDEX_STATE="$s")"
+  check "mirror-file: INDEX_STATE $s allows a repush" "0 pushed from ghcr.io/$OWN 1" \
+    "$rc $(mf_result "state-$s" 1) $(pushes "$REF_B")" "INDEX_STATE=$s $MF 1; cat $work/mf-state-$s.err"
+done
+# unread, ignored and no INDEX_STATE at all (unknown): failed, with no push,
+# no blob read and no upstream request.
+for s in unread ignored unknown; do
+  st=()
+  if [ "$s" != unknown ]; then
+    st=("INDEX_STATE=$s")
+  fi
+  reset 'Bearer QQ==\t200\ttag-b-nosig.json\n' "$after" 0
+  printf '%s\t200\tblob-b\n' "$OWN" > "$FAKE/blobs.tsv"
+  rc="$(mf_run "state-$s" 1 "${st[@]}")"
+  check "mirror-file: INDEX_STATE $s refuses a repush: failed, with no push, no blob read and no upstream request" \
+    "1 failed a signature repair waits for a run that read the index (INDEX_STATE $s) 0 0 0" \
+    "$rc $(mf_result "state-$s" 1) $(pushes "$REF_B") $(blob_gets) $(up_gets)" "${st[*]:-env -u INDEX_STATE} $MF 1; cat $work/mf-state-$s.err"
+done
 
 # A push: the sibling plan names holds the package. MIRROR_REPAIR=0 is for a
 # repush only.
@@ -956,7 +1060,7 @@ printf '%s\t200\tblob-other\n' "$SIB1" > "$FAKE/blobs.tsv"
 rc="$(mf_run other 1)"
 check "mirror-file: a sibling that gives other bytes is refused and marked down, and upstream gives the package" \
   "0 pushed from $UP 1 yes same" \
-  "$rc $(mf_result other 1) $(up_gets) $(down "$SIB1" other) $(cmp -s "$FAKE/pushed/b-1-1-any.pkg.tar.zst" "$FAKE/blob-b" && echo same || echo other)" \
+  "$rc $(mf_result other 1) $(up_gets) $(down "$SIB1" other) $(same_bytes "$FAKE/pushed/b-1-1-any.pkg.tar.zst" "$FAKE/blob-b" && echo same || echo other)" \
   "$MF 1; cat $work/mf-other.err"
 
 # The sibling answers 404 BLOB_UNKNOWN: a quiet miss.
@@ -967,8 +1071,9 @@ check "mirror-file: a sibling that answers 404 is a quiet miss: not marked down,
   "0 pushed from $UP 1 no 0" "$rc $(mf_result miss 1) $(blob_gets "$SIB1") $(down "$SIB1" miss) $(names "$SIB1" miss)" \
   "$MF 1; cat $work/mf-miss.err"
 
-# d: every server answers 404. A sibling 404 keeps it absent; a sibling that
-# gives no answer that decides makes it failed.
+# d: every server answers 404. The absent rule looks at the upstream servers
+# only: a sibling that answers 404, or 503, leaves it absent. An upstream
+# server that errs makes it failed.
 printf 'd-1-1-any.pkg.tar.zst\t%s\n' "$SIB1" > "$mp/sources.tsv"
 reset "$absent" "$after" 0
 printf '%s\t404\tblob-unknown.json\n' "$SIB1" > "$FAKE/blobs.tsv"
@@ -978,10 +1083,17 @@ check "mirror-file: a sibling that answers 404, and every server 404: absent" "0
 reset "$absent" "$after" 0
 printf '%s\t503\tbusy.txt\n' "$SIB1" > "$FAKE/blobs.tsv"
 rc="$(mf_run gonebusy 3)"
-case "$rc:$(cut -f 3,5 "$work/mf-gonebusy/results/3.tsv" 2> /dev/null)" in
-  1:failed*"no answer that decides from ghcr.io/$SIB1 (status 1)"*) ok "mirror-file: a sibling that answers 503, and every server 404: failed, not absent, naming the sibling" ;;
-  *) fail "mirror-file: a sibling that answers 503, and every server 404: failed, not absent, naming the sibling" \
-    "got: exit $rc, $(cat "$work/mf-gonebusy/results/3.tsv" 2> /dev/null)" "$MF 3; cat $work/mf-gonebusy.err" ;;
+check "mirror-file: a sibling that answers 503, and every server 404: absent, as upstream decides" "0 absent yes" \
+  "$rc $(cut -f 3 "$work/mf-gonebusy/results/3.tsv" 2> /dev/null) $(down "$SIB1" gonebusy)" "$MF 3; cat $work/mf-gonebusy.err"
+reset "$absent" "$after" 0
+printf '%s\t503\tbusy.txt\n' "$SIB1" > "$FAKE/blobs.tsv"
+printf '503\n' > "$FAKE/up/d-1-1-any.pkg.tar.zst.code"
+rc="$(mf_run upbusy 3)"
+rm -f "$FAKE/up/d-1-1-any.pkg.tar.zst.code"
+case "$rc:$(cut -f 3,5 "$work/mf-upbusy/results/3.tsv" 2> /dev/null)" in
+  1:failed*"no answer that decides from ghcr.io/$SIB1 (status 1)"*) ok "mirror-file: a sibling that answers 503, and the upstream server errs: failed, not absent, naming the sibling" ;;
+  *) fail "mirror-file: a sibling that answers 503, and the upstream server errs: failed, not absent, naming the sibling" \
+    "got: exit $rc, $(cat "$work/mf-upbusy/results/3.tsv" 2> /dev/null)" "$MF 3; cat $work/mf-upbusy.err" ;;
 esac
 
 # MIRROR_REPAIR=0 (a run on a branch): no repush, and nothing is read.
@@ -1026,5 +1138,54 @@ reset 'Bearer QQ==\t200\ttag-b-full.json\n' '' 0
 rc="$(mf_run unread 1 GITHUB_RUN_ATTEMPT=2)"
 check "mirror-file, a re-run: with the live index unread, a tag that holds its file is present" "0 present" \
   "$rc $(cut -f 3 "$work/mf-unread/results/1.tsv" 2> /dev/null)" "GITHUB_RUN_ATTEMPT=2 $MF 1; cat $work/mf-unread.err"
+
+#---------------------------------------------------------------------------#
+# mirror-shard reads INDEX_STATE from the plan's meta.env (PLAN/<target>,
+# two levels above the shard file), as data, and gives it to mirror-file:
+# unknown when meta.env or the key is missing. A stand-in mirror-file records
+# what it got. mirror-shard runs on a GitHub runner, with GNU df and xargs
+# (df --output, xargs -d); with busybox's, these cases are skipped.
+#---------------------------------------------------------------------------#
+# shard_tools -> 0 when df and xargs take the options mirror-shard gives them
+shard_tools() {
+  df --output=avail -B1 "$work" > /dev/null 2>&1 || return 1
+  printf 'x\n' | xargs -d '\n' -n 1 true > /dev/null 2>&1
+}
+if ! shard_tools; then
+  skip "mirror-shard: INDEX_STATE from the plan's meta.env" "df --output or xargs -d is refused here (busybox), and mirror-shard needs both"
+  summary
+  exit $?
+fi
+cat > "$FAKE/root/scripts/mirror-file" << 'EOF'
+#!/usr/bin/env bash
+# A stand-in for scripts/mirror-file SHARD LINE: it records INDEX_STATE as it
+# gets it, and the result present for LINE.
+printf '%s\n' "${INDEX_STATE-unset}" > "$FAKE/shard-index-state"
+printf 'x86_64-core\tline-%s\tpresent\t0\tthe stand-in\n' "$2" > "$RESULTS/$2.tsv"
+EOF
+chmod +x "$FAKE/root/scripts/mirror-file"
+sp="$work/splan/x86_64-core"
+mkdir -p "$sp/shards"
+sed -n 1p "$mp/shards/0.tsv" > "$sp/shards/0.tsv"
+# shard_state NAME -> the exit status of mirror-shard, and the INDEX_STATE
+# that mirror-file got
+shard_state() {
+  local rc=0
+  rm -f "$FAKE/shard-index-state"
+  REPO_ROOT="$FAKE/root" PATH="$FAKE/bin:$PATH" DEBLOAT=never PARALLEL=1 SHARD_INDEX=0 \
+    "$SCRIPTS/mirror-shard" "$sp/shards/0.tsv" "$work/shard-$1" > "$work/shard-$1.out" 2> "$work/shard-$1.err" || rc=$?
+  printf '%s %s\n' "$rc" "$(cat "$FAKE/shard-index-state" 2> /dev/null || echo 'no call')"
+}
+SH="REPO_ROOT=<stand-ins> DEBLOAT=never scripts/mirror-shard SPLAN/x86_64-core/shards/0.tsv OUT"
+reset '' '' 0
+printf 'TARGET=x86_64-core\nINDEX_TAG=index\nINDEX_STATE=ignored\nINDEX_DIGEST=\n' > "$sp/meta.env"
+check "mirror-shard: mirror-file gets the INDEX_STATE of the plan's meta.env" "0 ignored" "$(shard_state ignored)" \
+  "$SH; cat $work/shard-ignored.err"
+printf 'TARGET=x86_64-core\nINDEX_TAG=index\n' > "$sp/meta.env"
+check "mirror-shard: a meta.env with no INDEX_STATE gives unknown" "0 unknown" "$(shard_state nokey)" \
+  "$SH; cat $work/shard-nokey.err"
+rm -f "$sp/meta.env"
+check "mirror-shard: no meta.env gives unknown" "0 unknown" "$(INDEX_STATE=ok shard_state nometa)" \
+  "INDEX_STATE=ok $SH; cat $work/shard-nometa.err"
 
 summary

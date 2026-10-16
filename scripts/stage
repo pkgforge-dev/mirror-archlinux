@@ -60,7 +60,10 @@
 # The smallest canary is the smallest file whose tag reads and holds the
 # record's sha256 as its package layer: a file upstream no longer serves may
 # have no tag. At most 10 files are tried, smallest first. When none fits,
-# there is no smallest canary, and a warning says so.
+# there is no smallest canary, and a warning says so. With no canary at all
+# and nothing to verify, no batch is made: the target is held, "nothing to
+# verify, and no canary tag reads". Otherwise batch 0 gets files as any
+# other batch does.
 #
 # The number of batches is the larger of ceil(bytes /
 # VERIFY_BATCH_BYTES) and ceil(files / VERIFY_BATCH_FILES); when that is more
@@ -400,6 +403,13 @@ stage_target() {
 
   local nfiles nbytes k flimit blimit wanted
   nfiles="$(awk 'END { print NR + 0 }' "$dir/verify.tsv")"
+  # No canary and nothing to verify: a batch 0 with no file would fail in
+  # verify-batch. No batch is made, and nothing proves the path a consumer
+  # takes, so the target is held.
+  if [ ! -s "$dir/canaries.txt" ] && [ "$nfiles" -eq 0 ]; then
+    set_state "$dir" held "nothing to verify, and no canary tag reads"
+    return 0
+  fi
   nbytes="$(awk -F '\t' '{ s += $2 } END { printf "%.0f\n", s }' "$dir/verify.tsv")"
   read -r k flimit blimit wanted <<< "$(batch_count "$nfiles" "$nbytes" "$BATCH_FILES" "$BATCH_BYTES" "$MAX_BATCHES")"
   if [ "$wanted" -gt "$k" ]; then

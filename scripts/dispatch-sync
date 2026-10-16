@@ -10,16 +10,20 @@
 #
 # A sync.yml that is not active is not started: GitHub refuses the dispatch,
 # and a person may disable it on purpose. A run of sync.yml that waits
-# (queued, waiting, requested or pending) starts nothing more: that run plans
-# after the change, and runs share the concurrency group sync, so one more
-# run would only wait behind it. A run in progress does not stop a start: it
-# may have planned before the change.
+# (queued, waiting, requested or pending) and covers every TARGET starts
+# nothing more: that run plans after the change, and runs share the
+# concurrency group sync, so one more run would only wait behind it. A run
+# covers the targets when its title is "Sync all targets", or when its title
+# after "Sync " names each TARGET as a word (sync.yml run-name). A run that
+# waits for other targets does not stop a start: queue: max keeps the new
+# run too. A run in progress does not stop a start: it may have planned
+# before the change.
 #
 # Needs GH_TOKEN with actions: write, GITHUB_REPOSITORY, gh and jq.
 #
 # Exit status: 0 the sync was started; 2 nothing was started, because sync.yml
-# is not active or a run of it waits; 1 could not tell, could not start, or
-# usage.
+# is not active or a run of it that covers every TARGET waits; 1 could not
+# tell, could not start, or usage.
 set -euo pipefail
 
 usage() {
@@ -71,9 +75,17 @@ rc=0
 gh api "repos/$slug/actions/workflows/sync.yml/runs?per_page=50" > "$work/runs.json" || rc=$?
 [ "$rc" -eq 0 ] || die "could not list the runs of sync.yml (gh ended $rc)" \
   "reproduce: gh api 'repos/$slug/actions/workflows/sync.yml/runs?per_page=50'"
-waiting="$(jq '[.workflow_runs[] | select(.status == "queued" or .status == "waiting" or .status == "requested" or .status == "pending")] | length' "$work/runs.json")"
+# A run that waits counts only when it covers every target asked for.
+waiting="$(jq --arg t "$targets" '
+  ($t | split(" ") | map(select(. != ""))) as $want
+  | [.workflow_runs[]
+    | select(.status == "queued" or .status == "waiting" or .status == "requested" or .status == "pending")
+    | (.display_title // "") as $d
+    | select($d == "Sync all targets"
+      or (($d | startswith("Sync ")) and (($d[5:] | split(" ")) as $w | all($want[]; . as $x | any($w[]; . == $x)))))]
+  | length' "$work/runs.json")"
 if [ "$waiting" -gt 0 ]; then
-  echo "::notice::dispatch-sync: $waiting run(s) of sync.yml wait; no sync of $targets is started"
+  echo "::notice::dispatch-sync: $waiting run(s) of sync.yml wait, and each covers $targets; no sync of $targets is started"
   exit 2
 fi
 

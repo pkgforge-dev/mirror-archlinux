@@ -1343,7 +1343,7 @@ manifest_layer() {
 #
 # index_push ORAS REPO TAG DIR ANNOTATION... -> 0 pushed, 1 not: DIR/ref.db
 # and DIR/index.tsv as REPO:TAG, each ANNOTATION (key=value) on the
-# manifest. Needs ORAS_CONFIG (oras_args). A 429 costs no attempt: its pauses
+# manifest. DIR may be relative. Needs ORAS_CONFIG (oras_args). A 429 costs no attempt: its pauses
 # add up to INDEX_RATE_WAIT (default 120 s), a cap of their own; the
 # THROTTLE_WAITED of the caller is kept. At most 2 attempts, each within
 # 120 s.
@@ -1473,6 +1473,11 @@ index_push() {
   esac
   if [ ! -f "$dir/ref.db" ] || [ ! -f "$dir/index.tsv" ]; then
     warn "$repo:$tag: $dir holds no ref.db and index.tsv to push"
+    return 1
+  fi
+  # An absolute path: the push runs from inside DIR, and its log is DIR/push.log.
+  if ! dir="$(cd "$dir" && pwd)"; then
+    warn "$repo:$tag: $dir could not be made an absolute path"
     return 1
   fi
   local oargs=() args=()

@@ -30,8 +30,10 @@
 #      an earlier run of the ref left it on the registry. INDEX_STATE is ok,
 #      absent, invalid (not used), unread (no answer that decides, or
 #      REGISTRY_READ_BUDGET is spent; a warning, and the target plans as with
-#      no index), or ignored (INDEX_READ=0: not read, and the run writes a
-#      new index).
+#      no index), or ignored (INDEX_READ=0: its rows are not read, and the
+#      run writes a new index). With ignored, plan reads the manifest of the
+#      tag alone (index_seen): its digest, or that there is no tag, tells
+#      scripts/index-write which index the new one replaces.
 #   4. The files promoted or indexed with no signature (the
 #      dev.pkgforge.mirror.unsigned annotation of latest, scripts/stage, and
 #      the indexed files with unsigned 1): each one's .sig is asked for again.
@@ -54,7 +56,8 @@
 #   6. Otherwise every file is skip, when the promoted database or the index
 #      names it with the same sha256 and the same %PGPSIG% (no request made),
 #      or todo. A file is todo also when the index lists it as absent
-#      upstream (state a), or when step 4 or 4b plans it again.
+#      upstream (state a) and the promoted database does not name it, or
+#      when step 4 or 4b plans it again.
 #      scripts/mirror-file reads each todo file's tag before writing it: it
 #      never overwrites a package layer, and it repairs a signature layer that
 #      upstream signed again. The files to verify (new.tsv) are the todo
@@ -62,7 +65,8 @@
 #      under this run's verify context (lib.sh verify_context).
 #   6b. Before any tag is written: plan withdraws from the index every row
 #      (state m) of a todo file. It pushes the index again without them, with
-#      the same ref.db and annotations, and reads it back. A push or read back
+#      the same ref.db and annotations, and reads it back. The annotation
+#      dev.pkgforge.mirror.withdrawn-by names this plan. A push or read back
 #      that fails puts the target in error. oras is installed only for this.
 #   6c. Registry sources: the todo files whose bytes a sibling holds. A
 #      sibling is an enabled target of TARGETS_DIR with a db_server of the
@@ -85,11 +89,15 @@
 #
 # ⛔ The registry reads of steps 3b, 6 (the latest database of keyring_from,
 # for the verify context) and 6c share one budget for the whole plan,
-# REGISTRY_READ_BUDGET seconds (default 240). A read is not made when the
-# reads before it took the whole budget. Each blob and token read has a
-# deadline of 60 s, or what is left of the budget when that is less. A read
-# that is not made costs work, never safety: the index is unread, the verify
-# context is not known, or a sibling gives no source.
+# REGISTRY_READ_BUDGET seconds (default 240). The budget stops each new read:
+# a read is not made when the reads before it took the whole budget. Each
+# blob and token read has a deadline of 60 s, or what is left of the budget
+# when that is less. A manifest read has its own deadline (lib.sh
+# registry_get_manifest: 60 s, 3 retries), so one read in progress can run
+# past the budget by up to about 4 minutes. A read that is not made costs work:
+# the index is unread, the verify context is not known, or a sibling gives no
+# source. An unread index is safe because scripts/mirror-file writes no
+# repush for it, and a push goes only to an absent tag.
 #
 # Each upstream read of a .files database, a database signature or a package
 # .sig that answers is kept for the rest of the plan (OUT/.fetch-cache,
@@ -128,7 +136,10 @@
 #                           a pending target also INDEX_TAG, INDEX_STATE,
 #                           INDEX_DIGEST (sha256:<hex> of the index manifest
 #                           read, or pushed by step 6b; empty unless the state
-#                           is ok or invalid), INDEX_CONTEXT (the
+#                           is ok or invalid, or ignored and the tag read),
+#                           INDEX_PRIOR (absent when the state is ignored and
+#                           the registry has no such tag, else empty),
+#                           INDEX_CONTEXT (the
 #                           verify-context of that index), VERIFY_CONTEXT (this
 #                           run's, empty when not known) and INDEX_CONTEXT_OUT
 #                           (VERIFY_CONTEXT, or INDEX_CONTEXT when that is
@@ -327,11 +338,12 @@ reg_time() {
 
 # index_of REPO DIR DB...: REPO:$INDEX_TAG into DIR (lib.sh index_read),
 # anonymously first, then with the workflow's token when that is not ok or
-# invalid, as step 2 reads latest. Sets reg_state, and reg_private to 1 when
-# only the token read is ok. The time it takes counts in
-# REGISTRY_READ_BUDGET.
+# invalid, as step 2 reads latest. Sets reg_state, and reg_private to 1 only
+# when the anonymous read is absent and the token read is ok: an anonymous
+# read that got no answer that decides says nothing about the package. The
+# time it takes counts in REGISTRY_READ_BUDGET.
 index_of() {
-  local repo="$1" d="$2" t rc=0 started="$SECONDS"
+  local repo="$1" d="$2" t rc=0 started="$SECONDS" anon
   shift 2
   reg_state=unread
   reg_private=0
@@ -348,6 +360,7 @@ index_of() {
   case "$reg_state" in
     ok | invalid) return 0 ;;
   esac
+  anon="$reg_state"
   if [ -z "${REGISTRY_TOKEN:-}" ] && [ "$MIRROR_REGISTRY_AUTH" != none ]; then
     return 0
   fi
@@ -364,7 +377,7 @@ index_of() {
   if [ "$rc" -ne 0 ]; then
     reg_state=unread
   fi
-  if [ "$reg_state" = ok ]; then
+  if [ "$reg_state" = ok ] && [ "$anon" = absent ]; then
     reg_private=1
   fi
 }
@@ -478,10 +491,38 @@ oras_ready() {
   oras_bin="$bin"
 }
 
+# index_seen REPO: with INDEX_READ=0, the manifest of REPO:$INDEX_TAG alone,
+# read with the workflow's token as it is set. No blob is read, and no row is
+# used. Sets seen_digest to sha256:<hex> of the manifest bytes when the tag
+# is there, and seen_prior to absent when the registry has no such tag; both
+# stay empty when there is no answer that decides. scripts/index-write then
+# replaces only the index plan saw. The time it takes counts in
+# REGISTRY_READ_BUDGET.
+index_seen() {
+  local repo="$1" t rc=0 started="$SECONDS"
+  seen_digest=""
+  seen_prior=""
+  t="$(reg_time)"
+  if [ "$t" -eq 0 ]; then
+    log "$repo:$INDEX_TAG: not read, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s is spent"
+    return 0
+  fi
+  REG_TOKEN_MAX_TIME="$t" registry_manifest "$repo" "$INDEX_TAG" "$tmp/index-seen.json" || rc=$?
+  reg_spent=$((reg_spent + SECONDS - started))
+  case "$rc" in
+    "$REG_STATUS_OK") seen_digest="sha256:$(sha256sum "$tmp/index-seen.json" | cut -d ' ' -f 1)" ;;
+    "$REG_STATUS_ABSENT") seen_prior=absent ;;
+    *) log "$repo:$INDEX_TAG did not read (status $rc)" ;;
+  esac
+  rm -f -- "$tmp/index-seen.json"
+}
+
 # index_withdraw REPO DIR -> 0 when REPO:$INDEX_TAG is pushed again without
 # the rows of the files in DIR/withdraw.txt, with the same ref.db and the same
-# annotations (lib.sh index_push), and reads back so. Sets reg_digest to the
-# digest of the manifest read back.
+# annotations (lib.sh index_push), and reads back so. The one annotation
+# dev.pkgforge.mirror.withdrawn-by is added, or replaced: it names this plan,
+# so that scripts/index-write of the plan that wrote the index does not take
+# it for its own. Sets reg_digest to the digest of the manifest read back.
 index_withdraw() {
   local repo="$1" d="$2" p="$2/push" rc=0 attempt want got n annotations=()
   rm -rf "$p"
@@ -495,12 +536,14 @@ index_withdraw() {
     return 1
   fi
   # The annotations as they are, NUL separated: a value may hold any byte.
-  n="$(jq '.annotations | length' "$d/manifest.json")"
-  mapfile -d '' -t annotations < <(jq -j '.annotations // {} | to_entries[] | "\(.key)=\(.value)\u0000"' "$d/manifest.json")
+  # withdrawn-by is left out here, and added below with this plan's id.
+  n="$(jq '[.annotations // {} | to_entries[] | select(.key != "dev.pkgforge.mirror.withdrawn-by")] | length' "$d/manifest.json")"
+  mapfile -d '' -t annotations < <(jq -j '.annotations // {} | to_entries[] | select(.key != "dev.pkgforge.mirror.withdrawn-by") | "\(.key)=\(.value)\u0000"' "$d/manifest.json")
   if [ "${#annotations[@]}" != "$n" ]; then
     warn "$repo:$INDEX_TAG: $n annotation(s) in its manifest, and ${#annotations[@]} read"
     return 1
   fi
+  annotations+=("dev.pkgforge.mirror.withdrawn-by=$plan_id")
   oras_ready || return 1
   index_push "$oras_bin" "$repo" "$INDEX_TAG" "$p" "${annotations[@]}" || return 1
   want="sha256:$(sha256sum "$p/index.tsv" | cut -d ' ' -f 1)"
@@ -773,10 +816,21 @@ plan_target() {
   #     indexed.tsv: the ref.db record (8 fields), state, verified, unsigned
   #     of each valid row.
   #-------------------------------------------------------------------------#
-  local index_state index_digest="" index_context=""
+  local index_state index_digest="" index_context="" index_prior=""
   if [ "$INDEX_READ" = 0 ]; then
     index_state=ignored
-    log "$name: INDEX_READ=0: $repo_path:$INDEX_TAG is not read, and this run writes a new index"
+    index_seen "$repo_path"
+    index_digest="$seen_digest"
+    index_prior="$seen_prior"
+    if [ -n "$index_digest" ]; then
+      log "$name: INDEX_READ=0: the rows of $repo_path:$INDEX_TAG ($index_digest) are not read; this run writes a new index that replaces that one"
+    elif [ "$index_prior" = absent ]; then
+      log "$name: INDEX_READ=0: there is no $repo_path:$INDEX_TAG yet; this run writes the first one"
+    else
+      warn "$name: INDEX_READ=0: the manifest of $repo_path:$INDEX_TAG did not read, so the index that this reset replaces is not known, and this run writes no index" \
+        "the reset can be run again" \
+        "reproduce: curl -s -H 'Authorization: Bearer QQ==' -H 'Accept: application/vnd.oci.image.manifest.v1+json' $REG_URL/v2/$repo_path/manifests/$INDEX_TAG"
+    fi
   else
     index_of "$repo_path" "$dir/index" "$dir"/cand/*.db "$dir/promoted.db"
     index_state="$reg_state"
@@ -1161,9 +1215,11 @@ plan_target() {
   #    I indexed (state m, the same record), A indexed as absent upstream
   #    (state a, the same record), V indexed and verified under this verify
   #    context, and again a file of signed-now.txt (step 4 or 4b):
-  #      todo     !(P or I) or again or A
-  #      new      (!P and !V) or again or A, so todo is a part of new
+  #      todo     !(P or I) or again or (A and !P)
+  #      new      (!P and !V) or again or (A and !P), so todo is a part of new
   #      vouched  I and not again
+  #    A file absent upstream is tried again on each run until a promoted
+  #    database names it. After that it is skipped, as a promoted file is.
   #-------------------------------------------------------------------------#
   cut -f 1 "$dir/records.tsv" | "$WRAPPER" --tags > "$dir/pairs.tsv"
   : > "$dir/todo.tsv"
@@ -1185,7 +1241,7 @@ plan_target() {
       A = (f in x) && x[f] == rec && xs[f] == "a"
       V = I && xv[f] == "1" && vc != "" && vc == ic
       ag = (f in again)
-      if (!(P || I) || ag || A) {
+      if (!(P || I) || ag || (A && !P)) {
         print target, f, tag[f], $5, $6, $2, "todo", $7, $8 > todo
         print target, f, tag[f], $5, $6, $2, "todo", $7, $8 > new
       } else if (!P && !V) {
@@ -1257,7 +1313,7 @@ plan_target() {
     ctx_out="$index_context"
   fi
   {
-    printf 'INDEX_TAG=%s\nINDEX_STATE=%s\nINDEX_DIGEST=%s\n' "$INDEX_TAG" "$index_state" "$index_digest"
+    printf 'INDEX_TAG=%s\nINDEX_STATE=%s\nINDEX_DIGEST=%s\nINDEX_PRIOR=%s\n' "$INDEX_TAG" "$index_state" "$index_digest" "$index_prior"
     printf 'INDEX_CONTEXT=%s\nVERIFY_CONTEXT=%s\nINDEX_CONTEXT_OUT=%s\n' "$index_context" "$verify_ctx" "$ctx_out"
   } >> "$dir/meta.env"
 

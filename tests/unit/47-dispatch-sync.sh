@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # scripts/dispatch-sync starts one sync.yml run on main for the targets it is
-# given, only when sync.yml is active and no run of it waits.
+# given, only when sync.yml is active and no run of it that covers every
+# target waits.
 #
 # A stub gh answers the state and the runs list from files and records every
 # call, one argument in each <>, so the test needs no network and no token.
@@ -57,9 +58,10 @@ case_run() {
   check "$desc: gh workflow run is called: $want_start" "$want_start" "$got" "cat calls.log after scripts/dispatch-sync $*"
 }
 
-# a_run STATUS -> one run of the runs list, as JSON
+# a_run STATUS [TITLE] -> one run of the runs list, as JSON; the title is
+# "Sync x86_64-core" when not given
 a_run() {
-  printf '{"status":"%s","event":"workflow_dispatch","display_title":"Sync x86_64-core"}' "$1"
+  printf '{"status":"%s","event":"workflow_dispatch","display_title":"%s"}' "$1" "${2:-Sync x86_64-core}"
 }
 
 case_run "no run of sync.yml" '{"workflow_runs":[]}' 0 yes x86_64-core x86_64-extra
@@ -81,6 +83,17 @@ if grep -q 'run(s) of sync.yml wait' "$work/out.log"; then
 else
   fail "a run that waits: the notice says so" "$(cat "$work/out.log")" "reproduce: scripts/dispatch-sync x86_64-core with a pending run"
 fi
+
+# A run that waits stops a start only when it covers every target asked for:
+# its title is "Sync all targets", or names each target as a word.
+case_run "a run of all targets waits" "{\"workflow_runs\":[$(a_run pending 'Sync all targets')]}" 2 no x86_64-core x86_64-extra
+case_run "a run that waits names both targets, and more" \
+  "{\"workflow_runs\":[$(a_run queued 'Sync aarch64-core x86_64-extra x86_64-core')]}" 2 no x86_64-core x86_64-extra
+case_run "a run of another target waits" "{\"workflow_runs\":[$(a_run pending 'Sync x86_64-extra')]}" 0 yes x86_64-core
+case_run "a run that waits names one of two targets" "{\"workflow_runs\":[$(a_run pending 'Sync x86_64-core')]}" 0 yes x86_64-core x86_64-extra
+case_run "a run that waits names a longer target, not this one as a word" \
+  "{\"workflow_runs\":[$(a_run pending 'Sync x86_64-core-testing')]}" 0 yes x86_64-core
+case_run "a run that waits with no title" '{"workflow_runs":[{"status":"pending","event":"schedule"}]}' 0 yes x86_64-core
 
 STUB_STATE=disabled_manually case_run "a sync.yml a person disabled" '{"workflow_runs":[]}' 2 no x86_64-core
 if grep -q 'sync.yml is disabled_manually' "$work/out.log"; then

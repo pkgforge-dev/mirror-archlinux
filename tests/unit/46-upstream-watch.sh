@@ -158,10 +158,10 @@ cp "$state" "$work/state.before"
 clock=$((clock + 900))
 tick
 check "no change: exit 0, no sync" "0 none" "$rc $(started)" "$RW; $(tail -n 3 "$work/log" | tr '\n' ' ')"
-if cmp -s "$work/state.before" "$state"; then
+if same_bytes "$work/state.before" "$state"; then
   ok "no change: the state is the same"
 else
-  fail "no change: the state is the same" "$(diff "$work/state.before" "$state" | tr '\n' ' ')" "$RW"
+  fail "no change: the state is the same" "before: $(tr '\n' ' ' < "$work/state.before")" "after:  $(tr '\n' ' ' < "$state")" "$RW"
 fi
 
 #---------------------------------------------------------------------------#

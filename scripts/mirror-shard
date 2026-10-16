@@ -38,8 +38,16 @@
 #                           of a file it lists.
 #   $WORK/index-unread      why the live index did not read. Then
 #                           scripts/mirror-file writes no tag in this shard.
-# Attempt 1 reads nothing: plan withdrew the rows of the files it gives the
-# shards, and the sync concurrency group lets no other run write between.
+# Attempt 1 reads nothing. When plan read the index (INDEX_STATE ok), it
+# withdrew the rows of the files it gives the shards. When it did not
+# (unread, ignored), scripts/mirror-file writes no repush, and a push goes
+# only to an absent tag, which no valid row vouches for. The sync concurrency
+# group lets no other run write between.
+#
+# INDEX_STATE comes from the plan directory's meta.env, read as data, as
+# index_guard reads TARGET and INDEX_TAG. It is exported for
+# scripts/mirror-file, which writes a repush only when it is ok, absent or
+# invalid. A missing meta.env or key gives unknown.
 #
 # The work goes in the directory with the most free space among $RUNNER_TEMP,
 # /mnt and /tmp, counting each filesystem once. scripts/debloat-runner runs
@@ -96,6 +104,14 @@ else
   warn "$plan_id_file does not exist, so these results name no plan, and scripts/stage reads them only with a plan that names none"
 fi
 printf '%s\n' "$plan_id" > "$out/plan-id"
+# The plan's INDEX_STATE, for the repush rule of scripts/mirror-file
+INDEX_STATE=""
+if [ -f "$plan_dir/meta.env" ]; then
+  INDEX_STATE="$(awk 'index($0, "INDEX_STATE=") == 1 { v = substr($0, 13) } END { print v }' "$plan_dir/meta.env")"
+fi
+if [[ ! "$INDEX_STATE" =~ ^[a-z]+$ ]]; then
+  INDEX_STATE=unknown
+fi
 
 lines="$(awk 'END { print NR + 0 }' "$shard")"
 [ "$lines" -gt 0 ] || die "$shard has no work line"
@@ -147,7 +163,7 @@ done
 if [ "$best_free" -lt "$(need_for 1)" ]; then
   die "$best_dir has $((best_free / 1048576)) MiB free, and the largest file of this shard needs $(($(need_for 1) / 1048576)) MiB"
 fi
-log "$lines file(s), $PARALLEL at a time, in $best_dir ($((best_free / 1073741824)) GiB free)"
+log "$lines file(s), $PARALLEL at a time, in $best_dir ($((best_free / 1073741824)) GiB free); the plan's INDEX_STATE is $INDEX_STATE"
 
 WORK="$(mktemp -d "$best_dir/mirror.XXXXXX")"
 RESULTS="$out/lines"
@@ -167,7 +183,7 @@ trap cleanup EXIT
 ORAS="$("$REPO_ROOT/scripts/install-oras" "$WORK/bin")"
 ORAS_CONFIG="$WORK/oras-auth.json"
 oras_login "$ORAS" "$ORAS_CONFIG"
-export RESULTS WORK ORAS ORAS_CONFIG SHARD_INDEX MIRROR_NAMESPACE REGISTRY_TOKEN_CACHE GITHUB_RUN_ATTEMPT MIRROR_REPAIR
+export RESULTS WORK ORAS ORAS_CONFIG SHARD_INDEX MIRROR_NAMESPACE REGISTRY_TOKEN_CACHE GITHUB_RUN_ATTEMPT MIRROR_REPAIR INDEX_STATE
 
 #---------------------------------------------------------------------------#
 # ⛔ The re-run guard: on a re-run, the live index, read once before the

@@ -278,7 +278,9 @@ jobs:
   # no target's plan, stage or verdicts. Then the target's index
   # (scripts/index-write): what this run left on the registry, for the next
   # run. This job runs after a failure or a cancel too, so a run that stops
-  # early still leaves its work.
+  # early still leaves its work. The plan and the shard results are only for
+  # the index, so they come after the summary upload: a download of them that
+  # fails cannot stop Collect.
   # 10 min for the summary, and the index step's own 15.
   summary:
     needs: [mirror, stage, verify, promote]
@@ -293,16 +295,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: plan-${{ inputs.target }}
-          path: ${{ runner.temp }}/plan/${{ inputs.target }}
-          merge-multiple: true
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: results-${{ inputs.target }}-[0-9]*
-          path: ${{ runner.temp }}/results
-          merge-multiple: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: stage-${{ inputs.target }}
@@ -333,10 +325,25 @@ jobs:
           retention-days: 30
           if-no-files-found: error
           overwrite: true
-      # After the summary upload, so the report never loses a summary.
-      # index-write installs oras itself (scripts/install-oras). Its own
-      # timeout ends inside the step's 15 minutes. An index that is not
-      # written is a warning: the next run plans from the index it finds.
+      # The index step and its two downloads come after the summary upload,
+      # so the report never loses a summary. Each runs with always(), also
+      # after a step before it failed. index-write reads results that are
+      # missing or partial; with no plan it ends 1. It installs oras itself
+      # (scripts/install-oras). Its own timeout ends inside the step's 15
+      # minutes. An index that is not written is a warning: the next run
+      # plans from the index it finds.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ always() }}
+        with:
+          pattern: plan-${{ inputs.target }}
+          path: ${{ runner.temp }}/plan/${{ inputs.target }}
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: ${{ always() }}
+        with:
+          pattern: results-${{ inputs.target }}-[0-9]*
+          path: ${{ runner.temp }}/results
+          merge-multiple: false
       - name: Write the index
         if: ${{ always() }}
         timeout-minutes: 15

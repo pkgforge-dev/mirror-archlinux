@@ -97,7 +97,7 @@ The restart steps in `sync.yml` and `watchdog.yml` run with `always()`. So a sch
 4. The changed targets get one `sync.yml` run on `main` (`scripts/dispatch-sync`). The `targets` input of the run names them, and so does its title, for example `Sync x86_64-extra`.
 5. The watch starts a sync of one target at most once in `SYNC_MIN_INTERVAL` minutes (60).
 
-`scripts/dispatch-sync` starts nothing when `sync.yml` is not `active`, or when a run of `sync.yml` waits (`queued`, `waiting`, `requested` or `pending`). That run plans after the change. A run in progress does not stop a start, because it may have planned before the change.
+`scripts/dispatch-sync` starts nothing when `sync.yml` is not `active`, or when a run of `sync.yml` waits (`queued`, `waiting`, `requested` or `pending`) and covers every changed target. That run plans after the change. A run covers the targets when its title is `Sync all targets`, or when its title names each target as a word. A run that waits for other targets does not stop a start: the new run waits behind it, and `queue: max` keeps both. A run in progress does not stop a start, because it may have planned before the change.
 
 ⛔ A change that starts no sync is not lost. Its URL keeps the old values in the state, so the next tick sees the change again. This is true for a target that waits for `SYNC_MIN_INTERVAL`, a run that waits, a start that GitHub refuses, and a dry run.
 
@@ -208,7 +208,7 @@ A Worker probe fails in each of these cases. [worker.md](worker.md#monitoring) h
 - The signed URL of its 302 does not answer the status runner with 206 or 200 for one byte.
 - The smallest database, downloaded through the Worker once per run, is not the one `latest` names.
 
-Status runs are not an hour apart. The cron runs `status.yml` at minute 47 of each hour, and `sync.yml` starts it after each sync, so two runs can be minutes apart. So `scripts/status-collect` sets `worker.down` in `status.json` only when two conditions are true. The probes failed in 2 runs in a row. The first of these failures is 3000 s (50 minutes) or more before this run. The `worker` job raises `worker-down` on `worker.down`. A Worker or GHCR fault of a few minutes opens no issue.
+Status runs are not an hour apart. The cron runs `status.yml` at minute 47 of each hour. On `main`, `sync.yml` also starts it after a scheduled sync or a sync that promoted a target. Two runs can then be minutes apart. So `scripts/status-collect` sets `worker.down` in `status.json` only when two conditions are true. The probes failed in 2 runs in a row. The first of these failures is 3000 s (50 minutes) or more before this run. The `worker` job raises `worker-down` on `worker.down`. A Worker or GHCR fault of a few minutes opens no issue.
 
 ## What needs a person
 
@@ -241,13 +241,13 @@ A sync run can be run again from its page. The two choices do not do the same th
 
 A new run also reads the index that the runs before it wrote. So it mirrors only the files that no earlier run of the ref left on the registry ([design.md](design.md#the-index-of-a-ref)).
 
-⚠ "Re-run failed jobs" of an older run can come after a newer run wrote the index. Its mirror jobs then write no tag that the live index lists: each such file is `failed`, `the index lists it`. Its summary job keeps the newer index, with the warning `... is kept, and this run's rows are not pushed`.
+⚠ "Re-run failed jobs" of an older run can come after a newer run wrote the index. Its mirror jobs then write no tag that the live index lists: each such file is `failed`, `the index lists it`. Its summary job keeps the newer index, with the warning `... is kept, and this run's rows are not pushed`. This is also true for a re-run of a reset (`ignore_index`), and for an index that a newer run only withdrew rows from.
 
 ### The plan's budget
 
 The plan job reads every target's databases from upstream, one target after another, in one job of 40 minutes. `scripts/plan` ends its upstream reads within `PLAN_BUDGET` seconds (1200). Each target gets what is left of the budget, divided by the targets not yet read. A target whose upstream does not answer in time is in error for that run, and its row in the run's table names `PLAN_BUDGET`. The next run reads it again. A target that stays in error raises `stale-<target>` after the tolerance.
 
-The registry reads of the plan end within `REGISTRY_READ_BUDGET` seconds (240) in all: the index of each target, the `latest` database of `keyring_from`, and the siblings. A read that is not made costs work, not safety: the index is `unread`, and the target plans as with no index.
+The registry reads of the plan share `REGISTRY_READ_BUDGET` seconds (240): the index of each target, the `latest` database of `keyring_from`, and the siblings. The budget stops each new read. One manifest read in progress can run past it by up to about 4 minutes (60 s, 3 retries). A read that is not made costs work: the index is `unread`, and the target plans as with no index. This is safe: mirror-file then writes no repush, so no tag that a row of the index vouches for is written. Each such file is `failed`, `a signature repair waits for a run that read the index`, and the next run that reads the index repairs it.
 
 ### The index of a ref
 
@@ -260,8 +260,10 @@ Each target has an index tag per ref: `index` for `main`, `index-<branch>` for a
 | `... is kept, and this run's rows are not pushed` | the live index is not the one plan read: a newer run wrote it | nothing: the next run plans from it |
 | `scripts/index-write ended N` (summary job) | the index of the target is not written this run | nothing: the next run plans from the index there now |
 | `could not withdraw N index row(s) before their tags are written` (the target's why, state error) | plan could not push the index without the rows of the files it plans | read the plan log; the next run tries again |
+| `a signature repair waits for a run that read the index` (a mirror result, `failed`) | plan did not read the index (`unread` or `ignored`), so no repush is written | nothing: the next run that reads the index repairs the layer |
+| `INDEX_READ=0: the manifest of ... did not read` (plan), then `... is not written: the plan's read of the tag gave no answer` (summary job) | a reset could not read the manifest of the index tag, so the index it replaces is not known | run the reset again |
 
-Reset the index of every target of a ref with the dispatch input `ignore_index`. Nothing is deleted. plan does not read the index, so the run mirrors every file that is not promoted, and verifies every file that is new since the promoted database. index-write then replaces the index.
+Reset the index of every target of a ref with the dispatch input `ignore_index`. Nothing is deleted. plan does not read the rows of the index, so the run mirrors every file that is not promoted, and verifies every file that is new since the promoted database. plan reads the manifest of the index tag alone. index-write then replaces that index and no other: an index that a newer run wrote after it stays. When the manifest did not read, index-write writes nothing: run the reset again. ⚠ A reset repairs no signature layer: such a file is `failed`, and holds its target in that run. The next run reads the new index and repairs it.
 
 ```bash
 gh workflow run sync.yml --ref main -f ignore_index=true
@@ -509,7 +511,7 @@ In `status.json`, `summary.measured` counts the targets read on both sides, and 
 
 The time is `summary.last_synced` in `status.json`. It is the newest `org.opencontainers.image.created` of the `latest` manifests, which `scripts/status-collect` records per target as `mirror.created`. oras sets that annotation when `stage` pushes a snapshot. A manifest with no such annotation counts with its `dev.pkgforge.mirror.fetched` time. The table of repositories shows the same age per target, in the column `synced`.
 
-⚠ The age counts to the status run that wrote the badge, not to the moment a reader looks. A status run comes each hour and after each sync. A README shows a badge through GitHub's image proxy, which can serve an older copy.
+⚠ The age counts to the status run that wrote the badge, not to the moment a reader looks. A status run comes each hour, after a scheduled sync, and after a sync that promoted a target. After a sync that promoted nothing, a badge can be up to an hour old. A README shows a badge through GitHub's image proxy, which can serve an older copy.
 
 ### Size per architecture and repository
 

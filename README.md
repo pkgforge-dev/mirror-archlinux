@@ -179,7 +179,7 @@ pacman checks each package against the keyring of its distribution. A consumer n
 4. **verify** (`scripts/verify-batch`) runs pacman in the x86_64 Arch image with the wrapper as its `XferCommand`. pacman downloads each of these files and checks its sha256 and signature.
 5. **promote** (`scripts/promote`, branch `main` only) tags the staged digest: the date tag once, `db-HEX`, `files-HEX`, then `latest`. `latest` never moves backwards.
 6. **index** (`scripts/index-write`) writes the target's index: the files the run left on the registry, and the files verify passed. It runs also after a failure or a cancel, so the next run does not do the same work again.
-7. **report** (`scripts/report`) writes one table for the run. On `main`, it keeps the `visibility-`, `replaced-` and `refused-` issues current, then starts the status workflow.
+7. **report** (`scripts/report`) writes one table for the run. On `main`, it keeps the `visibility-`, `replaced-` and `refused-` issues current. After a scheduled sync, or a sync that promoted a target, it then starts the status workflow.
 8. **status** (`scripts/status-collect`, `scripts/status-render`, every hour) measures each target against upstream and against the Worker. It publishes the dashboard, the badges and the charts.
 
 [docs/design.md](docs/design.md) gives each rule and the failure it prevents.
