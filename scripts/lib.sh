@@ -238,6 +238,43 @@ esac
 REG_URL="$MIRROR_REGISTRY_SCHEME://$MIRROR_REGISTRY"
 UPSTREAM_PROTO="${UPSTREAM_PROTO:-=https}"
 
+# The tags of a ref. A run on main, or with no GITHUB_REF, writes staging and
+# index. A run on another branch writes staging-<slug> and index-<slug>. The
+# slug is GITHUB_REF_NAME in lower case, each other character a -, no two -
+# together, at most 40 characters, no - at either end; empty gives branch.
+# STAGING_TAG and INDEX_TAG, when set, are used as given. Each tag is checked
+# against its grammar.
+#
+# staging_tag -> staging or staging-<slug>
+# index_tag   -> index${staging_tag#staging}: index or index-<slug>
+staging_tag() {
+  local t slug
+  if [ -n "${STAGING_TAG:-}" ]; then
+    t="$STAGING_TAG"
+  elif [ -z "${GITHUB_REF:-}" ] || [ "$GITHUB_REF" = refs/heads/main ]; then
+    t=staging
+  else
+    slug="$(printf '%s' "${GITHUB_REF_NAME:-}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed 's/--*/-/g' | cut -c1-40 | sed 's/^-//; s/-$//')"
+    t="staging-${slug:-branch}"
+  fi
+  [[ "$t" =~ ^staging(-[a-z0-9]+(-[a-z0-9]+)*)?$ ]] ||
+    die "STAGING_TAG must be staging or staging-<slug>, not '$t'"
+  printf '%s\n' "$t"
+}
+
+index_tag() {
+  local t s
+  if [ -n "${INDEX_TAG:-}" ]; then
+    t="$INDEX_TAG"
+  else
+    s="$(staging_tag)" || return 1
+    t="index${s#staging}"
+  fi
+  [[ "$t" =~ ^index(-[a-z0-9]+(-[a-z0-9]+)*)?$ ]] ||
+    die "INDEX_TAG must be index or index-<slug>, not '$t'"
+  printf '%s\n' "$t"
+}
+
 # oras_args: what every oras call needs to reach the registry
 oras_args() {
   printf '%s\n' --registry-config "$ORAS_CONFIG"
@@ -646,6 +683,55 @@ keyring_copy() {
 }
 
 #---------------------------------------------------------------------------#
+# The verify context
+#
+# A verdict of scripts/verify-batch holds for the inputs it ran with. The
+# verify context is one sha256 of these inputs, in this order:
+#   the line index-format=1
+#   the key = value lines of the target file, as key=value; comments and
+#     blank lines do not count
+#   the bytes of scripts/verify-batch, client/pacman-oci and scripts/lib.sh
+#   fields 1, 5 and 8 of the records of the keyring packages verify
+#     installs, sorted
+# An index row verified under another context is verified again
+# (scripts/plan).
+#
+# verify_context CONF RECORDS -> the sha256, or status 1 when an input does
+# not read. RECORDS is a records file (db_records). Only the records whose
+# name is in the keyring list of CONF count. A RECORDS file that holds the
+# one line none stands for a keyring_from target with no latest.
+#---------------------------------------------------------------------------#
+verify_context() {
+  local conf="$1" records="$2" names tmpf sum
+  tmpf="$(mktemp)"
+  names="$(target_keyrings "$conf" | tr '\n' ' ')"
+  if printf 'index-format=1\n' > "$tmpf" &&
+    awk '
+      /^[[:space:]]*(#|$)/ { next }
+      {
+        k = $0; sub(/[[:space:]]*=.*/, "", k)
+        v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
+        print k "=" v
+      }
+    ' "$conf" >> "$tmpf" &&
+    cat "$REPO_ROOT/scripts/verify-batch" "$WRAPPER" "$REPO_ROOT/scripts/lib.sh" >> "$tmpf" &&
+    awk -F '\t' -v names=" $names" '
+      $0 == "none" { print; next }
+      $2 != "" && index(names, " " $2 " ") { print $1 "\t" $5 "\t" $8 }
+    ' "$records" > "$tmpf.keyrings" &&
+    LC_ALL=C sort "$tmpf.keyrings" >> "$tmpf"; then
+    sum="$(sha256sum "$tmpf" | cut -d ' ' -f 1)"
+    rm -f -- "$tmpf" "$tmpf.keyrings"
+    printf '%s\n' "$sum"
+    return 0
+  fi
+  rm -f -- "$tmpf" "$tmpf.keyrings"
+  warn "the verify context of $conf is not known: an input does not read" \
+    "reproduce: ls $conf $records $REPO_ROOT/scripts/verify-batch $WRAPPER $REPO_ROOT/scripts/lib.sh"
+  return 1
+}
+
+#---------------------------------------------------------------------------#
 # The write-once rule for package tags
 #
 # decide_push MANIFEST FILE SHA256 CSIZE SIG_SHA256
@@ -733,6 +819,49 @@ reconcile_results() {
   # "absent" is not bad: the file is gone from upstream (404 everywhere) though
   # its database still names it, so mirror-file skipped it rather than failing.
   awk -F '\t' '$3 != "pushed" && $3 != "present" && $3 != "absent" { n++ } END { print n + 0 }' "$outfile"
+}
+
+# results_of_plan RESULTS PLAN_ID OUT
+#
+# Every result line of the mirror shards of plan PLAN_ID into OUT: target
+# filename status seconds detail. RESULTS holds the shards' outputs at any
+# depth: every results.tsv under it is read, and every lines/*.tsv, which a
+# shard killed before its results.tsv leaves behind. A results.tsv and the
+# lines/ beside it say the same, so a line can come twice. No results at all
+# is ordinary: a database that changed by dropping packages names no new file.
+#
+# ⛔ Only a directory whose plan-id is PLAN_ID is read (scripts/mirror-shard).
+# "Re-run all jobs" plans again, and the download of results-<target>-* still
+# returns the earlier attempt's artifacts. Their lines are about another
+# plan: a stale "failed" could hold the target, a stale "pushed" could count
+# a file that is not there. Each directory left out is named in a warning.
+results_of_plan() {
+  local results="$1" plan_id="$2" outfile="$3" paths dirs d got
+  paths="$(mktemp)"
+  dirs="$(mktemp)"
+  : > "$outfile"
+  if [ -d "$results" ]; then
+    find "$results" \( -name results.tsv -type f \) -o \( -name lines -type d \) > "$paths"
+    sed 's|/[^/]*$||' "$paths" | sort -u > "$dirs"
+  fi
+  while IFS= read -r d; do
+    got=""
+    if [ -f "$d/plan-id" ]; then
+      got="$(cat "$d/plan-id")"
+    fi
+    if [ "$got" != "$plan_id" ]; then
+      warn "$d holds the results of plan '$got', not of this plan '$plan_id'; they are not read" \
+        "an earlier attempt of the run left them: Re-run all jobs plans again, and the artifacts of the earlier attempt stay"
+      continue
+    fi
+    if [ -f "$d/results.tsv" ]; then
+      cat "$d/results.tsv" >> "$outfile"
+    fi
+    if [ -d "$d/lines" ]; then
+      find "$d/lines" -maxdepth 1 -name '[0-9]*.tsv' -type f -exec cat {} + >> "$outfile"
+    fi
+  done < "$dirs"
+  rm -f -- "$paths" "$dirs"
 }
 
 #---------------------------------------------------------------------------#
@@ -893,9 +1022,18 @@ registry_error_code() {
 }
 
 # registry_get_manifest URL TOKEN OUT -> the HTTP status on stdout, curl's
-# status as the return value
+# status as the return value. REG_MANIFEST_MAX_TIME (seconds), when set,
+# bounds the whole call, its retries included, as registry_get_blob's
+# MAX_SECONDS does: --max-time, --retry-max-time, and timeout 5 s after it.
+# Unset, each try gets 60 s, and 3 retries can take about 4 minutes.
 registry_get_manifest() {
-  curl -q --silent --show-error --connect-timeout 20 --max-time 60 \
+  local max=60 whole=() limit=()
+  if [ -n "${REG_MANIFEST_MAX_TIME:-}" ]; then
+    max="$REG_MANIFEST_MAX_TIME"
+    whole=(--retry-max-time "$max")
+    limit=(timeout -k 5 "$((max + 5))")
+  fi
+  "${limit[@]}" curl -q --silent --show-error --connect-timeout 20 --max-time "$max" "${whole[@]}" \
     --retry 3 --retry-connrefused --retry-delay 2 --max-filesize 4194304 \
     --header "Authorization: Bearer $2" \
     --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
@@ -904,8 +1042,13 @@ registry_get_manifest() {
 
 # registry_manifest REPO REF OUT -> the manifest bytes in OUT
 #   returns 0 read, 4 the registry has no such manifest, 1 could not read
+# REG_MANIFEST_MAX_TIME, when set, bounds each manifest request
+# (registry_get_manifest); REG_TOKEN_MAX_TIME bounds each token request.
 registry_manifest() {
   local repo="$1" ref="$2" outfile="$3" code="" rc=0 err url
+  case "${REG_MANIFEST_MAX_TIME:-60}" in
+    *[!0-9]* | 0) die "REG_MANIFEST_MAX_TIME must be a positive number of seconds, not '$REG_MANIFEST_MAX_TIME'" ;;
+  esac
   REG_LAST_CODE=000
   url="$REG_URL/v2/$repo/manifests/$ref"
   if [ "$MIRROR_REGISTRY_AUTH" != none ] && [ "$MIRROR_REGISTRY" = ghcr.io ]; then
@@ -968,14 +1111,19 @@ registry_manifest() {
   return "$REG_STATUS_OK"
 }
 
-# registry_get_blob URL TOKEN OUT MAX_SECONDS -> the HTTP status of the last
-# answer on stdout, curl's status as the return value. The whole call, its
-# retries and the redirect to the blob host included, ends within MAX_SECONDS,
-# as fetch_upstream's does.
+# registry_get_blob URL TOKEN OUT MAX_SECONDS [MAX_BYTES] -> the HTTP status
+# of the last answer on stdout, curl's status as the return value. The whole
+# call, its retries and the redirect to the blob host included, ends within
+# MAX_SECONDS, as fetch_upstream's does. MAX_BYTES, when above 0, stops a
+# body that is larger (curl --max-filesize).
 registry_get_blob() {
+  local limit=()
+  if [ "${5:-0}" -gt 0 ]; then
+    limit=(--max-filesize "$5")
+  fi
   timeout -k 5 "$(($4 + 5))" curl -q --location --silent --show-error --proto "$REG_PROTO" --proto-redir "$REG_PROTO" --max-redirs 5 \
     --connect-timeout 20 --speed-limit 1024 --speed-time 60 --max-time "$4" --retry-max-time "$4" \
-    --retry 3 --retry-connrefused --retry-delay 2 \
+    --retry 3 --retry-connrefused --retry-delay 2 "${limit[@]}" \
     --header "Authorization: Bearer $2" \
     --output "$3" --write-out '%{http_code}' "$1"
 }
@@ -1018,6 +1166,90 @@ registry_blob() {
   if [ "$(sha256sum "$outfile" | cut -d ' ' -f 1)" != "${digest#sha256:}" ]; then
     warn "blob $digest of $repo does not hash to its digest"
     rm -f "$outfile"
+    return 1
+  fi
+  return 0
+}
+
+# registry_blob_probe REPO DIGEST OUT MAX CSIZE -> a package blob from a
+# registry repository, a source mirror-file asks before the upstream servers
+#   0  read: CSIZE bytes, and its sha256 is the digest
+#   4  the repository does not hold it: 404 with BLOB_UNKNOWN or NAME_UNKNOWN,
+#      or GHCR gives no anonymous token for the repository (403), as
+#      registry_manifest reads it. No warning.
+#   5  the registry limits requests (429): the caller pauses (throttle_pause)
+#      and asks its next source
+#   1  anything else, with a log line
+# MAX (seconds) bounds the read, its retries included; the token request has
+# its own REG_TOKEN_MAX_TIME. The read stops after CSIZE bytes. OUT exists
+# only on status 0. On GHCR with no credential, Bearer QQ== is tried first,
+# as in registry_blob.
+registry_blob_probe() {
+  local repo="$1" digest="$2" outfile="$3" max="$4" csize="$5" code="" rc=0 url err size
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "registry_blob_probe: not a sha256 digest: '$digest'"
+  case "$max" in
+    '' | *[!0-9]* | 0) die "registry_blob_probe: MAX must be a positive number of seconds, not '$max'" ;;
+  esac
+  case "$csize" in
+    '' | *[!0-9]*) die "registry_blob_probe: CSIZE must be a number of bytes, not '$csize'" ;;
+  esac
+  rm -f -- "$outfile"
+  url="$REG_URL/v2/$repo/blobs/$digest"
+  if registry_anon_ghcr; then
+    code="$(registry_get_blob "$url" 'QQ==' "$outfile" "$max" "$csize")" || rc=$?
+    if [ "$rc" -eq 0 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; }; then
+      code=""
+    fi
+  fi
+  if [ -z "$code" ] && [ "$rc" -eq 0 ]; then
+    if ! registry_token_get "$repo" pull; then
+      rm -f -- "$outfile"
+      if registry_anon_ghcr && [ "$REG_TOKEN_CODE" = 403 ]; then
+        return 4
+      fi
+      if [ "$REG_TOKEN_CODE" = 429 ]; then
+        return 5
+      fi
+      return 1
+    fi
+    code="$(registry_get_blob "$url" "$REG_TOKEN" "$outfile" "$max" "$csize")" || rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    rm -f -- "$outfile"
+    log "blob $digest of $repo did not read within ${max}s or ${csize} bytes (curl $rc)"
+    return 1
+  fi
+  case "$code" in
+    200) ;;
+    404)
+      err="$(registry_error_code "$outfile")"
+      rm -f -- "$outfile"
+      case "$err" in
+        BLOB_UNKNOWN | NAME_UNKNOWN) return 4 ;;
+      esac
+      log "blob $digest of $repo answered HTTP 404 with ${err:-no error code}"
+      return 1
+      ;;
+    429)
+      rm -f -- "$outfile"
+      log "blob $digest of $repo answered HTTP 429: the registry limits requests"
+      return 5
+      ;;
+    *)
+      rm -f -- "$outfile"
+      log "blob $digest of $repo answered HTTP $code"
+      return 1
+      ;;
+  esac
+  size="$(wc -c < "$outfile" | tr -d ' ')"
+  if [ "$size" != "$csize" ]; then
+    rm -f -- "$outfile"
+    log "blob $digest of $repo is $size bytes, not $csize"
+    return 1
+  fi
+  if [ "$(sha256sum "$outfile" | cut -d ' ' -f 1)" != "${digest#sha256:}" ]; then
+    rm -f -- "$outfile"
+    log "blob $digest of $repo does not hash to its digest"
     return 1
   fi
   return 0
@@ -1088,6 +1320,296 @@ manifest_layer() {
     [.layers[]? | select(.annotations["org.opencontainers.image.title"]? == $t)]
     | if length == 1 then "\(.[0].digest) \(.[0].size) \(.[0].mediaType)" else empty end
   ' "$1"
+}
+
+#---------------------------------------------------------------------------#
+# The index of a ref
+#
+# One OCI artifact per target repository and per ref, at the tag index_tag
+# gives. It holds what the runs of the ref left on the registry, so a run
+# that fails, is held or is cancelled leaves its work to the next run. Its
+# artifactType is INDEX_ARTIFACT_TYPE, its annotation
+# dev.pkgforge.mirror.index-format is 1, and it has two layers, by title:
+#   ref.db     the upstream database the rows describe
+#   index.tsv  filename, state, verified, unsigned; tab separated, sorted by
+#              filename. State m: the tag holds exactly the package bytes of
+#              the ref.db record, and the signature mirror-file expects for
+#              it. State a: every server answered 404 (absent upstream).
+#              verified and unsigned are 0 or 1, and both 0 for state a.
+# scripts/plan reads it and withdraws rows. scripts/index-write writes it.
+# ⛔ It is not a database: index and index-<slug> are reserved tag names that
+# no package tag can take (tests/unit/10-tag-encoding.sh), and the Worker and
+# the wrapper must never serve them.
+#
+# index_read REPO TAG OUTDIR [DB ...] -> one word on stdout, status 0:
+#   ok       read and valid. OUTDIR/index.tsv holds the valid lines,
+#            OUTDIR/ref.db the database, OUTDIR/ref.tsv its records.
+#   absent   the registry has no such tag
+#   invalid  read, and not a valid index of format 1: do not use it
+#   unread   no answer that decides: a transport error, an HTTP error, a
+#            blob that is not its digest, or a ref.db that db_records
+#            cannot read here
+# OUTDIR/manifest.json holds the manifest when the state is ok or invalid.
+# A DB whose sha256 is the digest of the ref.db layer is copied, not read.
+# The reads send REGISTRY_TOKEN as it is set (registry_manifest,
+# registry_blob). A line of index.tsv that does not fit the grammar, or whose
+# filename ref.db does not name, is dropped; so are both lines of a filename
+# given twice. More than 1% of the lines dropped makes the index invalid.
+#
+# index_push ORAS REPO TAG DIR ANNOTATION... -> 0 pushed, 1 not: DIR/ref.db
+# and DIR/index.tsv as REPO:TAG, each ANNOTATION (key=value) on the
+# manifest. DIR may be relative. Needs ORAS_CONFIG (oras_args). A 429 costs
+# no attempt: its pauses add up to INDEX_RATE_WAIT (default 120 s), a cap of
+# their own; the THROTTLE_WAITED of the caller is kept. At most 2 attempts,
+# each within 120 s.
+#
+# index_listed REPO TAG OUT -> 0: OUT holds the filenames of the m rows of
+# REPO:TAG, sorted, each once; OUT is empty when the registry has no such
+# tag. 1: no answer that decides, or not an index of format 1 with an
+# index.tsv layer; INDEX_LISTED_WHY says which. The manifest and the
+# index.tsv blob each get 3 tries, a blob read 60 s. The reads send
+# REGISTRY_TOKEN as it is set. ref.db is not read: a row is listed whether
+# ref.db names its file or not.
+#
+# index_guard PLAN_DIR WORK -> the re-run guard of scripts/mirror-shard. It
+# reads PLAN_DIR/meta.env as data: TARGET names the target file in
+# TARGETS_DIR, INDEX_TAG the tag. Then it reads that tag once (index_listed).
+#   0  WORK/index-listed.txt holds the filenames of the m rows
+#   1  no answer that decides: WORK/index-unread says why, and a warning
+#      says so. scripts/mirror-file then writes no tag.
+#---------------------------------------------------------------------------#
+INDEX_ARTIFACT_TYPE=application/vnd.pkgforge.archlinux.index.v1
+INDEX_DB_MEDIA_TYPE=application/vnd.pkgforge.archlinux.db.v1
+INDEX_TSV_MEDIA_TYPE=application/vnd.pkgforge.archlinux.index.v1+tsv
+
+index_read() {
+  local repo="$1" tag="$2" outdir="$3" rc=0 f ctx db_digest db_type tsv_digest tsv_type counts total bad
+  shift 3
+  if ! mkdir -p "$outdir"; then
+    echo unread
+    return 0
+  fi
+  rm -f -- "$outdir/manifest.json" "$outdir/ref.db" "$outdir/ref.tsv" "$outdir/ref.bad" "$outdir/index.raw" "$outdir/index.tsv"
+  registry_manifest "$repo" "$tag" "$outdir/manifest.json" || rc=$?
+  case "$rc" in
+    "$REG_STATUS_OK") ;;
+    "$REG_STATUS_ABSENT")
+      rm -f -- "$outdir/manifest.json"
+      echo absent
+      return 0
+      ;;
+    *)
+      rm -f -- "$outdir/manifest.json"
+      echo unread
+      return 0
+      ;;
+  esac
+  if ! jq -e --arg t "$INDEX_ARTIFACT_TYPE" '.artifactType == $t and .annotations["dev.pkgforge.mirror.index-format"]? == "1" and (.layers | length) == 2' "$outdir/manifest.json" > /dev/null; then
+    warn "$repo:$tag is not an index of format 1: its artifactType, its index-format annotation or its layer count differs" \
+      "$(head -c 300 "$outdir/manifest.json")"
+    echo invalid
+    return 0
+  fi
+  ctx="$(jq -r '.annotations["dev.pkgforge.mirror.verify-context"] // ""' "$outdir/manifest.json")"
+  read -r db_digest _ db_type <<< "$(manifest_layer "$outdir/manifest.json" ref.db)"
+  read -r tsv_digest _ tsv_type <<< "$(manifest_layer "$outdir/manifest.json" index.tsv)"
+  if [ "$db_type" != "$INDEX_DB_MEDIA_TYPE" ] || [ "$tsv_type" != "$INDEX_TSV_MEDIA_TYPE" ] ||
+    [[ ! "$db_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || [[ ! "$tsv_digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    [[ ! "$ctx" =~ ^([0-9a-f]{64})?$ ]]; then
+    warn "$repo:$tag is not an index of format 1: a layer ref.db ($db_type) and a layer index.tsv ($tsv_type), each with a sha256 digest, and a verify-context of 64 hex digits or none" \
+      "$(head -c 300 "$outdir/manifest.json")"
+    echo invalid
+    return 0
+  fi
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    if [ "sha256:$(sha256sum "$f" | cut -d ' ' -f 1)" = "$db_digest" ] && cp "$f" "$outdir/ref.db"; then
+      break
+    fi
+  done
+  if [ ! -f "$outdir/ref.db" ] && ! registry_blob "$repo" "$db_digest" "$outdir/ref.db"; then
+    echo unread
+    return 0
+  fi
+  if ! registry_blob "$repo" "$tsv_digest" "$outdir/index.raw"; then
+    echo unread
+    return 0
+  fi
+  # `if !`: db_records must not be called bare (see db_records). The blob
+  # has its digest, and index_push writes only a database there. So a
+  # failure here is local, for example tar on this host: unread, not
+  # invalid.
+  if ! db_records "$outdir/ref.db" "$outdir/ref.tsv"; then
+    warn "$repo:$tag: its ref.db ($db_digest) does not read as a tar archive on this host"
+    echo unread
+    return 0
+  fi
+  if ! db_validate "$outdir/ref.tsv" > "$outdir/ref.bad"; then
+    warn "$repo:$tag: records of its ref.db ($db_digest) fail their grammar" "$(sed -n 1,3p "$outdir/ref.bad")"
+    echo invalid
+    return 0
+  fi
+  # Each line: 4 fields, state m or a, flags 0 or 1, both 0 for a, and a
+  # filename ref.db names. A filename on two lines drops both.
+  if ! counts="$(awk -F '\t' -v out="$outdir/index.tsv" '
+    FILENAME == ARGV[1] { named[$1] = 1; next }
+    {
+      n++
+      l[n] = $0
+      g[n] = (NF == 4 && ($1 in named) && ($2 == "m" || $2 == "a") && ($3 == "0" || $3 == "1") && ($4 == "0" || $4 == "1") && ($2 == "m" || ($3 == "0" && $4 == "0")))
+      if (g[n]) { f[n] = $1; seen[$1]++ }
+    }
+    END {
+      printf "" > out
+      for (i = 1; i <= n; i++) {
+        if (g[i] && seen[f[i]] == 1) print l[i] > out
+        else bad++
+      }
+      print n + 0, bad + 0
+    }
+  ' "$outdir/ref.tsv" "$outdir/index.raw")"; then
+    echo unread
+    return 0
+  fi
+  read -r total bad <<< "$counts"
+  if [ "$((bad * 100))" -gt "$total" ]; then
+    warn "$repo:$tag: $bad of $total line(s) of its index.tsv fail their grammar, name no file of its ref.db or name a file twice; more than 1%"
+    echo invalid
+    return 0
+  fi
+  if [ "$bad" -gt 0 ]; then
+    log "$repo:$tag: $bad of $total line(s) of its index.tsv are dropped: they fail their grammar, name no file of its ref.db or name a file twice"
+  fi
+  echo ok
+}
+
+index_push() {
+  local oras="$1" repo="$2" tag="$3" dir="$4" cap="${INDEX_RATE_WAIT:-120}" saved="$THROTTLE_WAITED" rc=0 attempt=0 a abs
+  shift 4
+  case "$cap" in
+    '' | *[!0-9]*) die "INDEX_RATE_WAIT must be whole seconds, not '$cap'" ;;
+  esac
+  if [ ! -f "$dir/ref.db" ] || [ ! -f "$dir/index.tsv" ]; then
+    warn "$repo:$tag: $dir holds no ref.db and index.tsv to push"
+    return 1
+  fi
+  # An absolute path: the push runs from inside DIR, and its log is DIR/push.log.
+  if ! abs="$(cd "$dir" && pwd)"; then
+    warn "$repo:$tag: $dir could not be made an absolute path"
+    return 1
+  fi
+  dir="$abs"
+  local oargs=() args=()
+  mapfile -t oargs < <(oras_args)
+  args=(push "${oargs[@]}" --artifact-type "$INDEX_ARTIFACT_TYPE")
+  for a in "$@"; do
+    args+=(--annotation "$a")
+  done
+  args+=("$MIRROR_REGISTRY/$repo:$tag" "./ref.db:$INDEX_DB_MEDIA_TYPE" "./index.tsv:$INDEX_TSV_MEDIA_TYPE")
+  THROTTLE_WAITED=0
+  while :; do
+    rc=0
+    (cd "$dir" && timeout -k 10 120 "$oras" "${args[@]}" > "$dir/push.log" 2>&1) || rc=$?
+    [ "$rc" -ne 0 ] || break
+    if rate_limited "$dir/push.log"; then
+      throttle_pause "$dir" "$cap" "$repo:$tag: index push" || break
+      continue
+    fi
+    attempt=$((attempt + 1))
+    warn "$repo:$tag: index push attempt $attempt ended $rc" "$(tail -n 3 "$dir/push.log")"
+    [ "$attempt" -lt 2 ] || break
+    sleep 5
+  done
+  if [ "$rc" -ne 0 ]; then
+    warn "$repo:$tag: the index was not pushed ($attempt failed attempt(s), ${THROTTLE_WAITED}s of 429 pauses of at most INDEX_RATE_WAIT=${cap}s): $(tail -n 1 "$dir/push.log")"
+  fi
+  THROTTLE_WAITED="$saved"
+  return "$rc"
+}
+
+# ⛔ Each step is checked on its own: the caller calls it in an if, where
+# set -e does not act, and a list that is not whole lets a tag be written.
+INDEX_LISTED_WHY=""
+index_listed() {
+  local repo="$1" tag="$2" outfile="$3" tmpd try rc=0 d t
+  INDEX_LISTED_WHY=""
+  rm -f -- "$outfile"
+  if ! tmpd="$(mktemp -d)"; then
+    INDEX_LISTED_WHY="no temporary directory for the read of $repo:$tag"
+    return 1
+  fi
+  for try in 1 2 3; do
+    rc=0
+    registry_manifest "$repo" "$tag" "$tmpd/manifest.json" || rc=$?
+    if [ "$rc" -eq "$REG_STATUS_OK" ] || [ "$rc" -eq "$REG_STATUS_ABSENT" ] || [ "$try" -eq 3 ]; then
+      break
+    fi
+    sleep "$try"
+  done
+  if [ "$rc" -eq "$REG_STATUS_ABSENT" ]; then
+    : > "$tmpd/index.tsv"
+  elif [ "$rc" -ne "$REG_STATUS_OK" ]; then
+    INDEX_LISTED_WHY="$repo:$tag did not read in 3 tries (HTTP $REG_LAST_CODE)"
+  elif [ "$(jq -r --arg t "$INDEX_ARTIFACT_TYPE" '.artifactType == $t and .annotations["dev.pkgforge.mirror.index-format"]? == "1"' "$tmpd/manifest.json")" != true ]; then
+    INDEX_LISTED_WHY="$repo:$tag is not an index of format 1"
+  else
+    read -r d _ t <<< "$(manifest_layer "$tmpd/manifest.json" index.tsv)"
+    if [[ ! "${d:-}" =~ ^sha256:[0-9a-f]{64}$ ]] || [ "${t:-}" != "$INDEX_TSV_MEDIA_TYPE" ]; then
+      INDEX_LISTED_WHY="$repo:$tag has no index.tsv layer of $INDEX_TSV_MEDIA_TYPE"
+    else
+      for try in 1 2 3; do
+        rc=0
+        REG_BLOB_MAX_TIME=60 REG_TOKEN_MAX_TIME=60 registry_blob "$repo" "$d" "$tmpd/index.tsv" || rc=$?
+        if [ "$rc" -eq 0 ] || [ "$try" -eq 3 ]; then
+          break
+        fi
+        sleep "$try"
+      done
+      if [ "$rc" -ne 0 ]; then
+        INDEX_LISTED_WHY="the index.tsv of $repo:$tag ($d) did not read in 3 tries"
+      fi
+    fi
+  fi
+  if [ -z "$INDEX_LISTED_WHY" ] && ! awk -F '\t' '$2 == "m" { print $1 }' "$tmpd/index.tsv" | LC_ALL=C sort -u > "$outfile"; then
+    INDEX_LISTED_WHY="the m rows of $repo:$tag could not be written to $outfile"
+  fi
+  rm -rf -- "$tmpd"
+  if [ -n "$INDEX_LISTED_WHY" ]; then
+    rm -f -- "$outfile"
+    return 1
+  fi
+  return 0
+}
+
+# ⛔ Each step is checked on its own, as in index_listed. WORK/index-listed.txt
+# exists only when the whole list is written.
+index_guard() {
+  local pdir="$1" work="$2" tgt="" tag="" conf repo why=""
+  rm -f -- "$work/index-listed.txt" "$work/index-unread"
+  if [ -f "$pdir/meta.env" ]; then
+    tgt="$(awk 'index($0, "TARGET=") == 1 { v = substr($0, 8) } END { print v }' "$pdir/meta.env")"
+    tag="$(awk 'index($0, "INDEX_TAG=") == 1 { v = substr($0, 11) } END { print v }' "$pdir/meta.env")"
+  fi
+  conf="$TARGETS_DIR/$tgt.conf"
+  if [ ! -f "$pdir/meta.env" ]; then
+    why="$pdir/meta.env does not exist, so the index tag is not known"
+  elif [ -z "$tgt" ] || [[ "$tgt" == *[!a-z0-9_.-]* ]] || [ ! -f "$conf" ]; then
+    why="$pdir/meta.env: TARGET '$tgt' names no target file in $TARGETS_DIR"
+  elif [[ ! "$tag" =~ ^index(-[a-z0-9]+(-[a-z0-9]+)*)?$ ]]; then
+    why="$pdir/meta.env: INDEX_TAG is '$tag', not index or index-<slug>"
+  else
+    target_check "$conf"
+    repo="$(target_repository "$conf")"
+    if index_listed "$repo" "$tag" "$work/index-listed.txt"; then
+      log "a re-run: $repo:$tag lists $(awk 'END { print NR + 0 }' "$work/index-listed.txt") file(s) on the registry; no tag of these is written"
+      return 0
+    fi
+    why="$INDEX_LISTED_WHY"
+  fi
+  printf '%s\n' "$why" > "$work/index-unread"
+  warn "a re-run: the live index did not read ($why); no tag is written in this shard" \
+    "a file whose tag holds it already still counts; the next run plans again"
+  return 1
 }
 
 # fetch_upstream URL OUT [MAX_SECONDS] -> 0 fetched, 4 the server says it has

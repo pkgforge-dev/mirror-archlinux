@@ -4,8 +4,8 @@
 # valid, which database fields are refused, which database is behind another,
 # when a package tag may be written, when a target is stale, which snapshot is
 # newer, how a shard accounts for every file, which token a registry read
-# sends, which server is asked last, how long an upstream read may take, and
-# which artifacts of a re-run the report reads.
+# sends, which server is asked last, how long an upstream read or a registry
+# request may take, and which artifacts of a re-run the report reads.
 set -euo pipefail
 # shellcheck source=../lib/harness.sh
 . "$REPO_ROOT/tests/lib/harness.sh"
@@ -617,6 +617,8 @@ cat > "$fake/bin/curl" << 'EOF'
 # exists, every token request gets that HTTP code and no token. Answers a
 # manifest or a blob request from $FAKE/answers.tsv: AUTH<TAB>CODE<TAB>BODY-FILE,
 # the first line whose AUTH matches. With --write-out, prints the HTTP code.
+# Each call's arguments go to $FAKE/curl-args, one call per line.
+printf '%s\n' "$*" >> "$FAKE/curl-args"
 out="" auth="" url="" cred="" wo="" maxt="" retmax=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -654,6 +656,16 @@ case "$url" in
     fi
     ;;
   */manifests/* | */blobs/*)
+    # The deadlines a manifest request was given, and a manifest server that
+    # stalls when $FAKE/manifest-stall exists, as for a token request.
+    case "$url" in
+      */manifests/*)
+        printf '%s %s\n' "${maxt:-none}" "${retmax:-none}" > "$FAKE/manifest-args"
+        if [ -f "$FAKE/manifest-stall" ]; then
+          exec sleep 60 > /dev/null
+        fi
+        ;;
+    esac
     line="$(awk -F '\t' -v a="$auth" '$1 == a && !f { print $2 "\t" $3; f = 1 }' "$FAKE/answers.tsv")"
     if [ -z "$line" ]; then
       [ -z "$wo" ] || printf '000'
@@ -798,6 +810,32 @@ REG_TOKEN_MAX_TIME=soon FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY=ghcr
 check "registry_token: a REG_TOKEN_MAX_TIME that is not a number of seconds is refused" "refused" \
   "$([ "$rc" -ne 0 ] && echo refused || echo "accepted (status $rc)")" "REG_TOKEN_MAX_TIME=soon bash -c '. scripts/lib.sh; registry_token it/repo pull'"
 
+# A manifest server that stalls. With REG_MANIFEST_MAX_TIME, as plan sets it
+# for each read of REGISTRY_READ_BUDGET, the whole request ends within it,
+# retries included, and timeout(1) ends it when curl does not. With none set,
+# a request keeps --max-time 60 and no --retry-max-time.
+REG_TOKEN='' reg ok 'Bearer QQ==\t200\tmanifest.json\n' > /dev/null
+check "registry_manifest: with no REG_MANIFEST_MAX_TIME, a manifest request gets --max-time 60 and no --retry-max-time" \
+  "60 none" "$(cat "$fake/manifest-args")" "bash -c '. scripts/lib.sh; registry_manifest it/repo latest OUT' with curl logging its arguments"
+REG_MANIFEST_MAX_TIME=2 REG_TOKEN='' reg ok 'Bearer QQ==\t200\tmanifest.json\n' > /dev/null
+check "registry_manifest: REG_MANIFEST_MAX_TIME=2 gives a manifest request --max-time 2 and --retry-max-time 2" \
+  "2 2" "$(cat "$fake/manifest-args")" "REG_MANIFEST_MAX_TIME=2 bash -c '. scripts/lib.sh; registry_manifest it/repo latest OUT'"
+touch "$fake/manifest-stall"
+m_started=$SECONDS
+m_res="$(REG_MANIFEST_MAX_TIME=2 REG_TOKEN='' reg stalled 'Bearer QQ==\t200\tmanifest.json\n')"
+m_took=$((SECONDS - m_started))
+rm -f "$fake/manifest-stall"
+check "registry_manifest: a manifest server that stalls is given up within REG_MANIFEST_MAX_TIME and 5 s, with no answer" \
+  "1 1 0, within 15 s" "$m_res, $([ "$m_took" -lt 15 ] && echo 'within 15 s' || echo "after $m_took s")" \
+  "REG_MANIFEST_MAX_TIME=2 bash -c '. scripts/lib.sh; registry_manifest it/repo latest OUT' against a manifest server that does not answer"
+rc=0
+rm -f "$fake/manifest-args"
+REG_MANIFEST_MAX_TIME=soon FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY=ghcr.io MIRROR_REGISTRY_AUTH=token \
+  MIRROR_REGISTRY_SCHEME=https REGISTRY_TOKEN='' in_lib registry_manifest it/repo latest "$fake/out.json" > /dev/null 2>&1 || rc=$?
+check "registry_manifest: a REG_MANIFEST_MAX_TIME that is not a number of seconds is refused, with no request" "refused" \
+  "$([ "$rc" -ne 0 ] && [ ! -e "$fake/manifest-args" ] && echo refused || echo "accepted (status $rc)")" \
+  "REG_MANIFEST_MAX_TIME=soon bash -c '. scripts/lib.sh; registry_manifest it/repo latest OUT'"
+
 # Blobs: the same on GHCR with no credential; with REGISTRY_TOKEN, the real
 # token at once; a blob whose bytes are not its digest is refused.
 check "registry blob, anonymous: the dummy token's 200 is the answer" "0 1 0" \
@@ -818,6 +856,61 @@ check "registry blob: bytes that are not the digest are refused, and not left be
   "lib.sh registry_blob; cat $fake/err"
 check "registry blob: a 404 is refused" "1" \
   "$(REG_READ=blob REG_TOKEN='' reg blob404 'Bearer QQ==\t404\tunknown.json\n' | cut -d ' ' -f 1)" "lib.sh registry_blob; cat $fake/err"
+
+#---------------------------------------------------------------------------#
+# registry_blob_probe: a package blob from a registry repository, one source
+# of mirror-file. 0 read and checked, 4 not there (quiet), 5 limited, 1
+# anything else.
+#---------------------------------------------------------------------------#
+printf '{"errors":[{"code":"BLOB_UNKNOWN"}]}' > "$fake/blob-unknown.json"
+printf '{"errors":[{"code":"NAME_UNKNOWN"}]}' > "$fake/name-unknown.json"
+printf '{"errors":[{"code":"TOOMANYREQUESTS"}]}' > "$fake/toomany.json"
+BLOB_SIZE="$(wc -c < "$fake/blob.bin" | tr -d ' ')"
+# probe NAME ANSWERS [CSIZE] -> "STATUS LINES OUT", LINES the lines of
+# stderr, OUT whether the output file is there; REG_TOKEN as in reg
+probe() {
+  local rc=0
+  printf '%b' "$2" > "$fake/answers.tsv"
+  : > "$fake/calls.log"
+  : > "$fake/curl-args"
+  rm -f "$fake/probe.out"
+  FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY=ghcr.io MIRROR_REGISTRY_AUTH=token MIRROR_REGISTRY_SCHEME=https \
+    REGISTRY_TOKEN="${REG_TOKEN-secret}" \
+    bash -c '. "$1"; registry_blob_probe it/sib "$2" "$3" 30 "$4" || exit $?' _ "$LIB" "$BLOB" "$fake/probe.out" "${3:-$BLOB_SIZE}" \
+    > /dev/null 2> "$fake/err" || rc=$?
+  printf '%s %s %s\n' "$rc" "$(awk 'END { print NR + 0 }' "$fake/err")" "$([ -e "$fake/probe.out" ] && echo kept || echo none)"
+}
+PB="bash -c '. scripts/lib.sh; registry_blob_probe it/sib DIGEST OUT 30 CSIZE' against a curl stand-in; cat $fake/err"
+check "registry_blob_probe: the blob of the right size and digest is 0, quietly" "0 0 kept" \
+  "$(REG_TOKEN='' probe ok 'Bearer QQ==\t200\tblob.bin\n')" "$PB"
+check "registry_blob_probe, with a token: the real token reads it" "0 0 kept" \
+  "$(probe auth 'Bearer tok1\t200\tblob.bin\n')" "$PB"
+check "registry_blob_probe: 404 BLOB_UNKNOWN is 4, with no line" "4 0 none" \
+  "$(REG_TOKEN='' probe blobunknown 'Bearer QQ==\t404\tblob-unknown.json\n')" "$PB"
+check "registry_blob_probe: 404 NAME_UNKNOWN is 4, with no line" "4 0 none" \
+  "$(probe nameunknown 'Bearer tok1\t404\tname-unknown.json\n')" "$PB"
+check "registry_blob_probe: a 404 with another code is 1" "1 1 none" \
+  "$(REG_TOKEN='' probe otherunknown 'Bearer QQ==\t404\tunknown.json\n')" "$PB"
+check "registry_blob_probe: 429 is 5" "5 1 none" \
+  "$(probe limited 'Bearer tok1\t429\ttoomany.json\n')" "$PB"
+check "registry_blob_probe: 503 is 1" "1 1 none" \
+  "$(probe busy 'Bearer tok1\t503\tbusy.txt\n')" "$PB"
+check "registry_blob_probe: bytes of another size are refused, and not left behind" "1 1 none" \
+  "$(probe size 'Bearer tok1\t200\tother.bin\n')" "$PB"
+check "registry_blob_probe: bytes of the right size and another digest are refused" "1 1 none" \
+  "$(probe digest 'Bearer tok1\t200\tother.bin\n' "$(wc -c < "$fake/other.bin" | tr -d ' ')")" "$PB"
+check "registry_blob_probe: the right bytes with another CSIZE are refused" "1 1 none" \
+  "$(probe csize 'Bearer tok1\t200\tblob.bin\n' 7)" "$PB"
+check "registry_blob_probe: the request stops at CSIZE bytes (--max-filesize)" "--max-filesize $BLOB_SIZE" \
+  "$(REG_TOKEN='' probe args 'Bearer QQ==\t200\tblob.bin\n' > /dev/null; grep -o -- "--max-filesize $BLOB_SIZE" "$fake/curl-args" | sed -n 1p)" \
+  "$PB; cat $fake/curl-args"
+printf '403\n' > "$fake/token-code"
+check "registry_blob_probe, anonymous: GHCR refuses QQ== and gives no token for the repository (403): 4" "4" \
+  "$(REG_TOKEN='' probe denied 'Bearer QQ==\t401\tdenied.json\n' | cut -d ' ' -f 1)" "$PB"
+printf '429\n' > "$fake/token-code"
+check "registry_blob_probe: a token endpoint that answers 429 is 5" "5" \
+  "$(probe tokenlimited 'Bearer tok1\t200\tblob.bin\n' | cut -d ' ' -f 1)" "$PB"
+rm -f "$fake/token-code"
 
 #---------------------------------------------------------------------------#
 # A 429, in the registry's words and in oras's own
@@ -1058,5 +1151,150 @@ for want in 0 4 1; do
     "$want $([ "$want" = 0 ] && echo kept || echo removed)" "$rc $wrote" \
     "STUB_RC=$want bash -c '. scripts/lib.sh; MIRROR_FETCHER=$stub fetch_upstream https://example.invalid/x.db OUT'"
 done
+
+#---------------------------------------------------------------------------#
+# The tags of a ref: staging and index on main, staging-<slug> and
+# index-<slug> on another branch, as sync-target.yml's slug makes them
+#---------------------------------------------------------------------------#
+# ref_tags REF NAME [STAGING_TAG [INDEX_TAG]] -> "STAGING INDEX", or
+# "refused". REF - leaves GITHUB_REF and GITHUB_REF_NAME unset.
+ref_tags() {
+  local out rc=0 e=(env -u GITHUB_REF -u GITHUB_REF_NAME -u STAGING_TAG -u INDEX_TAG)
+  if [ "$1" != - ]; then
+    e+=("GITHUB_REF=$1" "GITHUB_REF_NAME=$2")
+  fi
+  if [ -n "${3:-}" ]; then
+    e+=("STAGING_TAG=$3")
+  fi
+  if [ -n "${4:-}" ]; then
+    e+=("INDEX_TAG=$4")
+  fi
+  # shellcheck disable=SC2016 # the positional parameters of the inner script
+  out="$("${e[@]}" bash -c '. "$1"; s="$(staging_tag)" && i="$(index_tag)" && printf "%s %s\n" "$s" "$i"' _ "$LIB" 2> /dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    out=refused
+  fi
+  printf '%s\n' "$out"
+}
+TAGS="bash -c '. scripts/lib.sh; staging_tag; index_tag' with GITHUB_REF and GITHUB_REF_NAME"
+a39="$(printf '%*s' 39 '' | tr ' ' a)"
+b20="$(printf '%*s' 20 '' | tr ' ' b)"
+check "tags: no GITHUB_REF gives staging and index" "staging index" "$(ref_tags - -)" "$TAGS unset"
+check "tags: main gives staging and index" "staging index" "$(ref_tags refs/heads/main main)" "$TAGS refs/heads/main"
+check "tags: Feature/X_y gives staging-feature-x-y and index-feature-x-y" "staging-feature-x-y index-feature-x-y" \
+  "$(ref_tags refs/heads/Feature/X_y Feature/X_y)" "$TAGS refs/heads/Feature/X_y"
+check "tags: a 60-character name stops at 40 characters, with no - at the end" "staging-$a39 index-$a39" \
+  "$(ref_tags "refs/heads/$a39/$b20" "$a39/$b20")" "$TAGS refs/heads/<39 a>/<20 b>"
+check "tags: a name of no letter or digit gives staging-branch" "staging-branch index-branch" \
+  "$(ref_tags 'refs/heads////' '///')" "$TAGS refs/heads////"
+check "tags: STAGING_TAG names the index tag beside it" "staging-x index-x" \
+  "$(ref_tags refs/heads/main main staging-x)" "STAGING_TAG=staging-x $TAGS"
+check "tags: INDEX_TAG is used as given" "staging index-y" \
+  "$(ref_tags refs/heads/main main '' index-y)" "INDEX_TAG=index-y $TAGS"
+check "tags: an INDEX_TAG that is not index-<slug> is refused" refused \
+  "$(ref_tags refs/heads/main main '' index_y)" "INDEX_TAG=index_y $TAGS"
+check "tags: a STAGING_TAG that is not staging-<slug> is refused" refused \
+  "$(ref_tags refs/heads/main main Staging)" "STAGING_TAG=Staging $TAGS"
+
+#---------------------------------------------------------------------------#
+# The verify context: one sha256 of what a verdict of verify depends on
+#---------------------------------------------------------------------------#
+vc="$work/vctx"
+mkdir -p "$vc/root/scripts" "$vc/root/client"
+cp "$REPO_ROOT/scripts/verify-batch" "$REPO_ROOT/scripts/lib.sh" "$vc/root/scripts/"
+cp "$REPO_ROOT/client/pacman-oci" "$vc/root/client/"
+# vconf [LINE...]: the target file, with a comment, and LINE added
+vconf() {
+  {
+    printf '# a target\n'
+    printf '%s\n' 'arch = x86_64' 'repo = core' "db_server = https://example.invalid/core/os/x86_64" 'keyring = k-keyring' "$@"
+  } > "$vc/x86_64-core.conf"
+}
+KSHA=1111111111111111111111111111111111111111111111111111111111111111
+# vrecs KEYRING_SHA KEYRING_SIG KEYRING_BUILDDATE OTHER_SHA: the records file,
+# a keyring package and another package
+vrecs() {
+  {
+    printf 'k-keyring-1-1-any.pkg.tar.zst\tk-keyring\t1-1\tany\t%s\t10\t%s\t%s\n' "$1" "$3" "$2"
+    printf 'other-1-1-any.pkg.tar.zst\tother\t1-1\tany\t%s\t10\t1700000000\t\n' "$4"
+  } > "$vc/records.tsv"
+}
+vconf
+vrecs "$KSHA" c2ln 1700000000 "$SHA"
+# ctx CONF RECORDS -> the verify context, with REPO_ROOT the copy in $vc/root
+ctx() {
+  # shellcheck disable=SC2016 # the positional parameters of the inner script
+  REPO_ROOT="$vc/root" bash -c '. "$1"; verify_context "$2" "$3"' _ "$LIB" "$1" "$2"
+}
+VC="REPO_ROOT=COPY bash -c '. scripts/lib.sh; verify_context CONF RECORDS'"
+base="$(ctx "$vc/x86_64-core.conf" "$vc/records.tsv")"
+check "verify context: a sha256" 64 "$(printf '%s' "$base" | tr -cd '0-9a-f' | awk '{ print length($0) }')" "$VC"
+check "verify context: the same inputs give the same value" "$base" "$(ctx "$vc/x86_64-core.conf" "$vc/records.tsv")" "$VC, twice"
+# differs LABEL: a check that the context now differs from $base
+differs() {
+  local now
+  now="$(ctx "$vc/x86_64-core.conf" "$vc/records.tsv")"
+  if [ -n "$now" ] && [ "$now" != "$base" ]; then
+    ok "verify context: $1 changes it"
+  else
+    fail "verify context: $1 changes it" "before: $base" "after:  $now" "$VC"
+  fi
+}
+for f in scripts/verify-batch client/pacman-oci scripts/lib.sh; do
+  cp "$vc/root/$f" "$vc/saved"
+  printf '#' >> "$vc/root/$f"
+  differs "one byte more in $f"
+  cp "$vc/saved" "$vc/root/$f"
+done
+vrecs 2222222222222222222222222222222222222222222222222222222222222222 c2ln 1700000000 "$SHA"
+differs "another sha256 of a keyring record"
+vrecs "$KSHA" c2lnbg== 1700000000 "$SHA"
+differs "another %PGPSIG% of a keyring record"
+vrecs "$KSHA" c2ln 1700000000 "$KSHA"
+check "verify context: another sha256 of a record that is not a keyring package does not change it" "$base" \
+  "$(ctx "$vc/x86_64-core.conf" "$vc/records.tsv")" "$VC"
+vrecs "$KSHA" c2ln 1700000001 "$SHA"
+check "verify context: another build date of a keyring record does not change it" "$base" \
+  "$(ctx "$vc/x86_64-core.conf" "$vc/records.tsv")" "$VC"
+vrecs "$KSHA" c2ln 1700000000 "$SHA"
+vconf '' '# another comment, after a blank line'
+check "verify context: an edit of the comments and blank lines of the target file does not change it" "$base" \
+  "$(ctx "$vc/x86_64-core.conf" "$vc/records.tsv")" "$VC"
+vconf 'db_signed = yes'
+differs "a key of the target file"
+vconf
+printf 'none\n' > "$vc/none.tsv"
+: > "$vc/empty.tsv"
+check "verify context: no latest of keyring_from (none) is not the same as no keyring record" "differ" \
+  "$([ "$(ctx "$vc/x86_64-core.conf" "$vc/none.tsv")" != "$(ctx "$vc/x86_64-core.conf" "$vc/empty.tsv")" ] && echo differ || echo same)" "$VC"
+rc=0
+ctx "$vc/x86_64-core.conf" "$vc/no-such-file" > /dev/null 2>&1 || rc=$?
+check "verify context: a records file that does not read gives no context" 1 "$rc" "$VC with RECORDS missing"
+
+#---------------------------------------------------------------------------#
+# results_of_plan: the result lines of one plan's shards, and no other's
+#---------------------------------------------------------------------------#
+rp="$work/rop"
+mkdir -p "$rp/res/results-x-0/0" "$rp/res/results-x-1/1/lines" "$rp/res/results-x-2/2"
+printf 'p2\n' > "$rp/res/results-x-0/0/plan-id"
+printf 't\ta.pkg.tar.zst\tpushed\t1\tok\n' > "$rp/res/results-x-0/0/results.tsv"
+printf 'p2\n' > "$rp/res/results-x-1/1/plan-id"
+printf 't\tb.pkg.tar.zst\tpushed\t1\tok\n' > "$rp/res/results-x-1/1/lines/1.tsv"
+printf 't\tc.pkg.tar.zst\tfailed\t1\tno\n' > "$rp/res/results-x-1/1/lines/2.tsv"
+printf 'p1\n' > "$rp/res/results-x-2/2/plan-id"
+printf 't\td.pkg.tar.zst\tfailed\t1\tstale\n' > "$rp/res/results-x-2/2/results.tsv"
+rc=0
+in_lib results_of_plan "$rp/res" p2 "$rp/out.tsv" 2> "$rp/err" || rc=$?
+check "results_of_plan: the results.tsv and the lines of this plan, and nothing of another plan" "0 a.pkg.tar.zst b.pkg.tar.zst c.pkg.tar.zst" \
+  "$rc $(cut -f 2 "$rp/out.tsv" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')" "bash -c '. scripts/lib.sh; results_of_plan RESULTS p2 OUT'; cat $rp/err"
+if grep -q "results-x-2/2 holds the results of plan 'p1', not of this plan 'p2'; they are not read" "$rp/err"; then
+  ok "results_of_plan: the directory of another plan is named in a warning"
+else
+  fail "results_of_plan: the directory of another plan is named in a warning" "$(cat "$rp/err")" "bash -c '. scripts/lib.sh; results_of_plan RESULTS p2 OUT'"
+fi
+rc=0
+in_lib results_of_plan "$rp/none" p2 "$rp/none.tsv" 2> "$rp/err" || rc=$?
+check "results_of_plan: no results directory gives no line" "0 0" "$rc $(awk 'END { print NR + 0 }' "$rp/none.tsv")" \
+  "bash -c '. scripts/lib.sh; results_of_plan MISSING p2 OUT'"
 
 summary

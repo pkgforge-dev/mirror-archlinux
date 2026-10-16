@@ -19,7 +19,9 @@
 # short option group too), --location/-L for one 3xx hop. Options that take a
 # value are skipped
 # with their value; any other option is skipped alone. -K and --config are
-# refused, so a caller that needs them fails loudly here.
+# refused, so a caller that needs them fails loudly here. With --location,
+# --dump-header gets the 3xx answer and then the answer it leads to, each
+# after its own status line, as curl writes them.
 #
 # FAKE_CURL_LOG, when set, gets one line per request: the URL.
 #
@@ -120,12 +122,28 @@ answer() {
   return 0
 }
 
+# dump_block: append the answer read last to the --dump-header file
+dump_block() {
+  {
+    printf 'HTTP/2 %s\r\n' "$code"
+    if [ -n "$location" ]; then printf 'location: %s\r\n' "$location"; fi
+    if [ -n "$headers" ]; then sed 's/$/\r/' "$headers"; fi
+    printf '\r\n'
+  } >> "$hdrfile"
+}
+
+dumped=0
 rc=0
 answer "$url" || rc=$?
 [ "$rc" -eq 0 ] || exit "$rc"
 case "$code" in
   3??)
     if [ "$follow" -eq 1 ] && [ -n "$location" ]; then
+      if [ -n "$hdrfile" ]; then
+        : > "$hdrfile"
+        dump_block
+        dumped=1
+      fi
       url="$location"
       rc=0
       answer "$url" || rc=$?
@@ -153,12 +171,10 @@ if [ "$code" = 000 ]; then
   exit 7
 fi
 if [ -n "$hdrfile" ]; then
-  {
-    printf 'HTTP/2 %s\r\n' "$code"
-    if [ -n "$location" ]; then printf 'location: %s\r\n' "$location"; fi
-    if [ -n "$headers" ]; then sed 's/$/\r/' "$headers"; fi
-    printf '\r\n'
-  } > "$hdrfile"
+  if [ "$dumped" -eq 0 ]; then
+    : > "$hdrfile"
+  fi
+  dump_block
 fi
 if [ "$fail" -eq 1 ] && [ "$code" -ge 400 ]; then
   echo "curl: (22) The requested URL returned error: $code" >&2

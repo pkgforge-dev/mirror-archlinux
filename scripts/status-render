@@ -1848,7 +1848,7 @@ def page(ctx, charts, badges):
 <p>Each probe is one GET with no redirect followed. A repository with a snapshot must answer 302 to an https URL, and that signed URL must answer a request for one byte from the status runner, with no credential. A redirect host outside <code>*.githubusercontent.com</code> whose signed URL works is shown, and passes. A repository with no snapshot must answer 404. Once per run, the smallest database is downloaded through the Worker, and it must be the database its snapshot names. %(down)s</p>
 <div class="scroll">%(probes)s</div>
 <h2>Badges</h2>
-<p>The status workflow writes each badge when it measures: each hour, and after each sync. An age in a badge counts to that measurement, not to now. The synced badge is green under %(good)d h, yellow under %(late)d h, and red after. A badge is an image and runs no script, so it shows its time in UTC or as an age.</p>
+<p>The status workflow writes each badge when it measures: each hour, after a scheduled sync, and after a sync that promoted a target. An age in a badge counts to that measurement, not to now. The synced badge is green under %(good)d h, yellow under %(late)d h, and red after. A badge is an image and runs no script, so it shows its time in UTC or as an age.</p>
 <div class="scroll">%(badges)s</div>
 <footer>
 <p>Coverage counts an upstream file when the mirror's database names the same file name with the same sha256. Age is the time since the snapshot was fetched from upstream. Synced is the time since the latest snapshot was made: its manifest's created time, else its fetched time. Lag is the newest upstream build date minus the newest build date in the mirror. A snapshot that matches upstream is current at any age.</p>

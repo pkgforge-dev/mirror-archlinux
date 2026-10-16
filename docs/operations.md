@@ -6,9 +6,10 @@ This document tells what runs by itself, which issues the automation raises and 
 
 | workflow | triggers | does |
 | --- | --- | --- |
-| `sync.yml` | cron `17 */3 * * *`, dispatch | plan, one chain per pending target (`sync-target.yml`), report, keepalive |
-| `sync-target.yml` | called by `sync.yml` | mirror, stage, verify, promote (on `main`), summary, for one target |
-| `status.yml` | cron `47 * * * *`, dispatch, and `report` after each sync on `main` | measures the mirror and the Worker, renders the site, pushes branch `status`, deploys Pages, raises or clears `worker-down` |
+| `sync.yml` | cron `17 */3 * * *`, dispatch, and `upstream-watch.yml` for the targets that changed | plan, one chain per pending target (`sync-target.yml`), report, keepalive |
+| `sync-target.yml` | called by `sync.yml` | mirror, stage, verify, promote (on `main`), summary and the index ([below](#the-index-of-a-ref)), for one target |
+| `status.yml` | cron `47 * * * *`, dispatch, and `report` on `main` after a scheduled sync or a sync that promoted a target | measures the mirror and the Worker, renders the site, pushes branch `status`, deploys Pages, raises or clears `worker-down` |
+| `upstream-watch.yml` | cron `*/15 * * * *`, dispatch | `scripts/upstream-watch`: a sync of each target whose upstream database changed (below) |
 | `watchdog.yml` | cron `41 7 * * *`, dispatch | staleness and schedules |
 | `ci.yml` | push to `main`, pull request (not to `status`), dispatch | the test suites |
 | `worker.yml` | push to `main` that changes `worker/**` or the workflow, dispatch | tests the Worker; the maintainer deploys it by hand (`docs/worker.md`) |
@@ -50,6 +51,7 @@ The Worker check is a job of `status.yml`, not of `watchdog.yml`. An hourly cron
 | `sync.yml` | `sync`, for every ref | `max` | up to 100 runs wait, each in its turn; a dispatch with `allow_older` is never replaced by the next scheduled run |
 | `ci.yml` | `ci-pr-<number>` for a pull request, else `ci-<run id>` | default | a newer push to a pull request cancels its run in progress; every other run has a group of its own, so each push to `main` gets a verdict |
 | `status.yml` | `status` | default | one run waits; a newer one replaces it, and each run measures everything again |
+| `upstream-watch.yml` | `upstream-watch` | default | one tick waits; a newer one replaces it, and each tick reads every URL again |
 | `watchdog.yml` | `watchdog` | default | one run waits |
 | `worker.yml` | `worker-<ref>` | default | one run waits |
 
@@ -69,9 +71,11 @@ GitHub refuses `queue: max` with `cancel-in-progress: true`. actionlint 1.7.12 d
 
 A run that is queued or in progress counts as fresh, so nothing starts twice. A workflow with no run at all is started. Runs start on `main` only.
 
+⛔ For `sync.yml`, only a run of every target counts for the age: a scheduled run, or a run titled `Sync all targets`. `upstream-watch.yml` starts runs of some targets only, and such a run must not hold back the full sync. A run of any kind that has not ended still counts as fresh. `dispatch-overdue` reads the newest 100 runs on `main`.
+
 `dispatch-overdue` starts only a workflow whose state is `active`. GitHub refuses to start a disabled workflow. The script skips a workflow that a person disabled, or that GitHub disabled for inactivity. It prints a notice and exits 0. In `sync.yml` and `watchdog.yml`, `keep-schedules-enabled` runs first, and enables again a workflow that GitHub disabled for inactivity.
 
-The job `report` of `sync.yml` starts `status.yml` after each sync on `main`, whether or not it is overdue. It follows the same rule: when `status.yml` is not `active`, it prints a notice and the sync stays green. When the state does not read, the step fails. `tests/static/50-workflow-policy.sh` runs each workflow step that calls `gh workflow run` against a stub `gh`, with the workflow active, disabled and unreadable.
+The job `report` of `sync.yml` starts `status.yml` on `main` after a scheduled sync, and after a sync that promoted a target, whether or not `status.yml` is overdue. `scripts/report` gives the count of promoted targets to `GITHUB_OUTPUT` (`promoted=N`), also in a run that it makes red. A sync from `upstream-watch.yml` that promotes nothing does not start `status.yml`: its hourly cron measures the mirror. The step follows the same rule as `dispatch-overdue`: when `status.yml` is not `active`, it prints a notice and the sync stays green. When the state does not read, the step fails. `tests/static/50-workflow-policy.sh` runs each workflow step that calls `gh workflow run` against a stub `gh`, with the workflow active, disabled and unreadable.
 
 The restart steps in `sync.yml` and `watchdog.yml` run with `always()`. So a schedule check that fails earlier in the job does not stop the restart. A step with two `dispatch-overdue` calls runs both, then exits with the status of the last call that failed.
 
@@ -82,6 +86,59 @@ The restart steps in `sync.yml` and `watchdog.yml` run with `always()`. So a sch
 ⛔ A schedule that stops leaves no run behind to fail, and a red step reaches only the person who reads the run. So both jobs run `scripts/watch-schedules`. It runs `keep-schedules-enabled`, then `check-schedules-fired`, each to the end, and prints what each said. It raises `schedules-stopped` when a schedule has stopped, or when a person disabled a workflow. The body holds the line of each workflow and how to reproduce it. A schedule that stopped still makes the step red (exit 3). A workflow disabled by hand raises the issue and keeps the step green.
 
 ⚠ Neither check sees every schedule stop at once. Then no run is left to notice. Start `sync.yml` or `watchdog.yml` by hand to get the answer.
+
+## The upstream watch
+
+`upstream-watch.yml` runs `scripts/upstream-watch` every 15 minutes. It starts a sync of a target soon after the target's upstream database changes. ⭐ The 3-hour cron of `sync.yml` stays the backstop: it syncs every target, also when the watch stops or cannot read a host.
+
+1. Each tick sends one HEAD request to each `<db_server>/<repo>.db` of each enabled target: 36 URLs for 15 targets. A powerpc target is not watched: its upstream needs a browser-profile client (below, The fetchers), and the watch uses `curl`.
+2. The tick compares `ETag`, `Last-Modified` and `Content-Length` of the last answer, after the redirects, with the values that the last tick kept.
+3. A target changed when one of its URLs answers other values. A URL with no answer changes nothing. A URL seen for the first time changes nothing.
+4. The changed targets get one `sync.yml` run on `main` (`scripts/dispatch-sync`). The `targets` input of the run names them, and so does its title, for example `Sync x86_64-extra`.
+5. The watch starts a sync of one target at most once in `SYNC_MIN_INTERVAL` minutes (60).
+
+`scripts/dispatch-sync` starts nothing when `sync.yml` is not `active`, or when a run of `sync.yml` waits (`queued`, `waiting`, `requested` or `pending`) and covers every changed target. That run plans after the change. A run covers the targets when its title is `Sync all targets`, or when its title names each target as a word. A run that waits for other targets does not stop a start: the new run waits behind it, and `queue: max` keeps both. A run in progress does not stop a start, because it may have planned before the change.
+
+⛔ A change that starts no sync is not lost. Its URL keeps the old values in the state, so the next tick sees the change again. This is true for a target that waits for `SYNC_MIN_INTERVAL`, a run that waits, a start that GitHub refuses, and a dry run.
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `SYNC_MIN_INTERVAL` | 60 | minutes from one sync that the watch starts for a target to the next |
+| `WATCH_BUDGET` | 300 | seconds for all HEAD requests of a tick; each request gets 30 s at most |
+| `WATCH_DRY_RUN` | 0 | 1: log the changed targets, and start nothing |
+
+The job has 10 minutes. The HEAD requests end within `WATCH_BUDGET`, and `dispatch-sync` runs under `timeout -k 10 120`. A URL that is not read in time has no answer. A host that `curl` cannot reach is not asked again in that tick. A target with no URL that answered is named in a warning.
+
+The state goes from one tick to the next in the Actions cache, under the key `upstream-watch-<run id>-<run attempt>`. Each tick restores the newest entry and saves a new one, also after a tick that fails. A tick that finds no entry starts no sync. It keeps the values it reads, and the next tick compares with them. ⚠ GitHub removes a cache entry that no run used for 7 days (documented). So after a stop of 7 days or more, the first tick starts no sync.
+
+Only a run on `main` starts a sync. A run on another ref, or a dispatch with `dry_run`, logs the targets it would start:
+
+```bash
+gh workflow run upstream-watch.yml --ref main -f dry_run=true
+```
+
+### How many syncs the watch starts
+
+The status history shows how often the upstream databases change ([measurements.md](measurements.md)). In 33 hours, the files or the bytes of an upstream database changed between two status runs 27 times for x86_64 extra and 25 times for riscv64 extra. They changed 19 times in all for the other 13 watched targets. That is about 52 changes a day.
+
+- The watch starts a sync of x86_64 extra about 20 times a day, and of riscv64 extra about 18 times. It starts a sync of most other targets a few times a day or less.
+- Targets that change in one tick share one run. So the watch starts at most one run per tick: 96 runs a day.
+- `SYNC_MIN_INTERVAL` limits the syncs of one target to 24 a day.
+- ⚠ The status count is a lower limit: two changes between two status runs count as one.
+- ⚠ A `db_server` with more than one host behind its name can answer with the values of another host on each tick. Each such answer is a change, and `SYNC_MIN_INTERVAL` limits what it can start.
+
+Each run that the watch starts plans only its targets. Its chains share the 20 jobs of the organisation with every other run.
+
+### Stop the watch
+
+Disable the workflow, and enable it again later:
+
+```bash
+gh workflow disable upstream-watch.yml
+gh workflow enable upstream-watch.yml
+```
+
+The 3-hour cron of `sync.yml` still syncs every target while the watch is disabled. ⚠ `keep-schedules-enabled` leaves a workflow that a person disabled as it is, and `watch-schedules` raises `schedules-stopped` for it. The issue stays open while the watch is disabled. It is not a failure: the step stays green.
 
 ## Staleness
 
@@ -151,7 +208,7 @@ A Worker probe fails in each of these cases. [worker.md](worker.md#monitoring) h
 - The signed URL of its 302 does not answer the status runner with 206 or 200 for one byte.
 - The smallest database, downloaded through the Worker once per run, is not the one `latest` names.
 
-Status runs are not an hour apart. The cron runs `status.yml` at minute 47 of each hour, and `sync.yml` starts it after each sync, so two runs can be minutes apart. So `scripts/status-collect` sets `worker.down` in `status.json` only when two conditions are true. The probes failed in 2 runs in a row. The first of these failures is 3000 s (50 minutes) or more before this run. The `worker` job raises `worker-down` on `worker.down`. A Worker or GHCR fault of a few minutes opens no issue.
+Status runs are not an hour apart. The cron runs `status.yml` at minute 47 of each hour. On `main`, `sync.yml` also starts it after a scheduled sync or a sync that promoted a target. Two runs can then be minutes apart. So `scripts/status-collect` sets `worker.down` in `status.json` only when two conditions are true. The probes failed in 2 runs in a row. The first of these failures is 3000 s (50 minutes) or more before this run. The `worker` job raises `worker-down` on `worker.down`. A Worker or GHCR fault of a few minutes opens no issue.
 
 ## What needs a person
 
@@ -182,9 +239,38 @@ A sync run can be run again from its page. The two choices do not do the same th
 
 ⚠ A new run reads upstream again and leaves nothing of an earlier run behind. Prefer `gh workflow run sync.yml --ref main` to "Re-run all jobs".
 
+A new run also reads the index that the runs before it wrote. So it mirrors only the files that no earlier run of the ref left on the registry ([design.md](design.md#the-index-of-a-ref)).
+
+⚠ "Re-run failed jobs" of an older run can come after a newer run wrote the index. Its mirror jobs then write no tag that the live index lists: each such file is `failed`, `the index lists it`. Its summary job keeps the newer index, with the warning `... is kept, and this run's rows are not pushed`. This is also true for a re-run of a reset (`ignore_index`), and for an index that a newer run only withdrew rows from.
+
 ### The plan's budget
 
-The plan job reads every target's databases from upstream, one target after another, in one job of 30 minutes. `scripts/plan` ends its upstream reads within `PLAN_BUDGET` seconds (1200). Each target gets what is left of the budget, divided by the targets not yet read. A target whose upstream does not answer in time is in error for that run, and its row in the run's table names `PLAN_BUDGET`. The next run reads it again. A target that stays in error raises `stale-<target>` after the tolerance.
+The plan job reads every target's databases from upstream, one target after another, in one job of 40 minutes. `scripts/plan` ends its upstream reads within `PLAN_BUDGET` seconds (1200). Each target gets what is left of the budget, divided by the targets not yet read. A target whose upstream does not answer in time is in error for that run, and its row in the run's table names `PLAN_BUDGET`. The next run reads it again. A target that stays in error raises `stale-<target>` after the tolerance.
+
+The registry reads of the plan share `REGISTRY_READ_BUDGET` seconds (240): the index of each target, the `latest` database of `keyring_from`, and the siblings. The budget stops each new read. Each request of a read ends within 60 s, or what is left of the budget, and 5 s more. An index read makes up to 9 requests, so the read in progress can run past the budget by up to about 9 minutes. A read that is not made costs work: the index is `unread`, and the target plans as with no index. This is safe: mirror-file then writes no repush, so no tag that a row of the index vouches for is written. Each such file is `failed`, `a signature repair waits for a run that read the index`. Its tag keeps the layer that its index row vouches for. A later run plans the file again when step 4 or 4b of `scripts/plan` finds its new signature, or when its record changes. That run withdraws the row and repairs the layer, as for a promoted file.
+
+### The index of a ref
+
+Each target has an index tag per ref: `index` for `main`, `index-<branch>` for another branch. `scripts/index-write` writes it at the end of each chain, also after a failure or a cancel. The next run mirrors only what no earlier run left, and verifies only what no earlier run verified under the same verify context. Nothing waits on a person.
+
+| warning | means | do |
+| --- | --- | --- |
+| `... did not read; this run plans as with no index, and writes none` | plan got no answer that decides for the index, or tar cannot read its `ref.db` on this host | nothing: the next run reads it again. When every run says it for the same target, start a reset: `gh workflow run sync.yml -f ignore_index=true` |
+| `... is not a valid index; it is not used, and this run writes a new one` | the tag holds something that is not an index of format 1 | nothing: the run replaces it |
+| `... is kept, and this run's rows are not pushed` | the live index is not the one plan read: a newer run wrote it | nothing: the next run plans from it |
+| `scripts/index-write ended N` (summary job) | the index of the target is not written this run | nothing: the next run plans from the index there now |
+| `could not withdraw N index row(s) before their tags are written` (the target's why, state error) | plan could not push the index without the rows of the files it plans | read the plan log; the next run tries again |
+| `a signature repair waits for a run that read the index` (a mirror result, `failed`) | plan did not read the index (`unread` or `ignored`), so no repush is written | nothing: the tag keeps the layer that its row vouches for. A later run plans the file again when step 4 or 4b finds its new signature, or when its record changes. That run withdraws the row and repairs the layer |
+| `INDEX_READ=0: the manifest of ... did not read` (plan), then `... is not written: the plan's read of the tag gave no answer` (summary job) | a reset could not read the manifest of the index tag, so the index it replaces is not known | run the reset again |
+
+Reset the index of every target of a ref with the dispatch input `ignore_index`. Nothing is deleted. plan does not read the rows of the index, so the run mirrors every file that is not promoted, and verifies every file that is new since the promoted database. plan reads the manifest of the index tag alone. index-write then replaces that index and no other: an index that a newer run wrote after it stays. When the manifest did not read, index-write writes nothing: run the reset again. ⚠ A reset repairs no signature layer: such a file is `failed`, and holds its target in that run. The new index has no row for it, so the next run plans it again and repairs it. A promoted file waits until step 4 or 4b of `scripts/plan` plans it again.
+
+```bash
+gh workflow run sync.yml --ref main -f ignore_index=true
+gh workflow run sync.yml --ref main -f ignore_index=true -f targets='x86_64-extra'
+```
+
+⛔ The workflows delete no tag. A person who deletes a package tag by hand must then run one sync with `ignore_index`. Until then the index still vouches for the tag, and plan does not mirror the file again. ⚠ This does not bring back the tag of a promoted file: plan skips a file that `latest` names with the same record, index or not. A deleted index tag needs nothing: plan finds none, and the run writes the first one.
 
 ### An upstream that blocks
 
@@ -425,7 +511,7 @@ In `status.json`, `summary.measured` counts the targets read on both sides, and 
 
 The time is `summary.last_synced` in `status.json`. It is the newest `org.opencontainers.image.created` of the `latest` manifests, which `scripts/status-collect` records per target as `mirror.created`. oras sets that annotation when `stage` pushes a snapshot. A manifest with no such annotation counts with its `dev.pkgforge.mirror.fetched` time. The table of repositories shows the same age per target, in the column `synced`.
 
-⚠ The age counts to the status run that wrote the badge, not to the moment a reader looks. A status run comes each hour and after each sync. A README shows a badge through GitHub's image proxy, which can serve an older copy.
+⚠ The age counts to the status run that wrote the badge, not to the moment a reader looks. A status run comes each hour, after a scheduled sync, and after a sync that promoted a target. After a sync that promoted nothing, a badge can be up to an hour old. A README shows a badge through GitHub's image proxy, which can serve an older copy.
 
 ### Size per architecture and repository
 

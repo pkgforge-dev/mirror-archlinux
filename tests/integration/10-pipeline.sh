@@ -16,10 +16,11 @@
 # The trust root of every target is a keyring image of the suite's own,
 # pushed to the local registry (keyring_image). Then the real scripts run as
 # the workflows run them, each target in a chain of its own: plan,
-# mirror-shard, stage, verify-batch, promote, report. pacman in an Arch
-# container then installs from the mirror through the wrapper, with and
-# without DownloadUser, and the cases that must be refused are driven on
-# purpose.
+# mirror-shard, stage, verify-batch, promote, report, index-write. pacman in
+# an Arch container then installs from the mirror through the wrapper, with
+# and without DownloadUser, and the cases that must be refused are driven on
+# purpose. The runs are attempt 1 of a run on main: the tags are staging and
+# index, whatever ref CI runs on.
 #
 # Every port is chosen by the container runtime at run time and every
 # container name carries this shell's pid, so several runs share one host.
@@ -142,6 +143,14 @@ export CONTAINER_RUNTIME="$RUNTIME"
 export SHARD_FILES=2
 export PARALLEL=2
 export ORAS_CACHE="${IT_ORAS_CACHE:-$work/oras-cache}"
+# A run on main, attempt 1 (scripts/lib.sh staging_tag and index_tag,
+# scripts/mirror-shard). CI sets GITHUB_REF and GITHUB_RUN_ATTEMPT for its
+# own run, which would give other tags and, on a re-run of CI, the re-run
+# guard.
+export STAGING_TAG=staging
+export INDEX_TAG=index
+export GITHUB_RUN_ATTEMPT=1
+export MIRROR_REPAIR=1
 REPO="it/mirror/x86_64/test"
 BASE="http://127.0.0.1:$REG_PORT/v2/$REPO"
 UP="http://127.0.0.1:$UP_PORT"
@@ -190,10 +199,26 @@ conf x86_64 test 'keyring = test-keyring' 'keyring_from = x86_64-kr'
 conf x86_64 kr 'keyring = test-keyring'
 conf aarch64 port
 
+# index_write N TARGET: the last step of the chain, as the summary job runs
+# it, whatever the steps before it did. Its exit status goes to
+# out/N/index-TARGET.rc.
+index_write() {
+  local o="$work/out/$1" rc=0
+  "$REPO_ROOT/scripts/index-write" "$o/plan" "$o/results/$2" "$o/stage" "$o/verify" "$2" > "$o/index-$2.log" 2>&1 || rc=$?
+  printf '%s\n' "$rc" > "$o/index-$2.rc"
+  if [ "$rc" -ne 0 ]; then
+    diag "sync $1: index-write of $2 ended $rc"
+    while IFS= read -r l; do diag "$l"; done < <(tail -n 5 "$o/index-$2.log")
+  fi
+}
+
 # sync N [TARGET ...]: one run, as the workflows run it: plan for every
 # target, then each pending target's chain in the order given (default kr,
-# test, port), then the report; state in $work/out/N. AFTER_STAGE names a
-# function that runs with the target after each stage, before verify.
+# test, port), each one ending in index_write, then the report; state in
+# $work/out/N. AFTER_STAGE names a function that runs with the target after
+# each stage, before verify. BEFORE_VERIFY names a function that runs with
+# the target and the batch before each verify-batch, in this shell: what it
+# exports, verify-batch sees.
 sync() {
   local n="$1" o t s b rc
   shift
@@ -218,6 +243,7 @@ sync() {
     if ! "$REPO_ROOT/scripts/stage" "$o/plan" "$o/results/$t" "$o/stage" "$t" > "$o/stage-$t.log" 2>&1; then
       diag "sync $n: stage of $t failed"
       logs_of "$n"
+      index_write "$n" "$t"
       continue
     fi
     if [ -n "${AFTER_STAGE:-}" ]; then
@@ -225,6 +251,9 @@ sync() {
     fi
     for b in "$o/stage/$t"/batches/*.txt; do
       [ -e "$b" ] || continue
+      if [ -n "${BEFORE_VERIFY:-}" ]; then
+        "$BEFORE_VERIFY" "$t" "$(basename "$b" .txt)"
+      fi
       rc=0
       "$REPO_ROOT/scripts/verify-batch" "$o/stage" "$t" "$(basename "$b" .txt)" "$o/verify" \
         > "$o/verify-$t-$(basename "$b" .txt).log" 2>&1 || rc=$?
@@ -238,6 +267,7 @@ sync() {
     fi
     "$REPO_ROOT/scripts/report" collect "$t" "$o/stage" "$o/verify" "$o/promote-$t.tsv" "$o/summaries/$t" \
       > "$o/collect-$t.log" 2>&1
+    index_write "$n" "$t"
   done
   rc=0
   # report writes its table to GITHUB_STEP_SUMMARY when that is set, as it is
@@ -313,14 +343,52 @@ layer_of() {
   jq -r --arg t "$2" '.layers[] | select(.annotations["org.opencontainers.image.title"] == $t) | .digest' "$1"
 }
 
+# swap_sig REPOSITORY FILE OTHER: give the tag of FILE the signature layer of
+# the tag of OTHER, as a writer with push rights could
+swap_sig() {
+  local ftag otag rc=0
+  ftag="$("$REPO_ROOT/client/pacman-oci" --tag "$2")"
+  otag="$("$REPO_ROOT/client/pacman-oci" --tag "$3")"
+  {
+    manifest "$ftag" "$1" > "$work/swap-good.json" &&
+      manifest "$otag" "$1" > "$work/swap-other.json" &&
+      jq -c --arg t "$2.sig" --argjson l "$(jq -c --arg t "$3.sig" '.layers[] | select(.annotations["org.opencontainers.image.title"] == $t)' "$work/swap-other.json")" \
+        '.layers |= map(if .annotations["org.opencontainers.image.title"] == $t then (.digest = $l.digest | .size = $l.size) else . end)' \
+        "$work/swap-good.json" > "$work/swap-bad.json" &&
+      curl -q -fsS --connect-timeout 5 --max-time 20 -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' \
+        --data-binary "@$work/swap-bad.json" -o /dev/null "http://127.0.0.1:$REG_PORT/v2/$1/manifests/$ftag"
+  } || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "$2 is given the signature layer of $3, on the registry"
+  else
+    fail "$2 is given the signature layer of $3, on the registry" "status $rc" \
+      "both tags must be on the registry: curl http://127.0.0.1:$REG_PORT/v2/$1/manifests/$ftag"
+  fi
+}
+
+# index_rows REPOSITORY -> the rows of REPOSITORY:index, one line each as
+# "filename state verified unsigned", joined by "; "; "no index" when the
+# tag or its index.tsv does not read
+index_rows() {
+  local d
+  d="$(manifest index "$1" | jq -r '[.layers[] | select(.annotations["org.opencontainers.image.title"] == "index.tsv") | .digest] | first // empty')" || d=""
+  if [ -z "$d" ]; then
+    echo "no index"
+    return 0
+  fi
+  curl -q -fsS --location --connect-timeout 5 --max-time 20 "http://127.0.0.1:$REG_PORT/v2/$1/blobs/$d" |
+    awk -F '\t' '{ printf "%s%s %s %s %s", (NR > 1 ? "; " : ""), $1, $2, $3, $4 } END { print "" }'
+}
+
 # pgpsig_count [DIR]: how many %PGPSIG% the upstream database carries
 pgpsig_count() {
   tar -xOzf "$work/upstream/${1:-x86_64/test}/${2:-test}.db" | awk '$0 == "%PGPSIG%" { n++ } END { print n + 0 }'
 }
 
-# pgpsig_of FILE: the %PGPSIG% the upstream test database carries for FILE
+# pgpsig_of FILE [DIR]: the %PGPSIG% the upstream test database of DIR
+# (default x86_64/test) carries for FILE
 pgpsig_of() {
-  tar -xOzf "$work/upstream/x86_64/test/test.db" |
+  tar -xOzf "$work/upstream/${2:-x86_64/test}/test.db" |
     awk -v f="$1" 'k == "F" { cur = $0 } k == "P" && cur == f { print } { k = ($0 == "%FILENAME%") ? "F" : ($0 == "%PGPSIG%") ? "P" : "" }'
 }
 
@@ -406,6 +474,21 @@ day="$(sed -n 's/^FETCHED=\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)T.*/\1.\2.
 check "latest and the dated tag name the same snapshot" "$latest1" "$(digest_of "$day")" "curl -I $BASE/manifests/$day"
 db_hex="$(sha256sum "$work/upstream/x86_64/test/test.db" | cut -d ' ' -f 1)"
 check "the snapshot is also tagged by its database's content" "$latest1" "$(digest_of "db-$db_hex")" "curl -I $BASE/manifests/db-$db_hex"
+
+# The index of each target: what the run left on the registry, for the next
+# run (scripts/index-write)
+indexed=""
+for t in x86_64-test x86_64-kr aarch64-port; do
+  indexed="$indexed $(cat "$work/out/1/index-$t.rc" 2> /dev/null || echo none):$([ -n "$(digest_of index "it/mirror/${t%%-*}/${t#*-}")" ] && echo tag || echo 'no tag')"
+done
+check "first sync: index-write ends 0, and each target has its tag index" " 0:tag 0:tag 0:tag" "$indexed" "read out/1/index-*.log"
+check "the index of x86_64-test vouches for its 3 files, each verified" \
+  "alpha-1:1.0+r2-1-any.pkg.tar.zst m 1 0; beta_pc-2.0-1-x86_64.pkg.tar.zst m 1 0; gamma-3.0-1-any.pkg.tar.zst m 1 0" \
+  "$(index_rows "$REPO")" "read out/1/index-x86_64-test.log"
+check "the index is an artifact of its own type, of this plan, about the database it describes" \
+  "application/vnd.pkgforge.archlinux.index.v1 $(cat "$work/out/1/plan/plan-id") $db_hex 1" \
+  "$(manifest index | jq -r '[.artifactType, .annotations["dev.pkgforge.mirror.plan-id"], .annotations["dev.pkgforge.mirror.db-sha256"], .annotations["dev.pkgforge.mirror.index-format"]] | join(" ")')" \
+  "curl $BASE/manifests/index | jq '.artifactType, .annotations'"
 
 #---------------------------------------------------------------------------#
 # 1b. Package manifests are the same bytes whoever pushes them: a second
@@ -1238,6 +1321,187 @@ else
 fi
 
 #---------------------------------------------------------------------------#
+# 9h. A run that the mirror holds leaves its work in the index. A db_server
+#     that does not answer holds unsigned-1-1, as in 1e2. The next run, with
+#     that db_server gone, mirrors that one file, verifies all 3, and
+#     promotes. In a namespace of its own.
+#---------------------------------------------------------------------------#
+build port aarch64/port-heldm port
+mkdir -p "$work/targets-heldm" "$work/targets-heldm2"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/port-heldm|; s|/\$arch/\./\$repo$|/$arch/./port-heldm|' "$work/targets/aarch64-port.conf" > "$work/targets-heldm2/aarch64-port.conf"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+{ cat "$work/targets-heldm2/aarch64-port.conf"; printf 'db_server = %s/$arch/$repo\n' "$closed"; } > "$work/targets-heldm/aarch64-port.conf"
+heldm_repo=it/heldm/aarch64/port
+TARGETS_DIR="$work/targets-heldm" MIRROR_NAMESPACE=it/heldm sync heldm1 aarch64-port
+check "held by the mirror: the stage is held, and index-write ends 0" "held 0" \
+  "$(state_of heldm1 stage aarch64-port) $(cat "$work/out/heldm1/index-aarch64-port.rc" 2> /dev/null || echo none)" \
+  "read out/heldm1/stage-aarch64-port.log out/heldm1/index-aarch64-port.log"
+check "held by the mirror: the index names the 2 files the run pushed, not verified" \
+  "expired-1-1-any.pkg.tar.zst m 0 0; port-1-1-aarch64.pkg.tar.zst m 0 0" "$(index_rows "$heldm_repo")" \
+  "read out/heldm1/index-aarch64-port.log"
+TARGETS_DIR="$work/targets-heldm2" MIRROR_NAMESPACE=it/heldm sync heldm2 aarch64-port
+check "the next run mirrors only the file that held the target, verifies all 3, and promotes" \
+  "pending unsigned-1-1-any.pkg.tar.zst 3 staged passed promoted" \
+  "$(state_of heldm2 plan aarch64-port) $(cut -f 2 "$work/out/heldm2/plan/aarch64-port/todo.tsv" 2> /dev/null | tr '\n' ' ')$(awk 'END { print NR + 0 }' "$work/out/heldm2/plan/aarch64-port/new.tsv" 2> /dev/null) $(state_of heldm2 stage aarch64-port) $(verdict_of heldm2 aarch64-port | cut -f 1) $(cut -f 2 "$work/out/heldm2/promote-aarch64-port.tsv" 2> /dev/null)" \
+  "read out/heldm2/plan.log out/heldm2/stage-aarch64-port.log out/heldm2/verify/verify-aarch64-port-0.log out/heldm2/promote-aarch64-port.log"
+check "after the promote, the index vouches for each file as verified" \
+  "expired-1-1-any.pkg.tar.zst m 1 0; port-1-1-aarch64.pkg.tar.zst m 1 0; unsigned-1-1-any.pkg.tar.zst m 1 1" \
+  "$(index_rows "$heldm_repo")" "read out/heldm2/index-aarch64-port.log"
+
+#---------------------------------------------------------------------------#
+# 9i. A batch that fails with no file at fault: its own budget ends before
+#     its container starts. The other batches pass, and the index keeps
+#     their verify credit. The next run mirrors nothing, verifies the file of
+#     that batch and the canaries only, and promotes. In a namespace of its
+#     own, with x86_64-kr beside it for keyring_from.
+#---------------------------------------------------------------------------#
+build one x86_64/test-fb test
+mkdir -p "$work/targets-fb"
+cp "$work/targets/x86_64-kr.conf" "$work/targets-fb/"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/test-fb|; s|/\$arch/\./\$repo$|/$arch/./test-fb|' "$work/targets/x86_64-test.conf" > "$work/targets-fb/x86_64-test.conf"
+fb_repo=it/fb/x86_64/test
+# budget_out_batch_1 TARGET BATCH: batch 1 gets 30 s, less than verify-batch
+# gives a container; every other batch gets the default
+budget_out_batch_1() {
+  if [ "$2" = 1 ]; then
+    export VERIFY_BUDGET=30
+  else
+    unset VERIFY_BUDGET
+  fi
+}
+VERIFY_BATCH_FILES=1 BEFORE_VERIFY=budget_out_batch_1 TARGETS_DIR="$work/targets-fb" MIRROR_NAMESPACE=it/fb sync fb1 x86_64-test
+unset VERIFY_BUDGET
+fb_name="$(cat "$work/out/fb1/stage/x86_64-test/batches/1.txt" 2> /dev/null || echo none)"
+fb_file="$(awk -F '\t' -v n="$fb_name" '$2 == n { print $1 }' "$work/out/fb1/plan/x86_64-test/records.tsv")"
+check "a failed batch: of 3 batches, batch 1 fails for its budget with no file at fault, and nothing is promoted" \
+  "3 passed failed passed empty failed" \
+  "$(find "$work/out/fb1/stage/x86_64-test/batches" -name '*.txt' | awk 'END { print NR + 0 }') $(verdict_of fb1 x86_64-test 0 | cut -f 1) $(verdict_of fb1 x86_64-test 1 | cut -f 1) $(verdict_of fb1 x86_64-test 2 | cut -f 1) $([ -f "$work/out/fb1/verify/faults-x86_64-test-1.txt" ] && [ ! -s "$work/out/fb1/verify/faults-x86_64-test-1.txt" ] && echo empty || echo 'not an empty file') $(cut -f 2 "$work/out/fb1/promote-x86_64-test.tsv" 2> /dev/null)" \
+  "read out/fb1/stage-x86_64-test.log out/fb1/verify/verify-x86_64-test-1.log out/fb1/promote-x86_64-test.log"
+check "the index keeps the verify credit of the 2 batches that passed, and gives the failed one none" "2 $fb_file m 0 0" \
+  "$(index_rows "$fb_repo" | tr ';' '\n' | awk '$3 == "1" { n++ } $3 == "0" { z = $1 " " $2 " " $3 " " $4 } END { print n + 0, z }')" \
+  "read out/fb1/index-x86_64-test.log"
+TARGETS_DIR="$work/targets-fb" MIRROR_NAMESPACE=it/fb sync fb2 x86_64-test
+check "the next run mirrors nothing, verifies the file of the failed batch, and has no shard" "pending 0 $fb_file 0" \
+  "$(state_of fb2 plan) $(awk 'END { print NR + 0 }' "$work/out/fb2/plan/x86_64-test/todo.tsv" 2> /dev/null) $(cut -f 2 "$work/out/fb2/plan/x86_64-test/new.tsv" 2> /dev/null | tr '\n' ' ' | sed 's/ $//') $(jq -r '.include[] | select(.target == "x86_64-test") | .shards | length' "$work/out/fb2/plan/pending.json" 2> /dev/null)" \
+  "read out/fb2/plan.log; jq . out/fb2/plan/pending.json"
+check "it verifies that file and the canaries only, and promotes" \
+  "$({ printf '%s\n' "$fb_name"; cat "$work/out/fb2/stage/x86_64-test/canaries.txt" 2> /dev/null; } | LC_ALL=C sort -u | tr '\n' ' ')passed promoted" \
+  "$(cut -f 1 "$work/out/fb2/stage/x86_64-test/verify.tsv" 2> /dev/null | LC_ALL=C sort -u | tr '\n' ' ')$(verdict_of fb2 | cut -f 1) $(cut -f 2 "$work/out/fb2/promote-x86_64-test.tsv" 2> /dev/null)" \
+  "read out/fb2/stage-x86_64-test.log out/fb2/verify/verify-x86_64-test-0.log out/fb2/promote-x86_64-test.log"
+
+#---------------------------------------------------------------------------#
+# 9j. A tag that the index vouches for, changed on the registry: after the
+#     stage, alpha's tag gets beta_pc's signature layer. verify fails and
+#     names alpha as the file at fault, and index-write drops its row. The
+#     next run mirrors alpha again, with the package blob from its own
+#     repository: the signature layer is repaired, and the target is
+#     promoted. In a namespace of its own, with x86_64-kr beside it for
+#     keyring_from.
+#---------------------------------------------------------------------------#
+build one x86_64/test-tamper test
+mkdir -p "$work/targets-tamper"
+cp "$work/targets/x86_64-kr.conf" "$work/targets-tamper/"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/test-tamper|; s|/\$arch/\./\$repo$|/$arch/./test-tamper|' "$work/targets/x86_64-test.conf" > "$work/targets-tamper/x86_64-test.conf"
+tamper_repo=it/tamper/x86_64/test
+tamper_alpha_tag="$("$REPO_ROOT/client/pacman-oci" --tag "$alpha")"
+# tamper_alpha TARGET: swap_sig, for x86_64-test only
+tamper_alpha() {
+  [ "$1" = x86_64-test ] || return 0
+  swap_sig "$tamper_repo" "$alpha" 'beta_pc-2.0-1-x86_64.pkg.tar.zst'
+}
+TARGETS_DIR="$work/targets-tamper" MIRROR_NAMESPACE=it/tamper AFTER_STAGE=tamper_alpha sync tamper1 x86_64-test
+case "$(verdict_of tamper1):$(cat "$work/out/tamper1/verify/faults-x86_64-test-0.txt" 2> /dev/null)" in
+  failed*"$alpha: its .sig is sha256"*":$alpha") ok "a tampered signature layer fails verify, and alpha is the one file at fault" ;;
+  *) fail "a tampered signature layer fails verify, and alpha is the one file at fault" \
+    "verdict: $(verdict_of tamper1)" "files at fault: $(cat "$work/out/tamper1/verify/faults-x86_64-test-0.txt" 2> /dev/null || echo 'no file')" \
+    "read out/tamper1/verify/verify-x86_64-test-0.log" ;;
+esac
+check "index-write drops the row of the file at fault" \
+  "beta_pc-2.0-1-x86_64.pkg.tar.zst m 0 0; gamma-3.0-1-any.pkg.tar.zst m 0 0" "$(index_rows "$tamper_repo")" \
+  "read out/tamper1/index-x86_64-test.log"
+TARGETS_DIR="$work/targets-tamper" MIRROR_NAMESPACE=it/tamper sync tamper2 x86_64-test
+check "the next run mirrors alpha alone, with the package blob from its own repository" \
+  "$alpha pushed from 127.0.0.1:$REG_PORT/$tamper_repo," \
+  "$(cut -f 2 "$work/out/tamper2/plan/x86_64-test/todo.tsv" 2> /dev/null) $(cat "$work/out/tamper2/results/x86_64-test"/*/results.tsv 2> /dev/null | awk -F '\t' -v f="$alpha" '$2 == f { print $3, $5 }' | sed 's/ pushed in .*//')" \
+  "read out/tamper2/plan.log out/tamper2/mirror-x86_64-test-0.log"
+check "alpha's signature layer is its %PGPSIG% again, with the same package blob, and the target is promoted" \
+  "sha256:$(pgpsig_of "$alpha" x86_64/test-tamper | base64 -d | sha256sum | cut -d ' ' -f 1) $(layer_of "$work/swap-good.json" "$alpha") passed promoted" \
+  "$(manifest "$tamper_alpha_tag" "$tamper_repo" > "$work/tamper-alpha.json" && echo "$(layer_of "$work/tamper-alpha.json" "$alpha.sig") $(layer_of "$work/tamper-alpha.json" "$alpha")") $(verdict_of tamper2 | cut -f 1) $(cut -f 2 "$work/out/tamper2/promote-x86_64-test.tsv" 2> /dev/null)" \
+  "curl http://127.0.0.1:$REG_PORT/v2/$tamper_repo/manifests/$tamper_alpha_tag; read out/tamper2/verify/verify-x86_64-test-0.log"
+check "the index then vouches for each file as verified" \
+  "$alpha m 1 0; beta_pc-2.0-1-x86_64.pkg.tar.zst m 1 0; gamma-3.0-1-any.pkg.tar.zst m 1 0" "$(index_rows "$tamper_repo")" \
+  "read out/tamper2/index-x86_64-test.log"
+
+#---------------------------------------------------------------------------#
+# 9k. The chain of an older run, run again after a newer run wrote the
+#     index, as "Re-run failed jobs" can do days later. Run A plans alpha,
+#     signed again upstream, and withdraws its row. Upstream signs alpha
+#     once more, and run B mirrors it, promotes, and writes the index. A's
+#     shard, run again as attempt 2, writes no tag that the index lists: it
+#     would put back the signature B replaced. A's index-write keeps B's
+#     index. In a namespace of its own, with x86_64-kr beside it for
+#     keyring_from. ⚠ build resigned replaces alpha's kept signature (see
+#     tests/fixtures/build-repo), so no section after this one builds alpha.
+#---------------------------------------------------------------------------#
+build two x86_64/test-old test
+mkdir -p "$work/targets-old"
+cp "$work/targets/x86_64-kr.conf" "$work/targets-old/"
+# shellcheck disable=SC2016 # $arch and $repo are the target file's, not the shell's
+sed 's|/\$arch/\$repo$|/$arch/test-old|; s|/\$arch/\./\$repo$|/$arch/./test-old|' "$work/targets/x86_64-test.conf" > "$work/targets-old/x86_64-test.conf"
+old_repo=it/old/x86_64/test
+old_alpha_tag="$("$REPO_ROOT/client/pacman-oci" --tag "$alpha")"
+TARGETS_DIR="$work/targets-old" MIRROR_NAMESPACE=it/old sync old1 x86_64-kr x86_64-test
+check "an older run's chain: the first run promotes x86_64-test, and writes its index" "promoted 0" \
+  "$(cut -f 2 "$work/out/old1/promote-x86_64-test.tsv" 2> /dev/null) $(cat "$work/out/old1/index-x86_64-test.rc" 2> /dev/null || echo none)" \
+  "read out/old1/promote-x86_64-test.log out/old1/index-x86_64-test.log"
+build resigned x86_64/test-old test
+rc=0
+TARGETS_DIR="$work/targets-old" MIRROR_NAMESPACE=it/old "$REPO_ROOT/scripts/plan" "$work/out/oldA" "$work/targets-old/x86_64-test.conf" \
+  > "$work/out/oldA.log" 2>&1 || rc=$?
+check "run A plans alpha, signed again, and first withdraws its row from the index" "pending $alpha 1 0" \
+  "$(cat "$work/out/oldA/x86_64-test/state" 2> /dev/null || echo "no state, plan exit $rc") $(cut -f 2 "$work/out/oldA/x86_64-test/todo.tsv" 2> /dev/null) $(grep -c "1 row(s) withdrawn from $old_repo:index" "$work/out/oldA.log") $(index_rows "$old_repo" | tr ';' '\n' | awk -v f="$alpha" '$1 == f { n++ } END { print n + 0 }')" \
+  "read out/oldA.log"
+old_db_a="$(sha256sum "$work/upstream/x86_64/test-old/test.db.tar.gz" | cut -d ' ' -f 1)"
+build resigned x86_64/test-old test
+check "upstream signs alpha once more: its database changes" changed \
+  "$([ "$(sha256sum "$work/upstream/x86_64/test-old/test.db.tar.gz" | cut -d ' ' -f 1)" != "$old_db_a" ] && echo changed || echo 'the same')" \
+  "read $work/build-resigned.log"
+TARGETS_DIR="$work/targets-old" MIRROR_NAMESPACE=it/old sync oldB x86_64-test
+old_alpha_b="$(digest_of "$old_alpha_tag" "$old_repo")"
+old_index_b="$(digest_of index "$old_repo")"
+check "run B mirrors alpha with the newest signature, promotes, and writes the index" \
+  "promoted sha256:$(pgpsig_of "$alpha" x86_64/test-old | base64 -d | sha256sum | cut -d ' ' -f 1) 0 $alpha m 1 0" \
+  "$(cut -f 2 "$work/out/oldB/promote-x86_64-test.tsv" 2> /dev/null) $(manifest "$old_alpha_tag" "$old_repo" | jq -r --arg t "$alpha.sig" '[.layers[] | select(.annotations["org.opencontainers.image.title"] == $t) | .digest] | first // "none"') $(cat "$work/out/oldB/index-x86_64-test.rc" 2> /dev/null || echo none) $(index_rows "$old_repo" | tr ';' '\n' | awk -v f="$alpha" '$1 == f { print $1, $2, $3, $4 }')" \
+  "read out/oldB/plan.log out/oldB/promote-x86_64-test.log out/oldB/index-x86_64-test.log"
+rc=0
+for s in "$work/out/oldA/x86_64-test"/shards/*.tsv; do
+  i="$(basename "$s" .tsv)"
+  TARGETS_DIR="$work/targets-old" MIRROR_NAMESPACE=it/old GITHUB_RUN_ATTEMPT=2 SHARD_INDEX="$i" "$REPO_ROOT/scripts/mirror-shard" \
+    "$s" "$work/out/oldA-results/$i" > "$work/out/oldA-mirror-$i.log" 2>&1 || rc=$?
+done
+old_result="$(cat "$work/out/oldA-results"/*/results.tsv 2> /dev/null | awk -F '\t' -v f="$alpha" '$2 == f { print $3 "\t" $5 }')"
+case "$old_result" in
+  failed$'\t'"the index lists it; a newer run vouches for this tag"*) ok "run A's shard, run again as attempt 2, does not write the tag of a file the index lists" ;;
+  *) fail "run A's shard, run again as attempt 2, does not write the tag of a file the index lists" "result: $old_result" \
+    "status $rc; read out/oldA-mirror-*.log" ;;
+esac
+check "alpha's tag keeps the signature run B wrote" "$old_alpha_b" "$(digest_of "$old_alpha_tag" "$old_repo")" \
+  "curl -I http://127.0.0.1:$REG_PORT/v2/$old_repo/manifests/$old_alpha_tag"
+rc=0
+TARGETS_DIR="$work/targets-old" MIRROR_NAMESPACE=it/old "$REPO_ROOT/scripts/index-write" "$work/out/oldA" "$work/out/oldA-results" \
+  "$work/out/oldA-stage" "$work/out/oldA-verify" x86_64-test > "$work/out/oldA-index.log" 2>&1 || rc=$?
+check "run A's index-write ends 0, and keeps the index of run B" "0 $old_index_b" "$rc $(digest_of index "$old_repo")" \
+  "read out/oldA-index.log"
+if grep -qF "$old_repo:index is kept, and this run's rows are not pushed" "$work/out/oldA-index.log"; then
+  ok "run A's index-write says that it keeps the live index"
+else
+  fail "run A's index-write says that it keeps the live index" "read out/oldA-index.log"
+fi
+
+#---------------------------------------------------------------------------#
 # 10. What the wrapper must refuse, served by a plain web server standing in
 #    for a registry that lies: a manifest whose bytes are not the digest the
 #    URL pins, a manifest with two layers of the same name, and a package
@@ -1270,6 +1534,23 @@ refuses "a manifest with two layers of the same name" \
   "oci+http://127.0.0.1:$UP_PORT/fake/repo/test.db" "more than one layer"
 refuses "a package manifest with no signature layer, loudly" \
   "oci+http://127.0.0.1:$UP_PORT/fake/repo/nosig-1-1-any.pkg.tar.zst.sig" "pacman tries no other server"
+
+# The index of a ref is not a database. Its tag holds no layer of the name
+# pacman asks for, so a Server line at :index gives no database, and pacman
+# asks its next server.
+check "the repository of x86_64-test has the tag index" present \
+  "$([ -n "$(digest_of index)" ] && echo present || echo absent)" "curl -I $BASE/manifests/index"
+for f in test.db test.files; do
+  rc=0
+  PACMAN_OCI_DEBUG=1 "$REPO_ROOT/client/pacman-oci" "$work/index-$f.part" "oci+http://127.0.0.1:$REG_PORT/$REPO:index/$f" \
+    2> "$work/index-$f.err" || rc=$?
+  if [ "$rc" -eq 1 ] && grep -qF "$REPO:index has no layer named $f" "$work/index-$f.err" && [ ! -e "$work/index-$f.part" ]; then
+    ok "a Server line at :index: the wrapper gives no $f"
+  else
+    fail "a Server line at :index: the wrapper gives no $f" "exit $rc" "stderr: $(cat "$work/index-$f.err")" \
+      "reproduce: PACMAN_OCI_DEBUG=1 client/pacman-oci out.part 'oci+http://127.0.0.1:$REG_PORT/$REPO:index/$f'"
+  fi
+done
 
 # A manifest far larger than any real one: curl stops reading at 64 KiB and the
 # file falls through at once, rather than leaving awk to parse it while pacman

@@ -26,7 +26,9 @@
 # (PLAN/summary.tsv), with the state each chain collected into
 # SUMMARIES/<target>/state.tsv, and under it the files that hold a target and
 # the upstream-refused packages, per target. To $GITHUB_STEP_SUMMARY when set,
-# otherwise to stdout.
+# otherwise to stdout. To $GITHUB_OUTPUT when set: promoted=N, the targets
+# promoted in this run. The report job of sync.yml starts status.yml after a
+# scheduled run, or when N is 1 or more.
 #
 # ⛔ A chain's summary counts only when its plan-id is PLAN/plan-id, and only
 # for a target this plan marks pending. "Re-run all jobs" plans again, and the
@@ -162,7 +164,15 @@ case "$REFUSED_ISSUE_MIN" in
 esac
 run_url="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux}/actions/runs/${GITHUB_RUN_ID:-0}"
 
+# output_promoted N: promoted=N to $GITHUB_OUTPUT, when it is set
+output_promoted() {
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    printf 'promoted=%s\n' "$1" >> "$GITHUB_OUTPUT"
+  fi
+}
+
 if [ ! -f "$plan/summary.tsv" ]; then
+  output_promoted 0
   printf '### Sync\n\nThe plan did not finish, so nothing is known about any target. %s\n' "$run_url" >> "$summary"
   exit 1
 fi
@@ -208,6 +218,7 @@ awk -F '\t' -v OFS='\t' '
   { print }
 ' "$work/chains.tsv" "$work/states.tsv" > "$work/merged.tsv"
 mv -f "$work/merged.tsv" "$work/states.tsv"
+output_promoted "$(awk -F '\t' '$2 == "promoted" { n++ } END { print n + 0 }' "$work/states.tsv")"
 
 # dir_of TARGET -> the directory its chain collected, or nothing
 dir_of() {

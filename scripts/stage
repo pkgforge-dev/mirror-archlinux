@@ -2,7 +2,7 @@
 #
 # Stage one target's database: check that every file it names is on the
 # registry, push the database under a staging tag, read it back, and split the
-# files new since the promoted database into verification batches.
+# files to verify (below) into verification batches.
 #
 #   scripts/stage PLAN RESULTS OUT TARGET
 #
@@ -32,8 +32,10 @@
 # OUT/verify-matrix.json  {"include":[{"target":..,"batch":..},..]}
 # OUT/summary.tsv         target, state, why
 #
-# ⛔ A database is staged only when every file new since the promoted one has a
-# result of pushed or present. A file with no result or a failure holds the
+# ⛔ A database is staged only when every file this run mirrors
+# (PLAN/TARGET/todo.tsv) has a result of pushed or present. Each other file
+# new since the promoted one is on the registry already: the index of the ref
+# vouches for it (scripts/plan). A file with no result or a failure holds the
 # target for this run; the next run plans again, from upstream's database of
 # that moment, so a file upstream superseded while this run went clears by
 # itself. A file whose tag holds other bytes (replaced) holds the target until
@@ -47,10 +49,23 @@
 # on every run, and plans a file again once upstream signs it. The list stops
 # at 16 KiB, so the manifest stays far below the 64 KiB the wrapper reads.
 #
-# Verification batches: every file new since the promoted database, plus the
-# canaries, which are always present: the smallest package and every keyring
-# package of the target, so a run with nothing new still proves the path a
-# consumer takes. The number of batches is the larger of ceil(bytes /
+# Verification batches: the files of PLAN/TARGET/new.tsv (every file new since
+# the promoted database that the index does not name as verified; todo.tsv
+# when there is no new.tsv), less the files absent upstream, plus the
+# canaries: the smallest package and every keyring package of the target, so
+# a run with nothing new still proves the path a consumer takes. The
+# accounting above reads todo.tsv only: a file to verify that this run did
+# not mirror is on the registry already (scripts/plan).
+#
+# The smallest canary is the smallest file whose tag reads and holds the
+# record's sha256 as its package layer: a file upstream no longer serves may
+# have no tag. At most 10 files are tried, smallest first. When none fits,
+# there is no smallest canary, and a warning says so. With no canary at all
+# and nothing to verify, no batch is made: the target is held, "nothing to
+# verify, and no canary tag reads". Otherwise batch 0 gets files as any
+# other batch does.
+#
+# The number of batches is the larger of ceil(bytes /
 # VERIFY_BATCH_BYTES) and ceil(files / VERIFY_BATCH_FILES); when that is more
 # than VERIFY_MAX_BATCHES, both limits grow until it is not (lib.sh
 # batch_count), and the log says so.
@@ -108,38 +123,14 @@ ORAS_CONFIG="$work/oras-auth.json"
 oras_login "$ORAS" "$ORAS_CONFIG"
 
 # Every result line from every shard of this plan: target filename status
-# seconds detail. No results at all is ordinary: a database that changed by
-# dropping packages names no new file. A results.tsv and the lines/ beside it
-# say the same.
+# seconds detail (lib.sh results_of_plan).
 plan_id=""
 if [ -f "$plan/$target/plan-id" ]; then
   plan_id="$(cat "$plan/$target/plan-id")"
 else
   warn "$plan/$target/plan-id does not exist: this plan names no plan id, so only results that name none are read"
 fi
-: > "$work/results.tsv"
-: > "$work/result-dirs.txt"
-if [ -d "$results" ]; then
-  find "$results" \( -name results.tsv -type f \) -o \( -name lines -type d \) > "$work/result-paths.txt"
-  sed 's|/[^/]*$||' "$work/result-paths.txt" | sort -u > "$work/result-dirs.txt"
-fi
-while IFS= read -r d; do
-  got=""
-  if [ -f "$d/plan-id" ]; then
-    got="$(cat "$d/plan-id")"
-  fi
-  if [ "$got" != "$plan_id" ]; then
-    warn "$d holds the results of plan '$got', not of this plan '$plan_id'; they are not read" \
-      "an earlier attempt of the run left them: Re-run all jobs plans again, and the artifacts of the earlier attempt stay"
-    continue
-  fi
-  if [ -f "$d/results.tsv" ]; then
-    cat "$d/results.tsv" >> "$work/results.tsv"
-  fi
-  if [ -d "$d/lines" ]; then
-    find "$d/lines" -maxdepth 1 -name '[0-9]*.tsv' -type f -exec cat {} + >> "$work/results.tsv"
-  fi
-done < "$work/result-dirs.txt"
+results_of_plan "$results" "$plan_id" "$work/results.tsv"
 
 set_state() {
   printf '%s\n' "$2" > "$1/state"
@@ -358,19 +349,67 @@ stage_target() {
   # absent.txt holds file names; records.tsv is file name in $1, package name in
   # $2, so the match is on $1.
   awk -F '\t' 'FILENAME == ARGV[1] { a[$1] = 1; next } !($1 in a)' "$dir/absent.txt" "$pdir/records.tsv" > "$work/records-present.tsv"
+  # The smallest canary: the first of the 10 smallest files whose tag holds
+  # the record's sha256 as its package layer. A promoted file that upstream
+  # no longer serves is not in absent.txt, and may have no tag.
+  local smallest="" c_file c_name c_sha c_tag c_digest
+  sort -t $'\t' -k6,6n -k2,2 "$work/records-present.tsv" | awk -F '\t' -v OFS='\t' 'NR <= 10 { print $1, $2, $5 }' > "$work/canary-try.tsv"
+  cut -f 1 "$work/canary-try.tsv" | "$WRAPPER" --tags > "$work/canary-tags.tsv"
+  while IFS=$'\t' read -r c_file c_name c_sha; do
+    c_tag="$(awk -F '\t' -v f="$c_file" '$1 == f { print $2 }' "$work/canary-tags.tsv")"
+    if [ -z "$c_tag" ]; then
+      log "$name: the wrapper gives no tag for $c_file; it is not the smallest canary"
+      continue
+    fi
+    rc=0
+    registry_manifest "$repo_path" "$c_tag" "$sd/canary.json" || rc=$?
+    if [ "$rc" -eq "$REG_STATUS_ABSENT" ]; then
+      log "$name: $c_file has no tag $repo_path:$c_tag; it is not the smallest canary"
+      continue
+    fi
+    if [ "$rc" -ne "$REG_STATUS_OK" ]; then
+      log "$name: $repo_path:$c_tag ($c_file) does not read (status $rc); it is not the smallest canary"
+      continue
+    fi
+    read -r c_digest _ _ <<< "$(manifest_layer "$sd/canary.json" "$c_file")"
+    if [ "$c_digest" = "sha256:$c_sha" ]; then
+      smallest="$c_name"
+      break
+    fi
+    log "$name: $repo_path:$c_tag holds ${c_digest:-no layer} for $c_file, not sha256:$c_sha; it is not the smallest canary"
+  done < "$work/canary-try.tsv"
+  if [ -z "$smallest" ]; then
+    warn "$name: none of the $(awk 'END { print NR + 0 }' "$work/canary-try.tsv") smallest file(s) has a tag that holds its bytes, so there is no smallest canary" \
+      "reproduce: cat $work/canary-tags.tsv, then read each tag of $repo_path"
+  fi
   {
     awk -F '\t' 'FILENAME == ARGV[1] { want[$1] = 1; next } ($2 in want) { print $2 }' "$work/keyrings.txt" "$work/records-present.tsv"
-    sort -t $'\t' -k6,6n -k2,2 "$work/records-present.tsv" | awk -F '\t' 'NR == 1 { print $2 }'
+    if [ -n "$smallest" ]; then
+      printf '%s\n' "$smallest"
+    fi
   } | awk '!seen[$0]++' > "$dir/canaries.txt"
+  # The files to verify: new.tsv, or todo.tsv from a plan with no new.tsv.
+  local verify_from="$pdir/new.tsv"
+  if [ ! -f "$verify_from" ]; then
+    verify_from="$pdir/todo.tsv"
+    log "$name: the plan has no new.tsv; the files to verify are its todo files"
+  fi
   {
     awk -F '\t' 'FILENAME == ARGV[1] { c[$1] = 1; next } ($2 in c) { print $2 "\t" $6 }' "$dir/canaries.txt" "$pdir/records.tsv"
-    # The todo files to verify, minus any skipped as absent: there is nothing on
-    # the registry to verify for a file upstream no longer serves.
-    awk -F '\t' 'FILENAME == ARGV[1] { a[$1] = 1; next } !($2 in a) { print $6 "\t" $5 }' "$dir/absent.txt" "$pdir/todo.tsv"
+    # Less any file skipped as absent: there is nothing on the registry to
+    # verify for a file upstream no longer serves.
+    awk -F '\t' 'FILENAME == ARGV[1] { a[$1] = 1; next } !($2 in a) { print $6 "\t" $5 }' "$dir/absent.txt" "$verify_from"
   } | awk -F '\t' '!seen[$1]++' > "$dir/verify.tsv"
 
   local nfiles nbytes k flimit blimit wanted
   nfiles="$(awk 'END { print NR + 0 }' "$dir/verify.tsv")"
+  # No canary and nothing to verify: a batch 0 with no file would fail in
+  # verify-batch. No batch is made, and nothing proves the path a consumer
+  # takes, so the target is held.
+  if [ ! -s "$dir/canaries.txt" ] && [ "$nfiles" -eq 0 ]; then
+    set_state "$dir" held "nothing to verify, and no canary tag reads"
+    return 0
+  fi
   nbytes="$(awk -F '\t' '{ s += $2 } END { printf "%.0f\n", s }' "$dir/verify.tsv")"
   read -r k flimit blimit wanted <<< "$(batch_count "$nfiles" "$nbytes" "$BATCH_FILES" "$BATCH_BYTES" "$MAX_BATCHES")"
   if [ "$wanted" -gt "$k" ]; then

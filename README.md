@@ -171,21 +171,22 @@ pacman checks each package against the keyring of its distribution. A consumer n
 
 ## How the mirror works
 
-`.github/workflows/sync.yml` runs every 3 hours. Each target with work runs its own chain (`.github/workflows/sync-target.yml`), so one target never holds another.
+`.github/workflows/sync.yml` runs every 3 hours. `.github/workflows/upstream-watch.yml` also starts it, for the targets whose upstream database changed, within about 15 minutes of the change. Each target with work runs its own chain (`.github/workflows/sync-target.yml`), so one target never holds another.
 
-1. **plan** (`scripts/plan`) reads each database from the distribution's own servers only. It refuses a database that is malformed or behind the promoted one, and puts the new files into shards per target.
-2. **mirror** (`scripts/mirror-shard`, `scripts/mirror-file`) downloads each new file from any listed server. It checks size and sha256, then pushes the file with its signature under a tag of its own.
-3. **stage** (`scripts/stage`) pushes the database under a staging tag once every file it names is on the registry. It reads the database back and splits the new files into verify batches.
-4. **verify** (`scripts/verify-batch`) runs pacman in the x86_64 Arch image with the wrapper as its `XferCommand`. pacman downloads every new file and checks its sha256 and signature.
+1. **plan** (`scripts/plan`) reads each database from the distribution's own servers only. It refuses a database that is malformed or behind the promoted one. It reads the target's index: what earlier runs of the ref left on the registry. Then it puts the files that are not on the registry into shards per target.
+2. **mirror** (`scripts/mirror-shard`, `scripts/mirror-file`) gets each of these files from the registry when a repository there holds its bytes, else from any listed server. It checks size and sha256, then pushes the file with its signature under a tag of its own.
+3. **stage** (`scripts/stage`) pushes the database under a staging tag once every file it names is on the registry. It reads the database back and splits the files to verify into batches: the new files that no earlier run verified.
+4. **verify** (`scripts/verify-batch`) runs pacman in the x86_64 Arch image with the wrapper as its `XferCommand`. pacman downloads each of these files and checks its sha256 and signature.
 5. **promote** (`scripts/promote`, branch `main` only) tags the staged digest: the date tag once, `db-HEX`, `files-HEX`, then `latest`. `latest` never moves backwards.
-6. **report** (`scripts/report`) writes one table for the run. On `main`, it keeps the `visibility-`, `replaced-` and `refused-` issues current, then starts the status workflow.
-7. **status** (`scripts/status-collect`, `scripts/status-render`, every hour) measures each target against upstream and against the Worker. It publishes the dashboard, the badges and the charts.
+6. **index** (`scripts/index-write`) writes the target's index: the files the run left on the registry, and the files verify passed. It runs also after a failure or a cancel, so the next run does not do the same work again.
+7. **report** (`scripts/report`) writes one table for the run. On `main`, it keeps the `visibility-`, `replaced-` and `refused-` issues current. After a scheduled sync, or a sync that promoted a target, it then starts the status workflow.
+8. **status** (`scripts/status-collect`, `scripts/status-render`, every hour) measures each target against upstream and against the Worker. It publishes the dashboard, the badges and the charts.
 
 [docs/design.md](docs/design.md) gives each rule and the failure it prevents.
 
 ## Trust and checks
 
-⛔ A database reaches `latest` only after every file it names is on the registry. Every file new since the promoted database must also pass pacman's own checks through the wrapper.
+⛔ A database reaches `latest` only after every file it names is on the registry. Every file new since the promoted database must also pass pacman's own checks through the wrapper. It passes in this run, or in an earlier run of the same ref, for the same database record and the same verify context ([docs/design.md](docs/design.md#the-index-of-a-ref)).
 
 - The database comes only from the `db_server` hosts of the target, which the distribution runs. These databases are unsigned. The source of a database chooses which validly signed packages get installed.
 - The wrapper checks each file it reads from the registry before pacman sees it:
@@ -193,7 +194,7 @@ pacman checks each package against the keyring of its distribution. A consumer n
   2. Exactly one layer must carry the name pacman asked for.
   3. The blob's size and sha256 must equal that layer's descriptor, or the database's `%SHA256SUM%`.
 - pacman then checks each package's sha256 against the database, and each signature against the keyring.
-- Push access to this repository is the trust root of the registry: any workflow on any branch can ask for `packages: write`. Every workflow starts from `permissions: {}`. Only `main` promotes. Actions are pinned by commit.
+- Push access to this repository is the trust root of the registry: any workflow on any branch can ask for `packages: write`. Every workflow starts from `permissions: {}`. Only `main` promotes, and only `main` repairs a signature layer. Actions are pinned by commit.
 - The Worker and its Cloudflare account join the trust root for the consumers of ways 1 and 3. Whoever can change the Worker can change the database a consumer gets.
 - Renovate pushes its own branches, so it holds the same trust. Its small updates merge when CI is green. ⚠ A major update waits for a person. So does a keyring image update that changes keys: CI job `keyrings` compares the keyring files with `targets/keyrings.sha256`.
 
@@ -240,7 +241,7 @@ WORKER_LIVE=1 tests/run.sh worker live
 
 These run by themselves:
 
-- Sync every 3 hours. Status, with the Worker check, every hour. The staleness and schedule checks every day.
+- Sync every 3 hours, and a sync of the targets whose upstream changed, checked every 15 minutes (not the powerpc targets). Status, with the Worker check, every hour. The staleness and schedule checks every day.
 - The scheduled workflows start each other when a newest run is overdue, and keep every schedule enabled.
 - Renovate merges digest, pin, patch and minor updates when every check is green.
 - `worker.yml` tests the Worker after a push to `main` that changes `worker/`.
@@ -273,7 +274,7 @@ These need a person:
 
 | document | contents |
 | --- | --- |
-| [docs/design.md](docs/design.md) | the invariant, the rules, the storage layout, the jobs, verify |
+| [docs/design.md](docs/design.md) | the invariant, the rules, the storage layout, the index of a ref, the jobs, verify |
 | [docs/client.md](docs/client.md) | the wrapper: run store, prefetch, single-file path, environment, exit codes |
 | [docs/worker.md](docs/worker.md) | the Worker: paths, references, caching, cost, deploy, trust |
 | [docs/operations.md](docs/operations.md) | workflows, schedules, issues, Renovate, secrets, Pages, the status branch |

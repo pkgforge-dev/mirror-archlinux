@@ -27,6 +27,28 @@
 # PLAN/<target>/shards/<n>.tsv). It is written first, so even a shard that is
 # killed leaves it. scripts/stage reads no result of another plan.
 #
+# ⛔ The re-run guard. A re-run of the job (GITHUB_RUN_ATTEMPT above 1)
+# mirrors from an older plan, and a newer run can have written the index
+# since. A tag that a row of the index vouches for must not be written. So,
+# before the first file, a re-run reads the live index once (lib.sh
+# index_guard): the tag INDEX_TAG of the plan directory's meta.env, in the
+# repository of its TARGET, with the workflow's token. It writes one of:
+#   $WORK/index-listed.txt  the filenames of its m rows; empty when there is
+#                           no index tag. scripts/mirror-file writes no tag
+#                           of a file it lists.
+#   $WORK/index-unread      why the live index did not read. Then
+#                           scripts/mirror-file writes no tag in this shard.
+# Attempt 1 reads nothing. When plan read the index (INDEX_STATE ok), it
+# withdrew the rows of the files it gives the shards. When it did not
+# (unread, ignored), scripts/mirror-file writes no repush, and a push goes
+# only to an absent tag, which no valid row vouches for. The sync concurrency
+# group lets no other run write between.
+#
+# INDEX_STATE comes from the plan directory's meta.env, read as data, as
+# index_guard reads TARGET and INDEX_TAG. It is exported for
+# scripts/mirror-file, which writes a repush only when it is ok, absent or
+# invalid. A missing meta.env or key gives unknown.
+#
 # The work goes in the directory with the most free space among $RUNNER_TEMP,
 # /mnt and /tmp, counting each filesystem once. scripts/debloat-runner runs
 # only when the PARALLEL largest files of the shard would not fit; if they
@@ -34,7 +56,8 @@
 #
 # Environment: PARALLEL (default 4), SHARD_INDEX, DEBLOAT (auto, always or
 # never; default auto), MIRROR_NAMESPACE, REGISTRY_USER, REGISTRY_TOKEN,
-# ORAS_CACHE (scripts/install-oras).
+# ORAS_CACHE (scripts/install-oras), GITHUB_RUN_ATTEMPT (default 1),
+# MIRROR_REPAIR (0 or 1, default 1; scripts/mirror-file).
 #
 # Exit status: 0 every file is on the registry, 1 otherwise.
 set -euo pipefail
@@ -62,8 +85,18 @@ case "$DEBLOAT" in
   auto | always | never) ;;
   *) die "DEBLOAT must be auto, always or never, not '$DEBLOAT'" ;;
 esac
+GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+case "$GITHUB_RUN_ATTEMPT" in
+  '' | *[!0-9]* | 0) die "GITHUB_RUN_ATTEMPT must be a positive integer, not '$GITHUB_RUN_ATTEMPT'" ;;
+esac
+MIRROR_REPAIR="${MIRROR_REPAIR:-1}"
+case "$MIRROR_REPAIR" in
+  0 | 1) ;;
+  *) die "MIRROR_REPAIR must be 0 or 1, not '$MIRROR_REPAIR'" ;;
+esac
 mkdir -p "$out"
-plan_id_file="$(dirname "$(dirname "$shard")")/plan-id"
+plan_dir="$(dirname "$(dirname "$shard")")"
+plan_id_file="$plan_dir/plan-id"
 plan_id=""
 if [ -f "$plan_id_file" ]; then
   plan_id="$(cat "$plan_id_file")"
@@ -71,6 +104,14 @@ else
   warn "$plan_id_file does not exist, so these results name no plan, and scripts/stage reads them only with a plan that names none"
 fi
 printf '%s\n' "$plan_id" > "$out/plan-id"
+# The plan's INDEX_STATE, for the repush rule of scripts/mirror-file
+INDEX_STATE=""
+if [ -f "$plan_dir/meta.env" ]; then
+  INDEX_STATE="$(awk 'index($0, "INDEX_STATE=") == 1 { v = substr($0, 13) } END { print v }' "$plan_dir/meta.env")"
+fi
+if [[ ! "$INDEX_STATE" =~ ^[a-z]+$ ]]; then
+  INDEX_STATE=unknown
+fi
 
 lines="$(awk 'END { print NR + 0 }' "$shard")"
 [ "$lines" -gt 0 ] || die "$shard has no work line"
@@ -122,7 +163,7 @@ done
 if [ "$best_free" -lt "$(need_for 1)" ]; then
   die "$best_dir has $((best_free / 1048576)) MiB free, and the largest file of this shard needs $(($(need_for 1) / 1048576)) MiB"
 fi
-log "$lines file(s), $PARALLEL at a time, in $best_dir ($((best_free / 1073741824)) GiB free)"
+log "$lines file(s), $PARALLEL at a time, in $best_dir ($((best_free / 1073741824)) GiB free); the plan's INDEX_STATE is $INDEX_STATE"
 
 WORK="$(mktemp -d "$best_dir/mirror.XXXXXX")"
 RESULTS="$out/lines"
@@ -142,7 +183,15 @@ trap cleanup EXIT
 ORAS="$("$REPO_ROOT/scripts/install-oras" "$WORK/bin")"
 ORAS_CONFIG="$WORK/oras-auth.json"
 oras_login "$ORAS" "$ORAS_CONFIG"
-export RESULTS WORK ORAS ORAS_CONFIG SHARD_INDEX MIRROR_NAMESPACE REGISTRY_TOKEN_CACHE
+export RESULTS WORK ORAS ORAS_CONFIG SHARD_INDEX MIRROR_NAMESPACE REGISTRY_TOKEN_CACHE GITHUB_RUN_ATTEMPT MIRROR_REPAIR INDEX_STATE
+
+#---------------------------------------------------------------------------#
+# ⛔ The re-run guard: on a re-run, the live index, read once before the
+# first file
+#---------------------------------------------------------------------------#
+if [ "$GITHUB_RUN_ATTEMPT" -gt 1 ] && ! index_guard "$plan_dir" "$WORK"; then
+  log "attempt $GITHUB_RUN_ATTEMPT of this run: scripts/mirror-file writes no tag in this shard"
+fi
 
 rc=0
 seq 1 "$lines" | xargs -d '\n' -n 1 -P "$PARALLEL" "$REPO_ROOT/scripts/mirror-file" "$shard" || rc=$?

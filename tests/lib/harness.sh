@@ -102,6 +102,19 @@ work_dir() {
   mktemp -d
 }
 
+# same_bytes A B: 0 when A and B are both files with the same sha256 of their
+# bytes. ⚠ Use this, not cmp or diff: the archlinux:base image of the
+# bash-gawk unit leg has no diffutils, and no CI job installs a package.
+same_bytes() {
+  local a b
+  if [ ! -f "$1" ] || [ ! -f "$2" ]; then
+    return 1
+  fi
+  a="$(sha256sum < "$1")" || return 1
+  b="$(sha256sum < "$2")" || return 1
+  [ "$a" = "$b" ]
+}
+
 #---------------------------------------------------------------------------#
 # grep_matches PATTERN FILE
 #

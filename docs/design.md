@@ -1,10 +1,10 @@
 # Design
 
-This document gives the invariant of the mirror, each rule with the failure it prevents, the storage layout, the jobs and the verify step. The measurements behind the rules are in [measurements.md](measurements.md).
+This document gives the invariant of the mirror, each rule with the failure it prevents, the storage layout, the index of a ref, the jobs and the verify step. The measurements behind the rules are in [measurements.md](measurements.md).
 
 ## The invariant
 
-⛔ A database reaches `latest` only after every file it names is on the registry. Every file new since the promoted database must also pass pacman's own checks through the wrapper.
+⛔ A database reaches `latest` only after every file it names is on the registry. Every file new since the promoted database must also pass pacman's own checks through the wrapper. It passes in this run, or in an earlier run of the same ref, for the same database record and the same verify context ([the index of a ref](#the-index-of-a-ref)). A tag that a row of the index vouches for is not written until plan withdraws the row.
 
 Each rule below keeps this invariant true for one way it could fail.
 
@@ -27,10 +27,10 @@ Each rule below keeps this invariant true for one way it could fail.
 | With no `%PGPSIG%`, mirror-file reads the `.sig` from the target's servers in their own order, the `db_server` hosts first. verify compares with the same order. Only package files are read in an order rotated by shard. | A plain mirror that serves other `.sig` bytes gives the layer, verify refuses it, and the target fails on every run. | `scripts/mirror-file` |
 | A file pushed unsigned is named in the staged manifest, in `dev.pkgforge.mirror.unsigned`. plan asks for its `.sig` again on each run. When a server answers, plan puts the file in todo, also when the database did not change, and mirror-file adds the layer. | A `.sig` that upstream publishes later never reaches the mirror. A detached-signature database does not change when a `.sig` is added. | `scripts/stage`, `scripts/plan` |
 | Every upstream read has a stall deadline. A database or a signature read has a whole-call deadline that also bounds its retries: `--retry-max-time`, and `timeout` 5 s after it. A package download gets 120 s plus the time at 64 KiB/s. | curl gives each retry a new `--max-time`: a call took 3 x the deadline + 4 s. | `scripts/lib.sh` `fetch_upstream` |
-| The upstream reads of plan end within `PLAN_BUDGET` (1200 s), below the job's 30 minutes. Each target gets what is left, divided by the targets not yet read. A `db_server` read gets 1/(n + 1) of the target's share, with n the `db_server` hosts not yet read. A target whose reads do not fit is in error for the run, and its why names `PLAN_BUDGET`. | One slow upstream server makes the plan job time out, and no target is mirrored or promoted. | `scripts/plan` |
+| The upstream reads of plan end within `PLAN_BUDGET` (1200 s), below the job's 40 minutes. Each target gets what is left, divided by the targets not yet read. A `db_server` read gets 1/(n + 1) of the target's share, with n the `db_server` hosts not yet read. A target whose reads do not fit is in error for the run, and its why names `PLAN_BUDGET`. | One slow upstream server makes the plan job time out, and no target is mirrored or promoted. | `scripts/plan` |
 | A server that fails for one file of a shard is asked last by every file of the shard after it: a timeout, a failed connection, or a status other than 200, 404 and 410. A `.sig` read ends within 30 s. | A server that stalls costs each file of the shard 184 s, also a file the registry holds. The shard never ends inside its step. | `scripts/mirror-file`, `scripts/lib.sh` `down_mark` |
 | The token cache keeps only a token got with `REGISTRY_TOKEN`. A read with `REGISTRY_TOKEN` empty never uses the cache, and the anonymous token it gets is never kept. | stage's anonymous read sends the workflow's token. A private package reads as public and is promoted. | `scripts/lib.sh` `registry_token_file` |
-| Every artifact that a chain makes carries the plan id (`scripts/plan`). stage reads only the shard results of its plan. The report reads only the summaries of its plan, and only for a target the plan marks pending. collect reads only the verdicts and the promotion of the staged digest. | "Re-run all jobs" plans again, and a download by name or pattern still returns the earlier attempt's artifacts. A stale result holds a target, or a stale summary raises an issue again. | `scripts/stage`, `scripts/report`, `scripts/mirror-shard` |
+| Every artifact that a chain makes carries the plan id (`scripts/plan`). stage and index-write read only the shard results of their plan (`scripts/lib.sh` `results_of_plan`). The report reads only the summaries of its plan, and only for a target the plan marks pending. collect and index-write read only the verdicts of the staged digest. | "Re-run all jobs" plans again, and a download by name or pattern still returns the earlier attempt's artifacts. A stale result holds a target, a stale summary raises an issue again, or a stale "pushed" gives a file a row in the index. | `scripts/stage`, `scripts/index-write`, `scripts/report`, `scripts/mirror-shard` |
 | Verify compares every `.sig` pacman stored with the decoded `%PGPSIG%`. | pacman checks against `%PGPSIG%` and stores the served `.sig` unread. A wrong layer passes verify and breaks a later `pacman -U` from the cache. | `scripts/verify-batch` |
 | Package manifests are the same bytes whoever pushes them. `org.opencontainers.image.created` is the package's `%BUILDDATE%`, and no annotation names the source server. | Two writers replace each other's tag with a manifest of another digest. | `scripts/mirror-file` |
 | Absent means the registry says so: only a 404 with `NAME_UNKNOWN` or `MANIFEST_UNKNOWN`, and, for an anonymous read only, the 403 of the token endpoint (next row). On GHCR, with a token set, a read tries `Bearer QQ==` first, and only its 200 counts. Any other answer is read again with the real token. | GHCR answers `QQ==` with 404 for a repository it does not show. A private package reads as absent, and its tags are pushed over. | `scripts/lib.sh` `registry_manifest` |
@@ -41,11 +41,22 @@ Each rule below keeps this invariant true for one way it could fail.
 | A file that upstream supersedes during a run holds the target for that run. A file that never succeeds holds its target until upstream drops or rebuilds it. | A database is staged that names a file the registry does not hold. | `scripts/stage` |
 | Each target runs its own chain and reads only its own artifacts. Every artifact name carries the target. A chain reads its shard results and verdicts by the pattern `<kind>-<target>-[0-9]*`. So a target name that extends another target name with a letter never matches. ⚠ An extension that starts with `-` and a digit, as in `x86_64-core-2`, still matches. | One slow or failed target holds every other target. A chain reads the verdicts of another target. | `.github/workflows/sync-target.yml` |
 | A push attempt gets 300 s plus the time at `MIRROR_MIN_RATE` (2 MiB/s), and never more than 600 s. | Attempts run past GHCR's 10-minute upload limit and are lost. | `scripts/mirror-file` |
-| A 429 from the registry costs no attempt, in mirror-file, in stage's staging push and in promote's tags. A 429 is `toomanyrequests`, `429 Too Many` or oras's own `status code 429`. Each pause is 20 to 60 s. A push of a shard that gets one writes `$WORK/throttle`, the time its pause ends, and every push of the shard waits for that time first. The pauses add up to at most `MIRROR_RATE_WAIT` (1800 s) for one file, `STAGE_RATE_WAIT` (600 s) for the staging push, and `PROMOTE_RATE_WAIT` (420 s) for the tags of one promotion. The last two are below the 20 and 15 minutes of their jobs. After the cap, the step fails and names its pauses. | GHCR limits the requests of one token, and every push of every job shares the workflow token. Three attempts, 5 s and 20 s apart, all fall inside the limit: the file fails, stage is in error, or `latest` does not move. | `scripts/lib.sh` `rate_limited`, `throttle_pause`; `scripts/mirror-file`, `scripts/stage`, `scripts/promote` |
+| A 429 from the registry costs no attempt, in mirror-file, in stage's staging push and in promote's tags. A 429 is `toomanyrequests`, `429 Too Many` or oras's own `status code 429`. Each pause is 20 to 60 s. A push of a shard that gets one writes `$WORK/throttle`, the time its pause ends, and every push of the shard waits for that time first. The pauses add up to at most `MIRROR_RATE_WAIT` (1800 s) for one file, `STAGE_RATE_WAIT` (600 s) for the staging push, `PROMOTE_RATE_WAIT` (420 s) for the tags of one promotion, and `INDEX_RATE_WAIT` (120 s) for one push of the index. The second and third are below the 20 and 15 minutes of their jobs. After the cap, the step fails and names its pauses. | GHCR limits the requests of one token, and every push of every job shares the workflow token. Three attempts, 5 s and 20 s apart, all fall inside the limit: the file fails, stage is in error, or `latest` does not move. | `scripts/lib.sh` `rate_limited`, `throttle_pause`, `index_push`; `scripts/mirror-file`, `scripts/stage`, `scripts/promote` |
 | Each item of a shard writes its result line the moment it ends. A work line with no result counts as failed. | A shard that runs out of time loses the results of the files it pushed. | `scripts/mirror-shard`, `scripts/mirror-file` |
 | The verify budgets nest. The pulls and the container end inside `VERIFY_BUDGET` (4800 s). That ends inside the step's 85 minutes, which end inside the job's 95. The verdict is written by an EXIT trap. | The runner ends the job, and no verdict is left. | `scripts/verify-batch`, `sync-target.yml` |
 | The verify container looks up no key on the network. Its `gpg.conf` has `disable-dirmngr`, so a WKD lookup and a keyserver lookup both fail at once. It also names the keyserver `hkp://127.0.0.1:9`, which refuses at once. | A missing or expired key makes pacman look it up by WKD on the domain of the key's user ID, then on a keyserver. The verdict then depends on a host outside the run, and verify waits on it. | `scripts/verify-batch` |
 | No exit is silent. Each script that sources `scripts/lib.sh` has an ERR trap that names the command which ended it. No pipeline ends in a reader that stops early. | A step ends with status 141 (SIGPIPE) and no message. | `scripts/lib.sh`, `tests/static/35-pipeline-traps.sh` |
+| plan does not mirror a file that the index of the ref names with state `m` and the same sha256 and `%PGPSIG%`. It verifies such a file again unless the index names it as verified under this run's verify context. | A run that fails, is held or is cancelled loses its work, and the next run starts from scratch. A file verified under other rules is promoted with no check. | `scripts/plan`, `scripts/lib.sh` `index_read`, `verify_context` |
+| ⛔ A tag that a row of the index vouches for is not written until plan withdraws the row. Before any shard starts, plan pushes the index again without the rows of the files it plans, and reads it back. A push or a read back that fails puts the target in error. | A run writes a tag under a row that says verified, and the next run promotes bytes that no verify read. | `scripts/plan` |
+| index-write reads the live tag with the workflow's token just before the push. It pushes only in three cases: the live tag is the one plan read or saw; there is none, as plan found; an earlier attempt of the same plan wrote it, and no other plan withdrew rows from it since (`dev.pkgforge.mirror.withdrawn-by`). A reset (`INDEX_READ=0`) reads the manifest of the tag, and pushes by the same three cases. | A re-run of an older run, or of a reset, replaces the index of a newer run. A withdrawal keeps the plan id of the index it changes, so a re-run of that plan takes the newer index for its own. | `scripts/index-write`, `scripts/plan` |
+| A re-run of a mirror job (`GITHUB_RUN_ATTEMPT` above 1) reads the live index once. It writes no tag that the index lists. When the index does not read, it writes no tag at all. | A re-run of an older run writes an older signature layer over one that a newer run verified, and the index still vouches for the tag. | `scripts/mirror-shard`, `scripts/mirror-file`, `scripts/lib.sh` `index_guard` |
+| ⛔ A repush goes ahead only when plan read the index: `INDEX_STATE` `ok`, `absent` or `invalid`, from the plan's `meta.env` (`scripts/mirror-shard`). With `unread`, `ignored`, or no state, the result is `failed`, `a signature repair waits for a run that read the index`. A push goes only to an absent tag, which no valid row vouches for. | With the index unread or ignored, plan withdraws no row. A repush writes a signature layer under a row that says verified, and the next run promotes it with no verify. | `scripts/mirror-shard`, `scripts/mirror-file` |
+| A run on a branch repairs no signature layer (`MIRROR_REPAIR=0`). It writes only new package tags, and its own `staging-<branch>` and `index-<branch>` tags. | A branch run changes a tag that the index of `main` vouches for. | `sync-target.yml`, `scripts/mirror-file` |
+| A batch that fails removes from the index the rows of its files at fault (`faults-<target>-<batch>.txt`). A failed batch that names no file keeps its rows, not verified. | A tag at fault stays vouched for, and every later run skips it. | `scripts/verify-batch`, `scripts/index-write` |
+| mirror-file reads the package bytes from the registry before upstream: on a repush from the target's own repository, then from each sibling that plan names. The read stops at the record's size and checks the sha256. A 404 is a quiet miss. Any other answer marks the repository down for the shard. | A repair downloads the package from upstream again. The three base-any targets download the same files three times. | `scripts/mirror-file`, `scripts/lib.sh` `registry_blob_probe` |
+| A file is absent only when every upstream server answers 404 for it, none errs or gives other bytes, and every registry source gave an answer that decides. A registry source is known to hold the bytes: plan names a sibling because its latest database or its index holds them, and on a repush the target's own repository holds the package blob that `decide_push` matched. So an error there is not an absence. The file is `failed`, the target is held, and the next run tries again. | A file that the registry holds is skipped as absent. The run promotes a database that names a file the target never gets. | `scripts/mirror-file` |
+| The registry reads of plan (the index, the latest database of `keyring_from`, the siblings) share `REGISTRY_READ_BUDGET` (240 s) for the whole plan. The budget stops each new read. A read gets a deadline: 60 s, or what is left of the budget when that is less. curl starts no retry after it, and `timeout` stops each request 5 s after it: a manifest get (`REG_MANIFEST_MAX_TIME`), a token request, a blob get. An index read makes up to 9 requests: a manifest and two blobs, each `Bearer QQ==`, a token and the get again. So the read in progress when the budget is spent can run past it by up to about 9 minutes. A read that is not made costs work. An unread index is safe because mirror-file writes no repush for it (the row "A repush goes ahead only when plan read the index"). | A registry that stalls holds the plan job past its 40 minutes. | `scripts/plan`, `scripts/lib.sh` `registry_get_manifest` |
+| plan keeps each upstream read of a `.files` database, a database signature and a package `.sig` that answers, for the rest of the plan. A `<repo>.db` is never kept. | The three base-any targets read `base-any.files`, its signatures and the `.sig` files of steps 4 and 4b three times in one plan. | `scripts/plan` `fetch_within` |
 
 ## Storage layout
 
@@ -54,6 +65,8 @@ ghcr.io/pkgforge-dev/mirror-archlinux/<arch>/<repo>
   :<escaped filename>        one package: the file and its signature
   :staging                   the candidate database of the run on main
   :staging-<branch>          the candidate database of a run from another branch
+  :index                     the index of the runs on main: what they left on the registry
+  :index-<branch>            the index of the runs of another branch
   :latest                    the promoted database
   :YYYY.MM.DD                the first promoted database fetched on that UTC date; never moves
   :db-<sha256 of <repo>.db>          the promoted database by its content
@@ -62,7 +75,7 @@ ghcr.io/pkgforge-dev/mirror-archlinux/<arch>/<repo>
 
 `<arch>` is pacman's `$arch`. One GHCR repository holds one target. Nothing is ever deleted: `tests/static/50-workflow-policy.sh` refuses every use of the packages DELETE API.
 
-`<branch>` is the branch name in lower case. Each character other than `a-z` and `0-9` becomes `-`, a run of `-` becomes one, and a leading or trailing `-` is removed. Then the name is cut to 40 characters. An empty result is `branch`.
+`<branch>` is the branch name in lower case. Each character other than `a-z` and `0-9` becomes `-`, and a run of `-` becomes one. Then the name is cut to 40 characters. Then a leading or trailing `-` is removed. An empty result is `branch`. `scripts/lib.sh` `staging_tag` and `index_tag` make both tags. `STAGING_TAG` and `INDEX_TAG`, when set, replace them.
 
 ## Tags
 
@@ -71,7 +84,7 @@ A package tag is the filename with this mapping:
 - `+` becomes `_p`, `:` becomes `_c` and `@` becomes `_a`.
 - A literal `_` becomes `_u` only when the next character is `p`, `c`, `a` or `u`. So `x86_64` stays `x86_64`, and the mapping is injective.
 
-GHCR resolves tags with no regard to case, so every tag is lower case. Some filenames are stored under `fn-` and the hex sha256 of the name. These are a name with upper case or another character outside `[a-z0-9@._+:-]`, and a name that the mapping cannot carry in 128 characters. That form has no dot. Every escaped package name has `.pkg.tar`. So the two forms never meet, and neither meets `latest`, `staging`, a date, `db-` or `files-`.
+GHCR resolves tags with no regard to case, so every tag is lower case. Some filenames are stored under `fn-` and the hex sha256 of the name. These are a name with upper case or another character outside `[a-z0-9@._+:-]`, and a name that the mapping cannot carry in 128 characters. That form has no dot. Every escaped package name has `.pkg.tar`. So the two forms never meet, and neither meets `latest`, `staging`, `staging-<branch>`, `index`, `index-<branch>`, a date, `db-` or `files-`. `tests/unit/10-tag-encoding.sh` checks the database tags and the index tags.
 
 The mapping has one implementation: `client/pacman-oci --tag` and `--tags`. The scripts call it. The Worker has a copy, `tagOf`. `worker/test/tags.test.js` compares the two for every name in `tests/fixtures/filenames.txt`.
 
@@ -92,15 +105,150 @@ A database manifest:
 - annotations: `dev.pkgforge.mirror.arch`, `.repo`, `.upstream` (the server), `.db-sha256`, `.files-sha256`, `.packages`, `.bytes`, `.newest-builddate`, `.fetched` (ISO 8601 UTC), `.run`, and the OCI `source`, `title` and `revision`
 - `dev.pkgforge.mirror.unsigned`, only when a file has no signature because upstream publishes none: the filenames, space separated, at most 16 KiB
 
+An index manifest ([the index of a ref](#the-index-of-a-ref)):
+
+- artifact type `application/vnd.pkgforge.archlinux.index.v1`
+- two layers, by title: `ref.db` (`application/vnd.pkgforge.archlinux.db.v1`), the upstream database the rows describe; `index.tsv` (`application/vnd.pkgforge.archlinux.index.v1+tsv`), the rows
+- annotations: `dev.pkgforge.mirror.index-format` (`1`), `.plan-id`, `.fetched` (the plan's), `.db-sha256` (of `ref.db`), `.verify-context`, `.run`, and the OCI `source`
+- `dev.pkgforge.mirror.withdrawn-by`, only on an index that plan pushed again without some rows: the id of that plan
+
+## The index of a ref
+
+The index holds what the runs of one ref left on the registry. A run that fails, is held or is cancelled leaves its work to the next run, so no run starts from scratch. Each target repository has one index for `main` (`:index`) and one for each other branch (`:index-<branch>`).
+
+⛔ The index is not a database. The Worker takes no tag in a URL but `latest`, a date, `db-` and `files-` (`worker/test/paths.test.js`). The tag holds no layer named `<repo>.db` or `<repo>.files`, so the wrapper gets no database from a Server line at `:index` (`tests/integration/10-pipeline.sh`).
+
+### The rows
+
+`index.tsv` holds one line per file, sorted by filename: `filename state verified unsigned`, tab separated.
+
+| state | means |
+| --- | --- |
+| `m` | the tag holds exactly the package bytes of the `ref.db` record, and the signature layer mirror-file makes for it |
+| `a` | every server answered 404: the file is absent upstream |
+
+`verified` is 1 when a batch that held the file passed verify. `unsigned` is 1 when the tag holds no signature, because upstream publishes none. For state `a`, both are 0.
+
+### Who writes it
+
+1. `scripts/plan` withdraws rows (step 6b). Before any shard starts, it pushes the index again without the `m` rows of the files it plans. The same `ref.db` and annotations stay, so oras uploads only the new `index.tsv`. The annotation `dev.pkgforge.mirror.withdrawn-by` is added, or replaced: it names this plan. Then plan reads the tag back. A push or a read back that fails puts the target in error. Only this step needs oras in plan, and `packages: write`.
+2. `scripts/index-write` writes the rows of the run, in the `summary` job of `sync-target.yml`. That job runs also after a failure or a cancel.
+3. Nothing else writes it. stage writes no index.
+
+index-write writes these rows:
+
+- each line of `PLAN/<target>/vouched.tsv`: the rows of the index that plan read, for the files it did not plan
+- each file of the run with the result `pushed` or `present`: state `m`, verified 0
+- each file of the run with the result `absent`: state `a`
+- a file with any other result gets no row
+
+Then it gives verify credit, only when the stage is `staged` and of this plan. Each verdict about the staged digest counts. A batch that passed gives its files verified 1, only when the plan knew the verify context of the run (`VERIFY_CONTEXT` is not empty). Otherwise each row keeps the flag it carries. A batch that failed removes the rows of its files at fault (`faults-<target>-<batch>.txt`, `scripts/verify-batch`). A failed batch that names no file at fault keeps its rows, with verified 0. The next run verifies them again.
+
+The rows pass their own check before the push: four fields, each in its grammar, a filename of the plan's records, and no filename twice.
+
+### What plan reads
+
+plan reads the index after it chooses the database (step 3b), as it reads `latest`: anonymously, then with the workflow's token. The package is private only when the anonymous read finds no tag and the read with the token is valid. An anonymous read with no answer that decides says nothing about the package. `INDEX_READ=0`, the `ignore_index` input of `sync.yml`, does not read the rows. It reads the manifest of the tag alone: `INDEX_DIGEST` is the digest of that manifest, or `INDEX_PRIOR` is `absent` when there is no tag. Both are empty when the read gets no answer that decides.
+
+| `INDEX_STATE` | when | then |
+| --- | --- | --- |
+| `ok` | the index reads and is valid | its rows count |
+| `absent` | the registry has no such tag | the run plans as with no index, and writes the first one |
+| `invalid` | another artifact type, a layer missing, another format, records of `ref.db` that fail their grammar, or more than 1 % of its lines bad | the rows do not count; the run writes a new index |
+| `unread` | no answer that decides: a transport error, an HTTP error, a blob that is not its digest, a `ref.db` with its digest that tar cannot read on this host, or `REGISTRY_READ_BUDGET` spent | a warning; the run plans as with no index, repairs no signature layer, and index-write writes none |
+| `ignored` | `INDEX_READ=0` | the run plans as with no index, and repairs no signature layer. Its index replaces the one plan saw. With no answer to plan's read of the manifest, index-write writes none, and a warning says so |
+
+A line that fails its grammar, or names a file that `ref.db` does not, is dropped. Both lines of a filename given twice are dropped. A `ref.db` whose digest is the digest of a database plan holds already is copied, not read.
+
+A file counts as indexed when the index has a row `m` for it, and the `ref.db` record has the same sha256 and `%PGPSIG%` as the chosen record. For each record, with P promoted, I indexed, A indexed as absent, V indexed and verified under this run's verify context, and again planned by step 4 or 4b:
+
+| set | files |
+| --- | --- |
+| todo, the files this run mirrors | not (P or I), or again, or (A and not P) |
+| new, the files this run verifies | (not P and not V), or again, or (A and not P); so every todo file is verified |
+| vouched, the rows index-write keeps | I and not again |
+
+A file absent upstream is tried again on each run until a promoted database names it. After that it is skipped, as a promoted file is.
+
+A target with no todo file and files to verify is pending with no shard (`pending.json`). It stages and verifies. Its why says `0 file(s) to mirror, N to verify`.
+
+### The verify context
+
+A verdict holds for the inputs it ran with. `scripts/lib.sh` `verify_context` is one sha256 over:
+
+- the line `index-format=1`
+- the `key = value` lines of the target file; a comment or a blank line does not count
+- the bytes of `scripts/verify-batch`, `client/pacman-oci` and `scripts/lib.sh`
+- the filename, sha256 and `%PGPSIG%` of each keyring package that verify installs: from the target's own records, or from the `latest` of `keyring_from`, or `none` when that target has no `latest`
+
+A row verified under another context is verified again. When the context is not known, because the `latest` of `keyring_from` did not read, no row counts as verified, and each row keeps its flag for the next run. A batch that passes in such a run gives no verified 1.
+
+### The guards
+
+⛔ The writer guard. Just before the push, index-write reads the live tag with the workflow's token. It pushes only when one of these is true:
+
+- the live manifest is the one plan read, or the one its withdrawal pushed, or with `ignored` the one plan saw (`INDEX_DIGEST`)
+- there is no live tag, and plan found none (`absent`, or `ignored` with `INDEX_PRIOR` `absent`)
+- the live index names this plan in `dev.pkgforge.mirror.plan-id`, and no other plan in `dev.pkgforge.mirror.withdrawn-by`: an earlier attempt of this run wrote it. Its rows marked verified keep verified 1.
+
+Anything else keeps the live tag, with a warning. A live read that fails keeps it too. A reset (`ignored`) whose read of the manifest got no answer writes nothing: the index it replaces is not known. A withdrawal keeps the plan id of the index it changes, so `withdrawn-by` tells a re-run of that plan that a newer plan changed it. The `sync` concurrency group lets no two runs write at once. So only a re-run of an older run can come between plan and index-write.
+
+⛔ The re-run guard. A re-run of a mirror job mirrors from an older plan, and a newer run can have written the index since. So a shard with `GITHUB_RUN_ATTEMPT` above 1 reads the live index once, before its first file (`scripts/lib.sh` `index_guard`). mirror-file writes no tag of a file that the index lists, and its result is `failed`, `the index lists it`. When the index does not read, mirror-file writes no tag in that shard. A tag that holds its file already still counts as `present`. Attempt 1 reads nothing. When plan read the index (`ok`), it withdrew the rows of every file it gave the shards.
+
+⛔ The repush rule. When plan did not read the index (`unread`, `ignored`), it withdrew no row. mirror-shard reads `INDEX_STATE` from the plan's `meta.env`, and mirror-file writes a repush only when it is `ok`, `absent` or `invalid`. Otherwise the result is `failed`, `a signature repair waits for a run that read the index`. A push goes only to an absent tag, which no valid row vouches for. So no tag that a valid row vouches for is written. The tag keeps the layer that its row vouches for. A later run plans the file again when step 4 or 4b of plan finds its new signature, or when its record changes. That run withdraws the row and repairs the layer, as for a promoted file.
+
+⛔ A run on a branch repairs no signature layer. `sync-target.yml` sets `MIRROR_REPAIR=1` on `main` only. With 0, a file whose tag holds the right package bytes and another signature layer is `failed`, `a signature repair is left to main`.
+
+### Registry sources
+
+mirror-file reads a file's package bytes from the registry before it asks upstream:
+
+1. on a repush, the target's own repository: its tag holds the package blob
+2. each sibling repository that plan names for the file in `PLAN/<target>/sources.tsv`, in that order
+3. the upstream servers, as before
+
+A sibling is an enabled target of `TARGETS_DIR` with a `db_server` of the same URL. It holds a file when its `latest` database or its index names the same filename and sha256. Today only the three `*-base-any` PowerPC targets share a `db_server`. plan reads the `latest` database of each sibling once per layer digest.
+
+`scripts/lib.sh` `registry_blob_probe` reads at most the record's size, within the deadline of an upstream package read, and checks the sha256.
+
+| answer | then |
+| --- | --- |
+| the bytes | they are pushed; the result says `from <registry>/<repository>` |
+| 404 (`BLOB_UNKNOWN`, `NAME_UNKNOWN`), or no anonymous token for the repository | the next source, with no warning |
+| 429 | the shard pauses (`throttle_pause`), then the next source |
+| anything else, other bytes too | the repository is marked down for the shard (`$WORK/down/r-<repository, each / a _>`), and no file of the shard asks it again |
+
+This saves the package bytes and the upstream request of each file that the registry holds. That is every signature repair on every target, and each file of a base-any target that a sibling holds, on a seed or after a hold. The `.sig` handling does not change. ⚠ The bytes are pushed again: there is no cross-repository mount.
+
+### One read per URL per plan
+
+plan keeps each upstream read that answers in `OUT/.fetch-cache`, for the rest of the plan, and removes it at the end. A `<repo>.files`, a `<repo>.db.sig` and a `<repo>.files.sig` are kept by URL and the sha256 of the chosen database. A package `.sig` of steps 4 and 4b is kept by URL. A `<repo>.db` is never kept. A read that is kept costs no request and no time of the share. So the three base-any targets read `base-any.files`, its signatures and the `.sig` files of steps 4 and 4b once per plan, not three times.
+
+### Budgets
+
+| bound | value | where |
+| --- | --- | --- |
+| `REGISTRY_READ_BUDGET` | 240 s for the registry reads of the whole plan: the index, the `latest` database of `keyring_from`, the siblings; each manifest, token or blob request of a read 60 s, or what is left, and 5 s more. The budget stops each new read; the read in progress can run past it by up to about 9 minutes (an index read: up to 9 requests) | `scripts/plan` |
+| `INDEX_RATE_WAIT` | 120 s of 429 pauses for one push of the index; at most 2 attempts, each within 120 s | `scripts/lib.sh` `index_push` |
+| the withdrawal's read back | 5 tries, 2 to 8 s apart | `scripts/plan` |
+| the re-run guard's read | 3 tries of the manifest, 3 tries of `index.tsv` within 60 s each | `scripts/lib.sh` `index_listed` |
+| index-write | `timeout 780`, in a step of 15 minutes, in the `summary` job of 25 minutes | `sync-target.yml` |
+
+### ⚠ Not done
+
+- A cross-repository blob mount for a sibling source.
+- Verify credit for the files of a failed batch that are not at fault. They are verified again in the next run.
+- A shard of a re-run that starts from the results of its earlier attempt.
+
 ## Jobs
 
 `.github/workflows/sync.yml` runs on the cron `17 */3 * * *` and on dispatch.
 
 | job | permissions | timeout (min) | does |
 | --- | --- | --- | --- |
-| `plan` | contents read, packages read | 30 | `scripts/plan` for every enabled target, or for the targets of the `targets` input, within `PLAN_BUDGET` (1200 s) of upstream reads; uploads `plan-<target>` for each pending target |
+| `plan` | contents read, packages write | 40 | `scripts/plan` for every enabled target, or for the targets of the `targets` input, within `PLAN_BUDGET` (1200 s) of upstream reads, with `REGISTRY_READ_BUDGET` (240 s) for its registry reads; withdraws index rows (packages write); uploads `plan-<target>` for each pending target |
 | `target` | contents read, packages write | (each called job has its own) | one call of `sync-target.yml` per pending target, at most `max_targets` (4) at once |
-| `report` | actions write, contents read, issues write | 10 | `scripts/report`; on `main` it starts `status.yml` |
+| `report` | actions write, contents read, issues write | 10 | `scripts/report`; on `main`, after a scheduled sync or a sync that promoted a target, it starts `status.yml` |
 | `keepalive` | actions write, contents read, issues write | 10 | `scripts/watch-schedules` (`keep-schedules-enabled`, `check-schedules-fired`, the issue `schedules-stopped`), and `dispatch-overdue status.yml 120` on `main` |
 
 `.github/workflows/sync-target.yml` is the chain of one target:
@@ -111,11 +259,11 @@ A database manifest:
 | `stage` | contents read, packages write | 20 | `scripts/stage` for the target |
 | `verify` | contents read | 95 (step 85) | `scripts/verify-batch` per batch, at most `max_batches` (3) at once |
 | `promote` | contents read, packages write | 15 | `scripts/promote`, on `main` only |
-| `summary` | contents read | 10 | `scripts/report collect`: a small `summary-<target>` artifact for the report |
+| `summary` | contents read, packages write | 25 (index step 15) | `scripts/report collect`: a small `summary-<target>` artifact for the report; then `scripts/index-write`: the index of the target. It runs also after a failure or a cancel. An index that is not written is a warning. |
 
 All runs share one concurrency group, `sync`, on every ref. Two runs never write the same tags at once.
 
-The dispatch inputs are `targets`, `max_targets` (4), `max_shards` (3), `max_batches` (3), `parallel` (6 files at once in a shard), `debloat` (`auto`, `always`, `never`) and `allow_older`.
+The dispatch inputs are `targets`, `max_targets` (4), `max_shards` (3), `max_batches` (3), `parallel` (6 files at once in a shard), `debloat` (`auto`, `always`, `never`), `allow_older` and `ignore_index` (do not read the index; [operations.md](operations.md#the-index-of-a-ref)).
 
 A dispatch input reaches an expression as a string. `max-parallel` and a number input of a called workflow refuse a string. So `sync.yml` passes each number input through `fromJSON(format('{0}', x))`, which gives a number from a string or a number. `sync-target.yml` passes its two `max-parallel` values the same way.
 
@@ -131,11 +279,11 @@ plan gives each target shards of its own. The count is k = the larger of ceil(by
 
 ⚠ GHCR allows one token 2000 requests a minute, and every push of every job shares the workflow token. That limit, not the parallelism, bounds a seed: about 200 files a minute ([measurements.md](measurements.md#ghcr)).
 
-plan writes `OUT/targets.json` for the pending targets with files to mirror, and `OUT/pending.json` for pending targets with no file to mirror. A database that only drops packages is such a target. It still stages and verifies.
+plan writes `OUT/targets.json` for the pending targets with files to mirror, and `OUT/pending.json` for pending targets with no file to mirror. A database that only drops packages is such a target. So is a database whose new files the index names. It still stages and verifies.
 
 ### Batches
 
-stage splits the files new since the promoted database into verify batches. The count is the larger of ceil(bytes / `VERIFY_BATCH_BYTES`) and ceil(files / `VERIFY_BATCH_FILES`). When that is more than `VERIFY_MAX_BATCHES`, both limits grow until it is not, and the log says so.
+stage splits the files of `PLAN/<target>/new.tsv` into verify batches, less the files absent upstream. These are the files new since the promoted database that the index does not name as verified under this run's verify context. The count is the larger of ceil(bytes / `VERIFY_BATCH_BYTES`) and ceil(files / `VERIFY_BATCH_FILES`). When that is more than `VERIFY_MAX_BATCHES`, both limits grow until it is not, and the log says so.
 
 | variable | default |
 | --- | --- |
@@ -143,7 +291,7 @@ stage splits the files new since the promoted database into verify batches. The 
 | `VERIFY_BATCH_FILES` | 400 |
 | `VERIFY_MAX_BATCHES` | 40, per target |
 
-Batch 0 also holds the canaries: the smallest package, and each keyring package that the target's own database holds. So a run with nothing new still proves the path a consumer takes.
+Batch 0 also holds the canaries: the smallest package whose tag holds its bytes (of the 10 smallest), and each keyring package that the target's own database holds. So a run with nothing new still proves the path a consumer takes. When there is no canary and nothing to verify, stage makes no batch, and the target is held: `nothing to verify, and no canary tag reads`.
 
 ### Disk
 
@@ -279,12 +427,14 @@ Two upstream databases hold a `desc` member that is all NUL bytes: a GNU sparse 
 
 `OUT/verify-<target>-<batch>.tsv` holds `target batch result detail digest`. The result is `passed` or `failed`. The digest is the staged manifest the verdict is about. promote counts a batch with no verdict, or a verdict about another digest, as failed. The EXIT trap writes the verdict and the packages at fault so far, also when the step is killed. When the container ends with status 124 or 137, the verdict says that the script's own budget ran out.
 
+With each failed verdict, verify writes `OUT/faults-<target>-<batch>.txt`: the files at fault, one per line, sorted. These are the file of each `@@sigbad` line and of each package of a `@@refused` line, less the upstream-refused files. A failure that names no file gives an empty list. index-write removes the index rows of these files.
+
 ## Running outside GitHub Actions
 
 The scripts take the registry from `MIRROR_REGISTRY`, `MIRROR_NAMESPACE`, `REGISTRY_USER` and `REGISTRY_TOKEN`, and the targets from `TARGETS_DIR`. So another host can ingest a source that runners cannot read.
 
 - `sync.yml` must create each GHCR repository first, with the workflow token. That links the package to this repository. A package first pushed from outside is not linked, and the workflow token can never write to it.
 - ⚠ An outside host must not use a maintainer's token. GHCR accepts only classic tokens, which can write every package of their owner. Use a dedicated account with write access to these packages only.
-- Each script that pushes (`mirror-shard`, `stage`, `promote`) logs in with `--password-stdin`. The registry configuration is in its own temporary directory, which the script removes on exit.
+- Each script that pushes (`plan` for a withdrawal, `mirror-shard`, `stage`, `promote`, `index-write`) logs in with `--password-stdin`. The registry configuration is in its own temporary directory, which the script removes on exit.
 - ⚠ `scripts/debloat-runner` runs only on a GitHub-hosted Linux runner, and fails elsewhere. Set `DEBLOAT=never` on another host. `PARALLEL` is 4 there by default, not 6.
 - A push must stay inside GHCR's 10-minute upload limit. The largest file of a target sets the lowest upload rate it can use.

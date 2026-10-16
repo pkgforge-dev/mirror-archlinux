@@ -32,7 +32,39 @@
 # or an older snapshot may name the bytes a tag holds, and a consumer handed new
 # bytes under an old name gets a file pacman refuses, with no other Server
 # tried. A signature that is missing or wrong next to the right package bytes is
-# repaired, by pushing again with the same package blob.
+# repaired, by pushing again with the same package blob (a repush).
+#
+# ⛔ A push or a repush writes a tag. Three rules come first:
+#   MIRROR_REPAIR=0 (a run on a branch): no repush. The result is failed "a
+#     signature repair is left to main". Unset is 1.
+#   INDEX_STATE (scripts/mirror-shard, from the plan's meta.env) not ok,
+#     absent or invalid: no repush. With unread or ignored, plan withdrew no
+#     index row, and a valid row can vouch for the tag. The result is failed
+#     "a signature repair waits for a run that read the index". Unset is
+#     unknown. A push goes only to an absent tag, which no valid row vouches
+#     for.
+#   GITHUB_RUN_ATTEMPT above 1 (a re-run): no tag of a file that
+#     $WORK/index-listed.txt lists (scripts/mirror-shard). A newer run can
+#     vouch for that tag in the index. The result is failed "the index lists
+#     it". With no such list, the live index did not read, and the result of
+#     each push or repush is failed "the live index did not read".
+#
+# The package bytes come from the registry first, in this order:
+#   1. on a repush, the target's own repository: its tag holds the blob
+#   2. each sibling repository that scripts/plan names for the file in
+#      PLAN/<target>/sources.tsv (the shard is PLAN/<target>/shards/<n>.tsv)
+#   3. the upstream servers, as below
+# Each registry read is lib.sh registry_blob_probe: CSIZE bytes at most, and
+# the sha256 is checked. A 404 says that the repository does not hold the
+# blob: the next source is asked, with no warning. A 429 pauses the shard
+# (lib.sh throttle_pause), then the next source is asked. Any other answer,
+# other bytes too, marks the repository down for the shard
+# ($WORK/down/r-<repository, each / a _>), and no file of the shard asks it
+# again. When a registry source gave no answer that decides, a file that
+# every server answers 404 for is failed, not absent: the source is known to
+# hold the bytes (plan named the sibling; on a repush, decide_push matched the
+# package blob of the own repository). The target is held, and the next run
+# tries again.
 #
 # ⭐ The signature layer is the database's own %PGPSIG%, decoded, whenever the
 # database carries one: pacman checks against that copy, and asks for the .sig
@@ -48,7 +80,8 @@
 # The package file comes from the servers in an order rotated by shard, so
 # shards spread across mirrors. A server that fails (lib.sh down_mark) is
 # asked last by every file of the shard after it. A .sig read ends within
-# 30 s, and a package download within 120 s plus the time at 64 KiB/s.
+# 30 s, and a package download, or a registry read of it, within 120 s plus
+# the time at 64 KiB/s.
 #
 # ⭐ The manifest is the same bytes whoever pushes it: its created annotation is
 # the package's %BUILDDATE%, and no annotation names the server the bytes came
@@ -61,6 +94,8 @@
 # GHCR's limit for one upload. MIRROR_RATE_WAIT (seconds; default 1800) bounds
 # the pauses one file takes after a 429 from the registry (below), each of
 # RATE_PAUSE_MIN to RATE_PAUSE_MAX seconds (20 to 60; lib.sh throttle_pause).
+# MIRROR_REPAIR (0 or 1; default 1), INDEX_STATE (default unknown) and
+# GITHUB_RUN_ATTEMPT (default 1), above.
 #
 # Exit status: 0 pushed, present or absent, 1 anything else.
 set -euo pipefail
@@ -76,6 +111,20 @@ case "$line" in
 esac
 : "${RESULTS:?}" "${WORK:?}" "${ORAS:?}" "${ORAS_CONFIG:?}"
 MIN_RATE="${MIRROR_MIN_RATE:-2097152}"
+RATE_WAIT="${MIRROR_RATE_WAIT:-1800}"
+REPAIR="${MIRROR_REPAIR:-1}"
+case "$REPAIR" in
+  0 | 1) ;;
+  *) die "MIRROR_REPAIR must be 0 or 1, not '$REPAIR'" ;;
+esac
+RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT:-1}"
+case "$RUN_ATTEMPT" in
+  '' | *[!0-9]* | 0) die "GITHUB_RUN_ATTEMPT must be a positive integer, not '$RUN_ATTEMPT'" ;;
+esac
+PLAN_INDEX_STATE="${INDEX_STATE:-unknown}"
+if [[ ! "$PLAN_INDEX_STATE" =~ ^[a-z]+$ ]]; then
+  PLAN_INDEX_STATE=unknown
+fi
 
 started="$(date -u +%s)"
 result_file="$RESULTS/$line.tsv"
@@ -248,15 +297,105 @@ case "$decision" in
 esac
 
 #---------------------------------------------------------------------------#
-# Download, in the shard's order, a server that failed last. A server that
-# answers 200 with other bytes is behind, not down: it is not marked.
+# ⛔ The decision is push or repush: a tag is written. A run on a branch
+# repairs no signature layer, a run whose plan did not read the index repairs
+# none either, and a re-run writes no tag that the live index can vouch for.
+#---------------------------------------------------------------------------#
+if [ "$decision" = repush ] && [ "$REPAIR" = 0 ]; then
+  result failed "a signature repair is left to main; $ref holds these package bytes with other layers than the database gives (MIRROR_REPAIR=0)"
+  exit 1
+fi
+if [ "$decision" = repush ]; then
+  case "$PLAN_INDEX_STATE" in
+    ok | absent | invalid) ;;
+    *)
+      result failed "a signature repair waits for a run that read the index (INDEX_STATE $PLAN_INDEX_STATE); $ref holds these package bytes with other layers than the database gives"
+      exit 1
+      ;;
+  esac
+fi
+if [ "$RUN_ATTEMPT" -gt 1 ]; then
+  if [ ! -f "$WORK/index-listed.txt" ]; then
+    why="$WORK/index-listed.txt does not exist"
+    if [ -s "$WORK/index-unread" ]; then
+      why="$(sed -n 1p "$WORK/index-unread")"
+    fi
+    result failed "the live index did not read; attempt $RUN_ATTEMPT of this run writes no tag ($why)"
+    exit 1
+  fi
+  # A plain assignment: a list that does not read ends the item (set -e).
+  listed="$(awk -v f="$file" '$0 == f { n++ } END { print n + 0 }' "$WORK/index-listed.txt")"
+  if [ "$listed" -gt 0 ]; then
+    result failed "the index lists it; a newer run vouches for this tag, and attempt $RUN_ATTEMPT of this run does not write it"
+    exit 1
+  fi
+fi
+
+#---------------------------------------------------------------------------#
+# The registry first: on a repush the target's own repository, which holds
+# the package blob (decide_push matched its digest), then the siblings that
+# plan names for this file. A repository marked down is not asked. A read
+# waits for a pause of the shard first, as a push does.
 #---------------------------------------------------------------------------#
 got_from=""
+reg_undecided=""
+reg_sources=()
+if [ "$decision" = repush ]; then
+  reg_sources+=("$repo_path")
+fi
+hints="$(dirname "$shard")/../sources.tsv"
+if [ -f "$hints" ]; then
+  mapfile -t hinted < <(awk -F '\t' -v f="$file" 'NF == 2 && $1 == f { print $2 }' "$hints")
+  for r in "${hinted[@]}"; do
+    if [[ ! "$r" =~ ^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)+$ ]]; then
+      warn "$hints names '$r' for $file, which is not a repository path; it is not asked"
+      continue
+    fi
+    in_list "$r" "${reg_sources[@]}" || reg_sources+=("$r")
+  done
+fi
+for r in "${reg_sources[@]}"; do
+  reg_down="$down_dir/r-$(printf '%s' "$r" | tr '/' '_')"
+  if [ -e "$reg_down" ]; then
+    reg_undecided="$reg_undecided; $MIRROR_REGISTRY/$r is down for this shard"
+    continue
+  fi
+  throttle_wait "$WORK"
+  rc=0
+  registry_blob_probe "$r" "sha256:$sha256" "$dir/$file" "$((120 + csize / 65536))" "$csize" || rc=$?
+  case "$rc" in
+    0)
+      got_from="$MIRROR_REGISTRY/$r"
+      break
+      ;;
+    4) ;;
+    5)
+      reg_undecided="$reg_undecided; $MIRROR_REGISTRY/$r limits requests (429)"
+      if ! throttle_pause "$WORK" "$RATE_WAIT" "$file: a read of $MIRROR_REGISTRY/$r; every push and registry read of the shard waits"; then
+        reg_undecided="$reg_undecided, and the pauses reached MIRROR_RATE_WAIT"
+      fi
+      ;;
+    *)
+      reg_undecided="$reg_undecided; no answer that decides from $MIRROR_REGISTRY/$r (status $rc)"
+      log "$MIRROR_REGISTRY/$r failed for $file (status $rc); no file of this shard asks it again"
+      mkdir -p -- "$down_dir"
+      : > "$reg_down"
+      ;;
+  esac
+done
+
+#---------------------------------------------------------------------------#
+# Download, in the shard's order, a server that failed last. A server that
+# answers 200 with other bytes is behind, not down: it is not marked. Not
+# done when the registry gave the bytes.
+#---------------------------------------------------------------------------#
 dl_absent=0
 dl_error=0
 dl_other=0
 dl_order=()
-mapfile -t dl_order < <(down_last "$down_dir" "${order[@]}")
+if [ -z "$got_from" ]; then
+  mapfile -t dl_order < <(down_last "$down_dir" "${order[@]}")
+fi
 for server in "${dl_order[@]}"; do
   rc=0
   fetch_upstream "$server/$file" "$dir/$file" "$((120 + csize / 65536))" || rc=$?
@@ -284,16 +423,19 @@ for server in "${dl_order[@]}"; do
 done
 if [ -z "$got_from" ]; then
   # Every server answered 404, and none erred or offered other bytes: the file
-  # is gone from upstream though its database still names it. Skip it rather than
-  # fail, so one stale upstream entry cannot hold the whole target; the mirror
-  # then reflects upstream, where this file is a 404 too, and plan lists it again
-  # so it is picked up if it returns. An error (a server down) or other bytes
-  # (a build in flight) is still a failure, retried next run.
-  if [ "$dl_error" -eq 0 ] && [ "$dl_other" -eq 0 ] && [ "$dl_absent" -gt 0 ]; then
+  # is gone from upstream though its database still names it. Skip it rather
+  # than fail, so one stale upstream entry cannot hold the whole target; the
+  # mirror then reflects upstream, where this file is a 404 too. plan plans it
+  # again until a promoted database names it, so it is picked up if it
+  # returns. An error (a server down) or other bytes (a build in flight) is
+  # still a failure, retried next run. So is a registry source that gave no
+  # answer that decides: it is known to hold the bytes, so its error is not an
+  # absence.
+  if [ "$dl_error" -eq 0 ] && [ "$dl_other" -eq 0 ] && [ "$dl_absent" -gt 0 ] && [ -z "$reg_undecided" ]; then
     result absent "every server answers 404 for it ($dl_absent of $n); upstream's database names it but no longer serves the file"
     exit 0
   fi
-  result failed "no server answered with these bytes (tried $n); a file upstream superseded during the run clears on the next run's plan"
+  result failed "no server answered with these bytes (tried $n${reg_undecided:+; ${reg_undecided#; }}); a file upstream superseded during the run clears on the next run's plan"
   exit 1
 fi
 
@@ -334,8 +476,8 @@ push_started="$(date -u +%s)"
 # A 429 costs no attempt (lib.sh rate_limited, throttle_pause). The first push
 # of the shard that meets one writes $WORK/throttle, the time its pause ends,
 # and every push of the shard waits for that time first. The pauses of one
-# file may add up to MIRROR_RATE_WAIT seconds (default 1800).
-RATE_WAIT="${MIRROR_RATE_WAIT:-1800}"
+# file, those of its registry reads too, may add up to MIRROR_RATE_WAIT
+# seconds (default 1800).
 attempt=0
 while :; do
   throttle_wait "$WORK"

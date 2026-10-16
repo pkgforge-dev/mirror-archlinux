@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+#
+# Start a sync of each target whose upstream database changed since the last
+# tick. .github/workflows/upstream-watch.yml runs this every 15 minutes.
+#
+#   scripts/upstream-watch STATE_IN STATE_OUT OUT
+#
+# STATE_IN is the state that the last tick wrote. It may be missing: then
+# every URL is new, and no sync starts. STATE_OUT gets the state for the next
+# tick, and may be the same path as STATE_IN. OUT gets:
+#   changed.txt  the changed targets, one per line
+#   urls.tsv     URL<TAB>result for each URL: same, changed, new, or
+#                no answer: <why>
+#
+# Each enabled target in TARGETS_DIR is watched, except a target whose name
+# starts with powerpc: its upstream needs a browser-profile client
+# (docs/operations.md, The fetchers), and this script uses curl. Each
+# distinct URL <db_server>/<repo>.db gets one HEAD request per tick. The last
+# answer after the redirects gives ETag, Last-Modified and Content-Length. An
+# answer is a 200 that gives one of the three at least.
+#
+# The state has one record per line, with tab separated fields:
+#   u URL ETAG LAST_MODIFIED CONTENT_LENGTH   the answer kept for a URL
+#   t TARGET EPOCH                            when this script last started a
+#                                             sync of the target
+#
+# A URL changed when it has a u line, and a field of its answer differs. A URL
+# with no answer keeps its u line and changes nothing. A URL with no u line
+# gets one and changes nothing. A target changed when one of its URLs changed,
+# and its last sync from here started SYNC_MIN_INTERVAL minutes ago or more.
+#
+# ⛔ The changed targets go to scripts/dispatch-sync in one call, so they share
+# one run. Only when it exits 0 do their URLs keep the new answers, and their
+# t lines the time now. Otherwise each changed URL keeps its old u line, and
+# the next tick sees the change again. A changed URL of a target that waits for
+# SYNC_MIN_INTERVAL keeps its old u line too.
+#
+# ⛔ The HEAD requests end within WATCH_BUDGET seconds. Each request gets 30 s,
+# or what is left of the budget when that is less. A URL that is not read when
+# the budget is spent has no answer. A host that curl cannot reach is not asked
+# again in the tick. dispatch-sync runs under timeout -k 10 120.
+#
+# Environment:
+#   SYNC_MIN_INTERVAL  minutes from one sync this script starts for a target
+#                      to the next (default 60)
+#   WATCH_BUDGET       seconds for the HEAD requests (default 300)
+#   WATCH_DRY_RUN      1: log the changed targets and start nothing; their
+#                      URLs keep the old u lines (default 0)
+#   TARGETS_DIR and UPSTREAM_PROTO (scripts/lib.sh); GH_TOKEN and
+#   GITHUB_REPOSITORY (scripts/dispatch-sync); MIRROR_NOW (seconds) pins the
+#   clock, for the test suite only
+#
+# Exit status: 0 the tick ran, with a sync started or not; 1 the tick could
+# not run, or dispatch-sync could not tell or could not start the sync.
+set -euo pipefail
+SCRIPT_NAME="upstream-watch"
+# shellcheck source=lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+need curl awk sort timeout
+
+[ "$#" -eq 3 ] || die "usage: scripts/upstream-watch STATE_IN STATE_OUT OUT"
+state_in="$1"
+state_out="$2"
+out="$3"
+SYNC_MIN_INTERVAL="${SYNC_MIN_INTERVAL:-60}"
+WATCH_BUDGET="${WATCH_BUDGET:-300}"
+WATCH_DRY_RUN="${WATCH_DRY_RUN:-0}"
+[[ "$SYNC_MIN_INTERVAL" =~ ^[0-9]+$ ]] || die "SYNC_MIN_INTERVAL must be a whole number of minutes, not '$SYNC_MIN_INTERVAL'"
+[[ "$WATCH_BUDGET" =~ ^[1-9][0-9]*$ ]] || die "WATCH_BUDGET must be a positive whole number of seconds, not '$WATCH_BUDGET'"
+case "$WATCH_DRY_RUN" in
+  0 | 1) ;;
+  *) die "WATCH_DRY_RUN must be 0 or 1, not '$WATCH_DRY_RUN'" ;;
+esac
+
+# The deadline of one HEAD request when the budget allows it.
+HEAD_MAX_TIME=30
+deadline=$((SECONDS + WATCH_BUDGET))
+now="$(now_epoch)"
+[[ "$now" =~ ^[0-9]+$ ]] || die "the clock reads '$now', not seconds"
+ua="mirror-archlinux-watch (+https://github.com/${GITHUB_REPOSITORY:-pkgforge-dev/mirror-archlinux})"
+mkdir -p "$out"
+: > "$out/changed.txt"
+: > "$out/urls.tsv"
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+#---------------------------------------------------------------------------#
+# What to watch: watch.tsv, target<TAB>URL, one line per db_server
+#---------------------------------------------------------------------------#
+: > "$work/watch.tsv"
+for conf in "$TARGETS_DIR"/*.conf; do
+  [ -e "$conf" ] || continue
+  target_enabled "$conf" || continue
+  name="$(basename "$conf" .conf)"
+  case "$name" in
+    powerpc*) continue ;;
+  esac
+  target_check "$conf"
+  repo="$(target_get "$conf" repo)"
+  target_all "$conf" db_server > "$work/servers.txt"
+  while IFS= read -r server; do
+    [[ "$server" =~ ^https?://[^[:space:]]+$ ]] || die "$conf: db_server '$server' is not an http or https URL with no space"
+    printf '%s\t%s/%s.db\n' "$name" "$server" "$repo" >> "$work/watch.tsv"
+  done < "$work/servers.txt"
+done
+[ -s "$work/watch.tsv" ] || die "no target to watch in $TARGETS_DIR" "reproduce: ls $TARGETS_DIR"
+awk -F '\t' '!seen[$2]++ { print $2 }' "$work/watch.tsv" > "$work/urls.txt"
+
+#---------------------------------------------------------------------------#
+# The last tick's state: prior-u.tsv URL<TAB>ETAG<TAB>LM<TAB>CL, and
+# prior-t.tsv TARGET<TAB>EPOCH. A line that is not a state line is left out.
+#---------------------------------------------------------------------------#
+: > "$work/prior-u.tsv"
+: > "$work/prior-t.tsv"
+if [ -f "$state_in" ]; then
+  bad="$(awk -F '\t' -v uf="$work/prior-u.tsv" -v tf="$work/prior-t.tsv" '
+    { sub(/\r$/, "") }
+    $1 == "u" && NF == 5 && $2 ~ /^https?:\/\/[^[:space:]]+$/ && $5 ~ /^[0-9]*$/ {
+      if (!(("u" SUBSEP $2) in seen)) print $2 "\t" $3 "\t" $4 "\t" $5 > uf
+      seen["u", $2] = 1
+      next
+    }
+    $1 == "t" && NF == 3 && $2 ~ /^[a-z0-9_.-]+$/ && $3 ~ /^[0-9]+$/ {
+      if (!(("t" SUBSEP $2) in seen)) print $2 "\t" $3 > tf
+      seen["t", $2] = 1
+      next
+    }
+    { n++ }
+    END { print n + 0 }
+  ' "$state_in")"
+  if [ "$bad" -gt 0 ]; then
+    warn "$bad line(s) of $state_in are not state lines; they are left out" \
+      "reproduce: awk -F '\\t' '!((\$1 == \"u\" && NF == 5) || (\$1 == \"t\" && NF == 3))' $state_in"
+  fi
+else
+  log "$state_in does not exist: every URL is new, and no sync starts this tick"
+fi
+
+#---------------------------------------------------------------------------#
+# One HEAD request per URL, within WATCH_BUDGET. now.tsv gets
+# URL<TAB>ETAG<TAB>LM<TAB>CL for each URL that answered, noanswer.tsv
+# URL<TAB>why for each other URL. A host that curl could not reach is not
+# asked again in this tick (lib.sh down_mark), so a host that stalls costs one
+# deadline per tick, not one per URL.
+#---------------------------------------------------------------------------#
+: > "$work/now.tsv"
+: > "$work/noanswer.tsv"
+cut=0
+while IFS= read -r url; do
+  left=$((deadline - SECONDS))
+  if [ "$left" -lt 1 ]; then
+    cut=1
+    printf '%s\tnot read: WATCH_BUDGET (%ss) is spent\n' "$url" "$WATCH_BUDGET" >> "$work/noanswer.tsv"
+    continue
+  fi
+  if [ -e "$work/down/$(down_key "$url")" ]; then
+    printf '%s\tnot asked: its host failed earlier in this tick\n' "$url" >> "$work/noanswer.tsv"
+    continue
+  fi
+  t="$HEAD_MAX_TIME"
+  if [ "$left" -lt "$t" ]; then
+    t="$left"
+  fi
+  : > "$work/h"
+  rc=0
+  code="$(curl -q --head --location --silent --show-error --max-redirs 5 \
+    --proto "$UPSTREAM_PROTO" --proto-redir "$UPSTREAM_PROTO" \
+    --connect-timeout 10 --max-time "$t" --user-agent "$ua" \
+    --dump-header "$work/h" --output /dev/null --write-out '%{http_code}' "$url")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    why="curl $rc"
+    if [ "$rc" -eq 28 ]; then
+      why="curl 28: a deadline passed (10s to connect, ${t}s in all)"
+      if [ "$t" -lt "$HEAD_MAX_TIME" ]; then
+        cut=1
+      fi
+    fi
+    down_mark "$work/down" "$url"
+    printf '%s\t%s\n' "$url" "$why" >> "$work/noanswer.tsv"
+    continue
+  fi
+  if [ "$code" != 200 ]; then
+    printf '%s\tHTTP %s\n' "$url" "${code:-000}" >> "$work/noanswer.tsv"
+    continue
+  fi
+  # The dump holds one block per answer, each after its status line. The
+  # fields of the last block count.
+  fields="$(awk '
+    { sub(/\r$/, "") }
+    /^HTTP\// { e = ""; l = ""; c = ""; next }
+    {
+      i = index($0, ":")
+      if (i == 0) next
+      k = tolower(substr($0, 1, i - 1))
+      v = substr($0, i + 1)
+      gsub(/\t/, " ", v)
+      sub(/^ +/, "", v)
+      sub(/ +$/, "", v)
+      if (k == "etag") e = v
+      else if (k == "last-modified") l = v
+      else if (k == "content-length") c = v
+    }
+    END {
+      if (c !~ /^[0-9]+$/) c = ""
+      printf "%s\t%s\t%s\n", e, l, c
+    }
+  ' "$work/h")"
+  if [ "$fields" = $'\t\t' ]; then
+    printf '%s\tHTTP 200 with no ETag, Last-Modified or Content-Length\n' "$url" >> "$work/noanswer.tsv"
+    continue
+  fi
+  printf '%s\t%s\n' "$url" "$fields" >> "$work/now.tsv"
+done < "$work/urls.txt"
+
+#---------------------------------------------------------------------------#
+# Compare: urls.tsv URL<TAB>result, in the order of urls.txt
+#---------------------------------------------------------------------------#
+awk -F '\t' -v OFS='\t' '
+  FILENAME == ARGV[1] { prior[$1] = $2 OFS $3 OFS $4; next }
+  FILENAME == ARGV[2] {
+    v = $2 OFS $3 OFS $4
+    if (!($1 in prior)) r[$1] = "new"
+    else if (prior[$1] == v) r[$1] = "same"
+    else r[$1] = "changed"
+    next
+  }
+  FILENAME == ARGV[3] { r[$1] = "no answer: " $2; next }
+  { print $1, r[$1] }
+' "$work/prior-u.tsv" "$work/now.tsv" "$work/noanswer.tsv" "$work/urls.txt" > "$out/urls.tsv"
+
+while IFS=$'\t' read -r url result; do
+  if [ "$result" != same ]; then
+    log "$url: $result"
+  fi
+done < "$out/urls.tsv"
+counts="$(awk -F '\t' '
+  { n++ }
+  $2 == "same" { s++ }
+  $2 == "changed" { c++ }
+  $2 == "new" { w++ }
+  $2 ~ /^no answer/ { x++ }
+  END { printf "%d URL(s): %d the same, %d changed, %d new, %d with no answer", n, s, c, w, x }
+' "$out/urls.tsv")"
+log "$counts"
+if [ "$cut" -eq 1 ]; then
+  warn "WATCH_BUDGET (${WATCH_BUDGET}s) was spent before every URL had its answer; those URLs keep their state lines" \
+    "reproduce: scripts/upstream-watch STATE STATE OUT, and read the 'no answer' lines of OUT/urls.tsv"
+fi
+# A target with no URL that answered is not watched in this tick.
+awk -F '\t' '
+  FILENAME == ARGV[1] { ok[$1] = ($2 !~ /^no answer/); next }
+  { any[$1] += ok[$2] }
+  END { for (t in any) if (any[t] == 0) print t }
+' "$out/urls.tsv" "$work/watch.tsv" | LC_ALL=C sort > "$work/blind.txt"
+while IFS= read -r t; do
+  warn "$t: no db_server answered, so this tick cannot see a change; the 3 h schedule of sync.yml still syncs it" \
+    "reproduce: curl -sSI <db_server>/<repo>.db for each db_server of targets/$t.conf"
+done < "$work/blind.txt"
+
+#---------------------------------------------------------------------------#
+# The changed targets, then the start
+#---------------------------------------------------------------------------#
+awk -F '\t' '
+  FILENAME == ARGV[1] { if ($2 == "changed") ch[$1] = 1; next }
+  ($2 in ch) && !seen[$1]++ { print $1 }
+' "$out/urls.tsv" "$work/watch.tsv" > "$work/touched.txt"
+while IFS= read -r t; do
+  last="$(awk -F '\t' -v t="$t" '$1 == t { e = $2 } END { print e }' "$work/prior-t.tsv")"
+  if [ -n "$last" ] && [ "$last" -le "$now" ] && [ $((now - last)) -lt $((SYNC_MIN_INTERVAL * 60)) ]; then
+    log "$t: its database changed; its last sync from here started $(((now - last) / 60)) min ago, under SYNC_MIN_INTERVAL ($SYNC_MIN_INTERVAL min), so it waits"
+    continue
+  fi
+  printf '%s\n' "$t" >> "$out/changed.txt"
+done < "$work/touched.txt"
+
+drc=0
+: > "$work/started.txt"
+if [ -s "$out/changed.txt" ]; then
+  mapfile -t changed < "$out/changed.txt"
+  if [ "$WATCH_DRY_RUN" = 1 ]; then
+    log "dry run: a sync of ${changed[*]} would start; nothing starts, and their URLs keep the old lines"
+  else
+    timeout -k 10 120 "$REPO_ROOT/scripts/dispatch-sync" "${changed[@]}" || drc=$?
+    case "$drc" in
+      0) cp "$out/changed.txt" "$work/started.txt" ;;
+      2) log "dispatch-sync started nothing (exit 2); the next tick sees the change again" ;;
+      *)
+        warn "dispatch-sync could not start a sync of ${changed[*]} (exit $drc); the next tick sees the change again" \
+          "reproduce: GH_TOKEN=... GITHUB_REPOSITORY=... scripts/dispatch-sync ${changed[*]}"
+        ;;
+    esac
+  fi
+else
+  log "no target changed"
+fi
+
+#---------------------------------------------------------------------------#
+# The state for the next tick. A URL keeps its new answer when it did not
+# change, or when every target that names it started a sync now. Else it keeps
+# its old line, when it has one.
+#---------------------------------------------------------------------------#
+awk -F '\t' -v OFS='\t' -v now="$now" '
+  FILENAME == ARGV[1] { started[$1] = 1; next }
+  FILENAME == ARGV[2] { if (!($1 in started)) held[$2] = 1; tg[$1] = 1; next }
+  FILENAME == ARGV[3] { prior[$1] = $2 OFS $3 OFS $4; next }
+  FILENAME == ARGV[4] { cur[$1] = $2 OFS $3 OFS $4; next }
+  FILENAME == ARGV[5] { res[$1] = $2; next }
+  FILENAME == ARGV[6] { last[$1] = $2; next }
+  {
+    u = $1
+    if ((u in cur) && (res[u] != "changed" || !(u in held))) print "u", u, cur[u]
+    else if (u in prior) print "u", u, prior[u]
+  }
+  END {
+    for (t in tg) {
+      if (t in started) print "t", t, now
+      else if (t in last) print "t", t, last[t]
+    }
+  }
+' "$work/started.txt" "$work/watch.tsv" "$work/prior-u.tsv" "$work/now.tsv" "$out/urls.tsv" "$work/prior-t.tsv" \
+  "$work/urls.txt" | LC_ALL=C sort > "$work/state.tsv"
+mkdir -p "$(dirname "$state_out")"
+cp "$work/state.tsv" "$state_out.tmp"
+mv -f "$state_out.tmp" "$state_out"
+
+case "$drc" in
+  0 | 2) exit 0 ;;
+  *) exit 1 ;;
+esac
