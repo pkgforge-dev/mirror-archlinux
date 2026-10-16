@@ -12,7 +12,8 @@
 #   watch-schedules      schedules-stopped when a schedule stopped firing or a
 #                        workflow was disabled by hand; cleared when all fire
 #   report               refused-<target> when more files than
-#                        REFUSED_ISSUE_MIN are upstream-refused
+#                        REFUSED_ISSUE_MIN are upstream-refused; and the
+#                        promoted count it gives to GITHUB_OUTPUT
 set -euo pipefail
 # shellcheck source=../lib/harness.sh
 . "$REPO_ROOT/tests/lib/harness.sh"
@@ -254,13 +255,17 @@ report_run() {
     printf 'pkg%s-1-1-aarch64.pkg.tar.xz\tsig-refused\terror: pkg%s: signature from "Arch Linux ARM" is invalid\n' "$i" "$i"
   done >> "$r/sum/aarch64-core/refused.tsv"
   rc=0
-  TRACK_ISSUES=1 run_script env -u GITHUB_STEP_SUMMARY bash "$REPO_ROOT/scripts/report" "$r/plan" "$r/sum" || rc=$?
+  : > "$r/github-output"
+  GITHUB_OUTPUT="$r/github-output" TRACK_ISSUES=1 run_script env -u GITHUB_STEP_SUMMARY bash "$REPO_ROOT/scripts/report" "$r/plan" "$r/sum" || rc=$?
+  github_output="$(cat "$r/github-output")"
 }
 RR="PATH=<fake-gh>:\$PATH FAKE_GH_DIR=DIR TRACK_ISSUES=1 scripts/report PLAN SUMMARIES"
 
 report_run many promoted 20
 check "report: 20 upstream-refused files of a promoted target raise refused-<target>; the run stays green" \
   "0 open refused-aarch64-core" "$rc $(events)" "$RR; $(tail -n 3 "$work/out" | tr '\n' ' ')"
+check "report: a promoted target gives promoted=1 to GITHUB_OUTPUT, for the status kick of sync.yml" \
+  "promoted=1" "$github_output" "GITHUB_OUTPUT=FILE $RR; cat FILE"
 if grep -q 'pkg20-1-1-aarch64.pkg.tar.xz' "$gh/body-refused-aarch64-core.md" &&
   grep -q 'revoked or rotated' "$gh/body-refused-aarch64-core.md"; then
   ok "report: the refused-<target> body lists the files and asks a person to check the key"
@@ -279,5 +284,7 @@ check "report: a later promoted run with none clears refused-<target>" \
 report_run held held 0 refused-aarch64-core=31
 check "report: a held target clears nothing: it did not show the files pass" \
   "1 " "$rc $(events)" "$RR; $(tail -n 3 "$work/out" | tr '\n' ' ')"
+check "report: a held target gives promoted=0 to GITHUB_OUTPUT, also when the run fails" \
+  "promoted=0" "$github_output" "GITHUB_OUTPUT=FILE $RR; cat FILE"
 
 summary

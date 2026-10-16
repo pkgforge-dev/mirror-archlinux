@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+#
+# Start one sync on main for some targets.
+#
+#   scripts/dispatch-sync TARGET...
+#
+# TARGET is a target name, <arch>-<repo> (x86_64-core). One run of sync.yml
+# gets every TARGET, as its targets input. scripts/upstream-watch calls this
+# for the targets whose upstream database changed.
+#
+# A sync.yml that is not active is not started: GitHub refuses the dispatch,
+# and a person may disable it on purpose. A run of sync.yml that waits
+# (queued, waiting, requested or pending) starts nothing more: that run plans
+# after the change, and runs share the concurrency group sync, so one more
+# run would only wait behind it. A run in progress does not stop a start: it
+# may have planned before the change.
+#
+# Needs GH_TOKEN with actions: write, GITHUB_REPOSITORY, gh and jq.
+#
+# Exit status: 0 the sync was started; 2 nothing was started, because sync.yml
+# is not active or a run of it waits; 1 could not tell, could not start, or
+# usage.
+set -euo pipefail
+
+usage() {
+  echo "usage: scripts/dispatch-sync TARGET..." >&2
+  exit 1
+}
+
+die() {
+  echo "dispatch-sync: $1" >&2
+  shift
+  while [ "$#" -gt 0 ]; do
+    echo "  $1" >&2
+    shift
+  done
+  exit 1
+}
+
+[ "$#" -gt 0 ] || usage
+for t in "$@"; do
+  case "$t" in
+    '' | *[!a-z0-9_.-]*) die "not a target name: '$t'" "a target name holds a-z, 0-9, _, . and - only" ;;
+  esac
+done
+command -v gh > /dev/null || die "gh is required"
+command -v jq > /dev/null || die "jq is required"
+
+slug="${GITHUB_REPOSITORY:-}"
+case "$slug" in
+  */*) ;;
+  *) die "GITHUB_REPOSITORY is not owner/name: ${slug:-<unset>}" ;;
+esac
+targets="$*"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+rc=0
+gh api "repos/$slug/actions/workflows/sync.yml" > "$work/workflow.json" || rc=$?
+[ "$rc" -eq 0 ] || die "could not read the state of sync.yml (gh ended $rc)" \
+  "reproduce: gh api repos/$slug/actions/workflows/sync.yml --jq .state"
+state="$(jq -r '.state // "unknown"' "$work/workflow.json")"
+if [ "$state" != active ]; then
+  echo "::notice::dispatch-sync: sync.yml is $state; no sync of $targets is started"
+  exit 2
+fi
+
+# Every run, of every ref and event: all of them share the group sync.
+rc=0
+gh api "repos/$slug/actions/workflows/sync.yml/runs?per_page=50" > "$work/runs.json" || rc=$?
+[ "$rc" -eq 0 ] || die "could not list the runs of sync.yml (gh ended $rc)" \
+  "reproduce: gh api 'repos/$slug/actions/workflows/sync.yml/runs?per_page=50'"
+waiting="$(jq '[.workflow_runs[] | select(.status == "queued" or .status == "waiting" or .status == "requested" or .status == "pending")] | length' "$work/runs.json")"
+if [ "$waiting" -gt 0 ]; then
+  echo "::notice::dispatch-sync: $waiting run(s) of sync.yml wait; no sync of $targets is started"
+  exit 2
+fi
+
+rc=0
+gh workflow run sync.yml --ref main --repo "$slug" -f targets="$targets" || rc=$?
+[ "$rc" -eq 0 ] || die "could not start sync.yml for $targets (gh ended $rc)" \
+  "reproduce: gh workflow run sync.yml --ref main --repo $slug -f targets='$targets'"
+echo "dispatch-sync: started sync.yml on main for $targets"

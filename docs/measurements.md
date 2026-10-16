@@ -100,6 +100,8 @@ Source: GitHub's own REST API documentation, and `gh api` reads of the organisat
 | `keyring_image` with `create` and `cp` only, for `linux/loong64` and `linux/arm64`, worked on an amd64 runner | 2026-10-14 | run 38570044665 |
 | a public-repository `ubuntu-24.04` runner starts with about 87 GB free on `/`; GitHub guarantees 14 GB | 2026-10-13 | runner image documentation |
 | `scripts/debloat-runner` removed 12 of 12 directories in 45 s: 85 GiB free became 120 GiB | 2026-10-13 | a CI run on a runner |
+| the Actions cache removes an entry that no run used for 7 days; a restore key that is a prefix takes the newest entry it matches (documented) | 2026-10-16 | GitHub docs, dependency caching |
+| `actions/cache` v6.1.0 is commit `55cc8345863c7cc4c66a329aec7e433d2d1c52a9`, a lightweight tag; `restore` and `save` run on node24 | 2026-10-16 | `gh api repos/actions/cache/releases/latest` and `.../git/ref/tags/v6.1.0` |
 
 ## Cloudflare Workers
 
@@ -177,6 +179,9 @@ Source: each database downloaded from a `db_server` and read with `scripts/lib.s
 | the newest `%BUILDDATE%` of a database is not monotonic: archived core of 10-02 and 10-03 share it, and so do 10-10 and 10-11 | 2026-10-13 | the Arch Linux archive |
 | over eleven pairs of consecutive days (10-01 to 10-12), the newer core never had an older package | 2026-10-13 | the Arch Linux archive |
 | a superseded file is gone from every Arch mirror within a day, in `os/` and `pool/` | 2026-10-13 | the mirrors |
+| a HEAD of `core.db` answers 200 with `ETag`, `Last-Modified` and `Content-Length` on `geo.mirror.pkgbuild.com`, `fastly.mirror.pkgbuild.com`, `fl.us.mirror.archlinuxarm.org`, `riscv.mirror.pkgbuild.com`, `archriscv.felixc.at` and `loongarchlinux.lcpu.dev`; the two hosts of x86_64 and of riscv64 gave the same three values | 2026-10-16 | `curl --head --location` from the Windows host in Nepal |
+| `scripts/upstream-watch`, two ticks a few minutes apart: 36 URLs; 34 answered in each tick, and the 32 that answered in both gave the same values; `de3.mirror.archlinuxarm.org` did not connect within 10 s for 2 URLs in each tick, other URLs each time | 2026-10-16 | `WATCH_DRY_RUN=1 scripts/upstream-watch` from the Windows host in Nepal |
+| between two status runs, the file count or the bytes of upstream's database changed: x86_64 extra 27 times, riscv64 extra 25, aarch64 extra 5, armv7h extra, riscv64 core and x86_64 core 3 each, x86_64 multilib 2, aarch64 core, loong64 core and loong64 extra 1 each, the four `alarm` and `aur` targets and armv7h core 0; 71 in all, in 33 hours | 2026-10-14T17:31Z to 2026-10-16T02:32Z | the 39 lines of `history.jsonl` on branch `status` |
 
 ### ArchPOWER (the PowerPC targets)
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # scripts/dispatch-overdue starts a workflow only when its newest run on main
-# is older than the limit and no run of it is still going.
+# is older than the limit and no run of it is still going. For sync.yml, only
+# a run of every target counts for the age.
 #
 # A stub gh answers the runs list from a file and records every call, so the
 # test needs no network and no token.
@@ -41,6 +42,13 @@ iso() {
   jq -nr --argjson m "$1" 'now - ($m * 60) | floor | todate'
 }
 
+# a_run STATUS MINUTES_AGO [EVENT [TITLE]] -> one run of the runs list, as
+# JSON; a scheduled run of every target by default
+a_run() {
+  jq -nc --arg s "$1" --arg t "$(iso "$2")" --arg e "${3:-schedule}" --arg d "${4:-Sync all targets}" \
+    '{status: $s, created_at: $t, event: $e, display_title: $d}'
+}
+
 # case_run DESC RUNS_JSON EXPECT_RC EXPECT_DISPATCH(yes|no) [ARGS...]
 case_run() {
   local desc="$1" runs="$2" want_rc="$3" want_dispatch="$4" rc=0 got
@@ -54,16 +62,38 @@ case_run() {
 }
 
 case_run "a run 30 min old, limit 240" \
-  "{\"workflow_runs\":[{\"status\":\"completed\",\"created_at\":\"$(iso 30)\"}]}" 0 no sync.yml 240
+  "{\"workflow_runs\":[$(a_run completed 30)]}" 0 no sync.yml 240
 case_run "a newest run 300 min old, limit 240" \
-  "{\"workflow_runs\":[{\"status\":\"completed\",\"created_at\":\"$(iso 300)\"},{\"status\":\"completed\",\"created_at\":\"$(iso 500)\"}]}" 0 yes sync.yml 240
+  "{\"workflow_runs\":[$(a_run completed 300),$(a_run completed 500)]}" 0 yes sync.yml 240
 case_run "an old run and a newer one 10 min old" \
-  "{\"workflow_runs\":[{\"status\":\"completed\",\"created_at\":\"$(iso 900)\"},{\"status\":\"completed\",\"created_at\":\"$(iso 10)\"}]}" 0 no sync.yml 240
+  "{\"workflow_runs\":[$(a_run completed 900),$(a_run completed 10)]}" 0 no sync.yml 240
 case_run "an old run that is still in progress" \
-  "{\"workflow_runs\":[{\"status\":\"in_progress\",\"created_at\":\"$(iso 600)\"}]}" 0 no sync.yml 240
+  "{\"workflow_runs\":[$(a_run in_progress 600)]}" 0 no sync.yml 240
 case_run "an old run and a queued one" \
-  "{\"workflow_runs\":[{\"status\":\"completed\",\"created_at\":\"$(iso 600)\"},{\"status\":\"queued\",\"created_at\":\"$(iso 1)\"}]}" 0 no sync.yml 240
+  "{\"workflow_runs\":[$(a_run completed 600),$(a_run queued 1)]}" 0 no sync.yml 240
 case_run "no run at all" '{"workflow_runs":[]}' 0 yes status.yml 120
+check "the runs list is the newest 100 runs on main" \
+  "gh api repos/pkgforge-dev/mirror-archlinux/actions/workflows/status.yml/runs?branch=main&per_page=100" \
+  "$(grep 'runs?' "$work/calls.log")" "scripts/dispatch-overdue status.yml 120; cat calls.log"
+
+# sync.yml: only a run of every target counts for the age. upstream-watch
+# starts runs of some targets, and they must not hold back the full sync.
+case_run "sync.yml: a recent sync of one target and a full run 300 min old" \
+  "{\"workflow_runs\":[$(a_run completed 10 workflow_dispatch 'Sync x86_64-core'),$(a_run completed 300)]}" 0 yes sync.yml 240
+case_run "sync.yml: a full dispatch 30 min old counts, by its title" \
+  "{\"workflow_runs\":[$(a_run completed 30 workflow_dispatch),$(a_run completed 300)]}" 0 no sync.yml 240
+case_run "sync.yml: only runs of some targets" \
+  "{\"workflow_runs\":[$(a_run completed 10 workflow_dispatch 'Sync x86_64-core')]}" 0 yes sync.yml 240
+if grep -q 'no run of every target on main' "$work/out.log"; then
+  ok "sync.yml: only runs of some targets: the warning says no run of every target"
+else
+  fail "sync.yml: only runs of some targets: the warning says no run of every target" "$(cat "$work/out.log")" \
+    "reproduce: scripts/dispatch-overdue sync.yml 240 with one run titled Sync x86_64-core"
+fi
+case_run "sync.yml: a sync of one target in progress still counts as busy" \
+  "{\"workflow_runs\":[$(a_run in_progress 10 workflow_dispatch 'Sync x86_64-core'),$(a_run completed 300)]}" 0 no sync.yml 240
+case_run "status.yml: a dispatch 30 min old counts, whatever its title" \
+  "{\"workflow_runs\":[$(a_run completed 30 workflow_dispatch Status)]}" 0 no status.yml 120
 case_run "a workflow name that is not a file name" '{"workflow_runs":[]}' 2 no 'sync yml' 240
 case_run "a limit that is not a number" '{"workflow_runs":[]}' 2 no sync.yml soon
 

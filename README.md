@@ -171,7 +171,7 @@ pacman checks each package against the keyring of its distribution. A consumer n
 
 ## How the mirror works
 
-`.github/workflows/sync.yml` runs every 3 hours. Each target with work runs its own chain (`.github/workflows/sync-target.yml`), so one target never holds another.
+`.github/workflows/sync.yml` runs every 3 hours. `.github/workflows/upstream-watch.yml` also starts it, for the targets whose upstream database changed, within about 15 minutes of the change. Each target with work runs its own chain (`.github/workflows/sync-target.yml`), so one target never holds another.
 
 1. **plan** (`scripts/plan`) reads each database from the distribution's own servers only. It refuses a database that is malformed or behind the promoted one. It reads the target's index: what earlier runs of the ref left on the registry. Then it puts the files that are not on the registry into shards per target.
 2. **mirror** (`scripts/mirror-shard`, `scripts/mirror-file`) gets each of these files from the registry when a repository there holds its bytes, else from any listed server. It checks size and sha256, then pushes the file with its signature under a tag of its own.
@@ -241,7 +241,7 @@ WORKER_LIVE=1 tests/run.sh worker live
 
 These run by themselves:
 
-- Sync every 3 hours. Status, with the Worker check, every hour. The staleness and schedule checks every day.
+- Sync every 3 hours, and a sync of the targets whose upstream changed, checked every 15 minutes (not the powerpc targets). Status, with the Worker check, every hour. The staleness and schedule checks every day.
 - The scheduled workflows start each other when a newest run is overdue, and keep every schedule enabled.
 - Renovate merges digest, pin, patch and minor updates when every check is green.
 - `worker.yml` tests the Worker after a push to `main` that changes `worker/`.
