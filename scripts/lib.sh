@@ -1022,9 +1022,18 @@ registry_error_code() {
 }
 
 # registry_get_manifest URL TOKEN OUT -> the HTTP status on stdout, curl's
-# status as the return value
+# status as the return value. REG_MANIFEST_MAX_TIME (seconds), when set,
+# bounds the whole call, its retries included, as registry_get_blob's
+# MAX_SECONDS does: --max-time, --retry-max-time, and timeout 5 s after it.
+# Unset, each try gets 60 s, and 3 retries can take about 4 minutes.
 registry_get_manifest() {
-  curl -q --silent --show-error --connect-timeout 20 --max-time 60 \
+  local max=60 whole=() limit=()
+  if [ -n "${REG_MANIFEST_MAX_TIME:-}" ]; then
+    max="$REG_MANIFEST_MAX_TIME"
+    whole=(--retry-max-time "$max")
+    limit=(timeout -k 5 "$((max + 5))")
+  fi
+  "${limit[@]}" curl -q --silent --show-error --connect-timeout 20 --max-time "$max" "${whole[@]}" \
     --retry 3 --retry-connrefused --retry-delay 2 --max-filesize 4194304 \
     --header "Authorization: Bearer $2" \
     --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
@@ -1033,8 +1042,13 @@ registry_get_manifest() {
 
 # registry_manifest REPO REF OUT -> the manifest bytes in OUT
 #   returns 0 read, 4 the registry has no such manifest, 1 could not read
+# REG_MANIFEST_MAX_TIME, when set, bounds each manifest request
+# (registry_get_manifest); REG_TOKEN_MAX_TIME bounds each token request.
 registry_manifest() {
   local repo="$1" ref="$2" outfile="$3" code="" rc=0 err url
+  case "${REG_MANIFEST_MAX_TIME:-60}" in
+    *[!0-9]* | 0) die "REG_MANIFEST_MAX_TIME must be a positive number of seconds, not '$REG_MANIFEST_MAX_TIME'" ;;
+  esac
   REG_LAST_CODE=000
   url="$REG_URL/v2/$repo/manifests/$ref"
   if [ "$MIRROR_REGISTRY_AUTH" != none ] && [ "$MIRROR_REGISTRY" = ghcr.io ]; then
@@ -1333,7 +1347,8 @@ manifest_layer() {
 #   absent   the registry has no such tag
 #   invalid  read, and not a valid index of format 1: do not use it
 #   unread   no answer that decides: a transport error, an HTTP error, a
-#            blob that is not its digest
+#            blob that is not its digest, or a ref.db that db_records
+#            cannot read here
 # OUTDIR/manifest.json holds the manifest when the state is ok or invalid.
 # A DB whose sha256 is the digest of the ref.db layer is copied, not read.
 # The reads send REGISTRY_TOKEN as it is set (registry_manifest,
@@ -1343,10 +1358,10 @@ manifest_layer() {
 #
 # index_push ORAS REPO TAG DIR ANNOTATION... -> 0 pushed, 1 not: DIR/ref.db
 # and DIR/index.tsv as REPO:TAG, each ANNOTATION (key=value) on the
-# manifest. DIR may be relative. Needs ORAS_CONFIG (oras_args). A 429 costs no attempt: its pauses
-# add up to INDEX_RATE_WAIT (default 120 s), a cap of their own; the
-# THROTTLE_WAITED of the caller is kept. At most 2 attempts, each within
-# 120 s.
+# manifest. DIR may be relative. Needs ORAS_CONFIG (oras_args). A 429 costs
+# no attempt: its pauses add up to INDEX_RATE_WAIT (default 120 s), a cap of
+# their own; the THROTTLE_WAITED of the caller is kept. At most 2 attempts,
+# each within 120 s.
 #
 # index_listed REPO TAG OUT -> 0: OUT holds the filenames of the m rows of
 # REPO:TAG, sorted, each once; OUT is empty when the registry has no such
@@ -1420,10 +1435,13 @@ index_read() {
     echo unread
     return 0
   fi
-  # `if !`: db_records must not be called bare (see db_records).
+  # `if !`: db_records must not be called bare (see db_records). The blob
+  # has its digest, and index_push writes only a database there. So a
+  # failure here is local, for example tar on this host: unread, not
+  # invalid.
   if ! db_records "$outdir/ref.db" "$outdir/ref.tsv"; then
-    warn "$repo:$tag: its ref.db ($db_digest) does not read as a tar archive"
-    echo invalid
+    warn "$repo:$tag: its ref.db ($db_digest) does not read as a tar archive on this host"
+    echo unread
     return 0
   fi
   if ! db_validate "$outdir/ref.tsv" > "$outdir/ref.bad"; then
@@ -1466,7 +1484,7 @@ index_read() {
 }
 
 index_push() {
-  local oras="$1" repo="$2" tag="$3" dir="$4" cap="${INDEX_RATE_WAIT:-120}" saved="$THROTTLE_WAITED" rc=0 attempt=0 a
+  local oras="$1" repo="$2" tag="$3" dir="$4" cap="${INDEX_RATE_WAIT:-120}" saved="$THROTTLE_WAITED" rc=0 attempt=0 a abs
   shift 4
   case "$cap" in
     '' | *[!0-9]*) die "INDEX_RATE_WAIT must be whole seconds, not '$cap'" ;;
@@ -1476,10 +1494,11 @@ index_push() {
     return 1
   fi
   # An absolute path: the push runs from inside DIR, and its log is DIR/push.log.
-  if ! dir="$(cd "$dir" && pwd)"; then
+  if ! abs="$(cd "$dir" && pwd)"; then
     warn "$repo:$tag: $dir could not be made an absolute path"
     return 1
   fi
+  dir="$abs"
   local oargs=() args=()
   mapfile -t oargs < <(oras_args)
   args=(push "${oargs[@]}" --artifact-type "$INDEX_ARTIFACT_TYPE")

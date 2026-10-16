@@ -28,9 +28,9 @@
 #      A file is "indexed" when the index lists it with state m and its
 #      ref.db record has the same sha256 and %PGPSIG% as the chosen record:
 #      an earlier run of the ref left it on the registry. INDEX_STATE is ok,
-#      absent, invalid (not used), unread (no answer that decides, or
-#      REGISTRY_READ_BUDGET is spent; a warning, and the target plans as with
-#      no index), or ignored (INDEX_READ=0: its rows are not read, and the
+#      absent, invalid (not used), unread (no answer that decides, a ref.db
+#      that tar cannot read on this host, or REGISTRY_READ_BUDGET is spent; a
+#      warning, and the target plans as with no index), or ignored (INDEX_READ=0: its rows are not read, and the
 #      run writes a new index). With ignored, plan reads the manifest of the
 #      tag alone (index_seen): its digest, or that there is no tag, tells
 #      scripts/index-write which index the new one replaces.
@@ -90,14 +90,20 @@
 # ⛔ The registry reads of steps 3b, 6 (the latest database of keyring_from,
 # for the verify context) and 6c share one budget for the whole plan,
 # REGISTRY_READ_BUDGET seconds (default 240). The budget stops each new read:
-# a read is not made when the reads before it took the whole budget. Each
-# blob and token read has a deadline of 60 s, or what is left of the budget
-# when that is less. A manifest read has its own deadline (lib.sh
-# registry_get_manifest: 60 s, 3 retries), so one read in progress can run
-# past the budget by up to about 4 minutes. A read that is not made costs work:
-# the index is unread, the verify context is not known, or a sibling gives no
-# source. An unread index is safe because scripts/mirror-file writes no
-# repush for it, and a push goes only to an absent tag.
+# a read is not made when the reads before it took the whole budget. A read
+# gets a deadline (reg_time): 60 s, or what is left of the budget when that
+# is less. curl starts no retry after that deadline, and timeout(1) stops
+# each request of the read 5 s after it. The requests are a manifest
+# get (REG_MANIFEST_MAX_TIME), a token request (REG_TOKEN_MAX_TIME) and a
+# blob get (REG_BLOB_MAX_TIME). The budget is not checked between the
+# requests of one read. The longest read is an index read: a manifest and two
+# blobs, each up to 3 requests (Bearer QQ==, a token, the get again). So the
+# read in progress when the budget is spent can run past it by up to about 9
+# minutes (9 requests of at most 65 s, less the time that was left).
+# A read that is not made costs work: the index is unread, the verify context
+# is not known, or a sibling gives no source. An unread index is safe because
+# scripts/mirror-file writes no repush for it, and a push goes only to an
+# absent tag.
 #
 # Each upstream read of a .files database, a database signature or a package
 # .sig that answers is kept for the rest of the plan (OUT/.fetch-cache,
@@ -352,7 +358,8 @@ index_of() {
     log "$repo:$INDEX_TAG: not read, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s is spent"
     return 0
   fi
-  reg_state="$(REGISTRY_TOKEN='' REG_BLOB_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" index_read "$repo" "$INDEX_TAG" "$d" "$@")" || rc=$?
+  reg_state="$(REGISTRY_TOKEN='' REG_MANIFEST_MAX_TIME="$t" REG_BLOB_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" \
+    index_read "$repo" "$INDEX_TAG" "$d" "$@")" || rc=$?
   reg_spent=$((reg_spent + SECONDS - started))
   if [ "$rc" -ne 0 ]; then
     reg_state=unread
@@ -372,7 +379,8 @@ index_of() {
   fi
   rc=0
   started="$SECONDS"
-  reg_state="$(REG_BLOB_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" index_read "$repo" "$INDEX_TAG" "$d" "$@")" || rc=$?
+  reg_state="$(REG_MANIFEST_MAX_TIME="$t" REG_BLOB_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" \
+    index_read "$repo" "$INDEX_TAG" "$d" "$@")" || rc=$?
   reg_spent=$((reg_spent + SECONDS - started))
   if [ "$rc" -ne 0 ]; then
     reg_state=unread
@@ -404,7 +412,7 @@ latest_read() {
     log "$path:latest: not read, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s is spent"
     return 0
   fi
-  REGISTRY_TOKEN='' REG_TOKEN_MAX_TIME="$t" registry_manifest "$path" latest "$m" || rc=$?
+  REGISTRY_TOKEN='' REG_MANIFEST_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" registry_manifest "$path" latest "$m" || rc=$?
   case "$rc" in
     "$REG_STATUS_OK") ;;
     "$REG_STATUS_ABSENT")
@@ -507,7 +515,7 @@ index_seen() {
     log "$repo:$INDEX_TAG: not read, REGISTRY_READ_BUDGET=${REGISTRY_READ_BUDGET}s is spent"
     return 0
   fi
-  REG_TOKEN_MAX_TIME="$t" registry_manifest "$repo" "$INDEX_TAG" "$tmp/index-seen.json" || rc=$?
+  REG_MANIFEST_MAX_TIME="$t" REG_TOKEN_MAX_TIME="$t" registry_manifest "$repo" "$INDEX_TAG" "$tmp/index-seen.json" || rc=$?
   reg_spent=$((reg_spent + SECONDS - started))
   case "$rc" in
     "$REG_STATUS_OK") seen_digest="sha256:$(sha256sum "$tmp/index-seen.json" | cut -d ' ' -f 1)" ;;

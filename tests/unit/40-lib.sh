@@ -4,8 +4,8 @@
 # valid, which database fields are refused, which database is behind another,
 # when a package tag may be written, when a target is stale, which snapshot is
 # newer, how a shard accounts for every file, which token a registry read
-# sends, which server is asked last, how long an upstream read may take, and
-# which artifacts of a re-run the report reads.
+# sends, which server is asked last, how long an upstream read or a registry
+# request may take, and which artifacts of a re-run the report reads.
 set -euo pipefail
 # shellcheck source=../lib/harness.sh
 . "$REPO_ROOT/tests/lib/harness.sh"
@@ -656,6 +656,16 @@ case "$url" in
     fi
     ;;
   */manifests/* | */blobs/*)
+    # The deadlines a manifest request was given, and a manifest server that
+    # stalls when $FAKE/manifest-stall exists, as for a token request.
+    case "$url" in
+      */manifests/*)
+        printf '%s %s\n' "${maxt:-none}" "${retmax:-none}" > "$FAKE/manifest-args"
+        if [ -f "$FAKE/manifest-stall" ]; then
+          exec sleep 60 > /dev/null
+        fi
+        ;;
+    esac
     line="$(awk -F '\t' -v a="$auth" '$1 == a && !f { print $2 "\t" $3; f = 1 }' "$FAKE/answers.tsv")"
     if [ -z "$line" ]; then
       [ -z "$wo" ] || printf '000'
@@ -799,6 +809,32 @@ REG_TOKEN_MAX_TIME=soon FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY=ghcr
   MIRROR_REGISTRY_SCHEME=https REGISTRY_TOKEN='' in_lib registry_token it/repo pull > /dev/null 2>&1 || rc=$?
 check "registry_token: a REG_TOKEN_MAX_TIME that is not a number of seconds is refused" "refused" \
   "$([ "$rc" -ne 0 ] && echo refused || echo "accepted (status $rc)")" "REG_TOKEN_MAX_TIME=soon bash -c '. scripts/lib.sh; registry_token it/repo pull'"
+
+# A manifest server that stalls. With REG_MANIFEST_MAX_TIME, as plan sets it
+# for each read of REGISTRY_READ_BUDGET, the whole request ends within it,
+# retries included, and timeout(1) ends it when curl does not. With none set,
+# a request keeps --max-time 60 and no --retry-max-time.
+REG_TOKEN='' reg ok 'Bearer QQ==\t200\tmanifest.json\n' > /dev/null
+check "registry_manifest: with no REG_MANIFEST_MAX_TIME, a manifest request gets --max-time 60 and no --retry-max-time" \
+  "60 none" "$(cat "$fake/manifest-args")" "bash -c '. scripts/lib.sh; registry_manifest it/repo latest OUT' with curl logging its arguments"
+REG_MANIFEST_MAX_TIME=2 REG_TOKEN='' reg ok 'Bearer QQ==\t200\tmanifest.json\n' > /dev/null
+check "registry_manifest: REG_MANIFEST_MAX_TIME=2 gives a manifest request --max-time 2 and --retry-max-time 2" \
+  "2 2" "$(cat "$fake/manifest-args")" "REG_MANIFEST_MAX_TIME=2 bash -c '. scripts/lib.sh; registry_manifest it/repo latest OUT'"
+touch "$fake/manifest-stall"
+m_started=$SECONDS
+m_res="$(REG_MANIFEST_MAX_TIME=2 REG_TOKEN='' reg stalled 'Bearer QQ==\t200\tmanifest.json\n')"
+m_took=$((SECONDS - m_started))
+rm -f "$fake/manifest-stall"
+check "registry_manifest: a manifest server that stalls is given up within REG_MANIFEST_MAX_TIME and 5 s, with no answer" \
+  "1 1 0, within 15 s" "$m_res, $([ "$m_took" -lt 15 ] && echo 'within 15 s' || echo "after $m_took s")" \
+  "REG_MANIFEST_MAX_TIME=2 bash -c '. scripts/lib.sh; registry_manifest it/repo latest OUT' against a manifest server that does not answer"
+rc=0
+rm -f "$fake/manifest-args"
+REG_MANIFEST_MAX_TIME=soon FAKE="$fake" PATH="$fake/bin:$PATH" MIRROR_REGISTRY=ghcr.io MIRROR_REGISTRY_AUTH=token \
+  MIRROR_REGISTRY_SCHEME=https REGISTRY_TOKEN='' in_lib registry_manifest it/repo latest "$fake/out.json" > /dev/null 2>&1 || rc=$?
+check "registry_manifest: a REG_MANIFEST_MAX_TIME that is not a number of seconds is refused, with no request" "refused" \
+  "$([ "$rc" -ne 0 ] && [ ! -e "$fake/manifest-args" ] && echo refused || echo "accepted (status $rc)")" \
+  "REG_MANIFEST_MAX_TIME=soon bash -c '. scripts/lib.sh; registry_manifest it/repo latest OUT'"
 
 # Blobs: the same on GHCR with no credential; with REGISTRY_TOKEN, the real
 # token at once; a blob whose bytes are not its digest is refused.

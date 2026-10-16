@@ -3,13 +3,15 @@
 # scripts/plan with the index of a ref (scripts/lib.sh index_read). Which
 # files a run mirrors (todo.tsv), verifies (new.tsv) and vouches for
 # (vouched.tsv), for records that are promoted, indexed, indexed as verified,
-# indexed as absent upstream, and planned again by step 4. Then the index
-# states (absent, unread, invalid, ignored and the manifest it reads,
-# private, and an anonymous read that answers 503), the withdrawal of index
-# rows before their tags are written (step 6b, withdrawn-by), the registry
-# sources of a todo file (sources.tsv, step 6c), and one upstream read per
-# URL in a plan (OUT/.fetch-cache). Last, lib.sh index_read and index_push
-# alone, index_push with a relative DIR too.
+# indexed as absent upstream, and planned again by step 4; the deadline of a
+# read of the index manifest. Then the index states (absent, unread,
+# invalid, ignored and the manifest it reads, private, and an anonymous read
+# that answers 503), the withdrawal of index rows before their tags are
+# written (step 6b, withdrawn-by, also of an index another plan withdrew
+# from), the registry sources of a todo file (sources.tsv, step 6c), and one
+# upstream read per URL in a plan (OUT/.fetch-cache). Last, lib.sh
+# index_read and index_push alone: a ref.db that tar cannot read, and
+# index_push with a relative DIR too.
 #
 # The upstream and the registry are files under $work/net. A curl stand-in
 # answers a token request itself and hands every other request to
@@ -65,10 +67,11 @@ cat > "$bin/curl" << 'EOF'
 # comes on stdin (--config -), and "anon" when none does. Any other request
 # goes to tests/fixtures/status/fake-curl, with --config dropped, from
 # $NET/tok1 when it carries Bearer tok1 and the file is there, from
-# $NET/anon otherwise.
+# $NET/anon otherwise. A manifest request adds its URL and its
+# --retry-max-time (or none) to $NET/manifest-deadlines.
 a=("$@")
 pass=()
-auth="" out="" wo="" url="" cred=0 i=0
+auth="" out="" wo="" url="" cred=0 i=0 rmt=none
 while [ "$i" -lt "${#a[@]}" ]; do
   case "${a[$i]}" in
     --config)
@@ -82,11 +85,15 @@ while [ "$i" -lt "${#a[@]}" ]; do
     --header) case "${a[$((i + 1))]}" in Authorization:*) auth="${a[$((i + 1))]#Authorization: }" ;; esac ;;
     --output) out="${a[$((i + 1))]}" ;;
     --write-out) wo="${a[$((i + 1))]}" ;;
+    --retry-max-time) rmt="${a[$((i + 1))]}" ;;
     http://* | https://*) url="${a[$i]}" ;;
   esac
   pass+=("${a[$i]}")
   i=$((i + 1))
 done
+case "$url" in
+  */manifests/*) printf '%s\t%s\n' "$url" "$rmt" >> "$NET/manifest-deadlines" ;;
+esac
 case "$url" in
   */token)
     tok=anon
@@ -114,6 +121,7 @@ cat > "$bin/oras" << 'EOF'
 # A stand-in for oras. Logs each call to $NET/oras.log. login reads its
 # password. push fails while $NET/oras-fail exists, and answers in oras's
 # words for a 429 while $NET/oras-429 holds a number above 0 (counted down).
+# A push with two --annotation of one key fails, as oras refuses it.
 # Otherwise it writes each ./FILE:TYPE as a blob and the manifest, with
 # --artifact-type and every --annotation, under $NET/anon/ghcr.io.
 printf '%s\n' "$*" >> "$NET/oras.log"
@@ -144,7 +152,14 @@ while [ "$#" -gt 0 ]; do
     --registry-config) shift 2 ;;
     --plain-http) shift ;;
     --artifact-type) at="$2"; shift 2 ;;
-    --annotation) ann="$(jq -c --arg k "${2%%=*}" --arg v "${2#*=}" '. + {($k): $v}' <<< "$ann")"; shift 2 ;;
+    --annotation)
+      if jq -e --arg k "${2%%=*}" 'has($k)' <<< "$ann" > /dev/null; then
+        echo "Error: duplicate annotation key: ${2%%=*}" >&2
+        exit 1
+      fi
+      ann="$(jq -c --arg k "${2%%=*}" --arg v "${2#*=}" '. + {($k): $v}' <<< "$ann")"
+      shift 2
+      ;;
     ./*)
       f="${1%:*}"
       sha="$(sha256sum "$f" | cut -d ' ' -f 1)"
@@ -240,20 +255,22 @@ put_latest() {
       layers: [{mediaType: "application/vnd.pkgforge.archlinux.db.v1", digest: $d, size: $s, annotations: {"org.opencontainers.image.title": $t}}],
       annotations: {"dev.pkgforge.mirror.fetched": "2026-10-01T00:00:00Z"}}' > "$A/ghcr.io/v2/$1/manifests/latest"
 }
-# put_index TREE REPO REF.DB INDEX.TSV CONTEXT [ARTIFACT_TYPE]: the index of
-# REPO at the tag index, under TREE
+# put_index TREE REPO REF.DB INDEX.TSV CONTEXT [ARTIFACT_TYPE [WITHDRAWN_BY]]:
+# the index of REPO at the tag index, under TREE. WITHDRAWN_BY, when given,
+# is the plan id in its dev.pkgforge.mirror.withdrawn-by.
 put_index() {
   local dsha tsha
   dsha="$(blob_put "$1" "$2" "$3")"
   tsha="$(blob_put "$1" "$2" "$4")"
   mkdir -p "$1/ghcr.io/v2/$2/manifests"
   jq -cn --arg at "${6:-application/vnd.pkgforge.archlinux.index.v1}" --arg dd "sha256:$dsha" --arg td "sha256:$tsha" \
-    --argjson ds "$(wc -c < "$3" | tr -d ' ')" --argjson ts "$(wc -c < "$4" | tr -d ' ')" --arg c "$5" \
+    --argjson ds "$(wc -c < "$3" | tr -d ' ')" --argjson ts "$(wc -c < "$4" | tr -d ' ')" --arg c "$5" --arg w "${7:-}" \
     '{schemaVersion: 2, mediaType: "application/vnd.oci.image.manifest.v1+json", artifactType: $at,
       layers: [{mediaType: "application/vnd.pkgforge.archlinux.db.v1", digest: $dd, size: $ds, annotations: {"org.opencontainers.image.title": "ref.db"}},
         {mediaType: "application/vnd.pkgforge.archlinux.index.v1+tsv", digest: $td, size: $ts, annotations: {"org.opencontainers.image.title": "index.tsv"}}],
-      annotations: {"dev.pkgforge.mirror.index-format": "1", "dev.pkgforge.mirror.plan-id": "older.1.1",
-        "dev.pkgforge.mirror.verify-context": $c, "dev.pkgforge.mirror.run": "older"}}' > "$1/ghcr.io/v2/$2/manifests/index"
+      annotations: ({"dev.pkgforge.mirror.index-format": "1", "dev.pkgforge.mirror.plan-id": "older.1.1",
+        "dev.pkgforge.mirror.verify-context": $c, "dev.pkgforge.mirror.run": "older"}
+        + (if $w == "" then {} else {"dev.pkgforge.mirror.withdrawn-by": $w} end))}' > "$1/ghcr.io/v2/$2/manifests/index"
 }
 # rows LINE...: an index.tsv, NAME STATE VERIFIED UNSIGNED per argument,
 # for the file NAME-1-1-x86_64.pkg.tar.zst
@@ -280,6 +297,7 @@ run_plan() {
   rm -rf "$work/out-$name"
   : > "$work/$name.calls"
   : > "$net/oras.log"
+  : > "$net/manifest-deadlines"
   REPO_ROOT="$root" PATH="$bin:$PATH" FAKE_CURL_LOG="$work/$name.calls" PLAN_BUDGET=120 TARGETS_DIR="$work/targets" \
     "$PLAN" "$work/out-$name" "$@" > "$work/$name.out" 2> "$work/$name.err" || rc=$?
   return "$rc"
@@ -358,7 +376,7 @@ REGISTRY_TOKEN=secret run_plan matrix "$CONF" || rc=$?
 D="$work/out-matrix/x86_64-core"
 check "matrix: plan exits 0, the target pending, the index ok" "0 pending ok" \
   "$rc $(cat "$D/state" 2> /dev/null) $(meta matrix x86_64-core INDEX_STATE)" "$RP; cat $work/matrix.err"
-check "matrix: todo is what is not promoted or indexed, absent upstream, or signed now" "p11 p4 p5 p6 p8 p9" \
+check "matrix: todo is what is not promoted or indexed, absent upstream and not promoted, or signed now" "p11 p4 p5 p6 p8 p9" \
   "$(names "$D/todo.tsv" 2)" "$RP; cat $D/todo.tsv"
 check "matrix: new is todo and what is not promoted and not indexed as verified" "p11 p3 p4 p5 p6 p8 p9" \
   "$(names "$D/new.tsv" 2)" "$RP; cat $D/new.tsv"
@@ -384,6 +402,13 @@ check "matrix: the index pushed keeps the other rows, the same ref.db and the sa
   "jq . $live"
 check "matrix: INDEX_DIGEST is the digest of the index read back" "sha256:$(sha256sum "$live" | cut -d ' ' -f 1)" \
   "$(meta matrix x86_64-core INDEX_DIGEST)" "cat $D/meta.env; sha256sum $live"
+# first_deadline -> the --retry-max-time of the first manifest request of
+# the index tag in the last plan
+first_deadline() {
+  awk -F '\t' 'index($1, "/manifests/index") && !f { print $2; f = 1 }' "$net/manifest-deadlines"
+}
+check "matrix: the read of the index manifest gets the read's deadline of the budget, 60 s, for the whole request" 60 \
+  "$(first_deadline)" "$RP; cat $net/manifest-deadlines"
 check "matrix: the artifact holds no read of the index" "absent absent" \
   "$([ -e "$D/index" ] && echo present || echo absent) $([ -e "$D/indexed.tsv" ] && echo present || echo absent)" "ls $D"
 check "matrix: no upstream read is kept after the plan" absent \
@@ -422,6 +447,21 @@ case "$(cat "$D/why" 2> /dev/null)" in
   *) fail "withdrawal: the why names the rows not withdrawn" "$(cat "$D/why" 2> /dev/null)" "$RP" ;;
 esac
 check "withdrawal: the target has no shard" '{"include":[]}' "$(cat "$work/out-nowithdraw/targets.json")" "cat $work/out-nowithdraw/targets.json"
+
+# An index that another plan withdrew rows from already: this withdrawal
+# replaces its withdrawn-by. oras gets the key once, as oras refuses a key
+# given twice.
+put_index "$A" "$CORE" "$work/core-ref.db" "$work/core-index.tsv" "$CTX" "" newer.2.1
+rc=0
+REGISTRY_TOKEN=secret run_plan rewithdraw "$CONF" || rc=$?
+D="$work/out-rewithdraw/x86_64-core"
+check "withdrawn again: an index another plan withdrew rows from: one push, and the target pending" "0 pending 1" \
+  "$rc $(cat "$D/state" 2> /dev/null) $(awk '$1 == "push" { n++ } END { print n + 0 }' "$net/oras.log")" \
+  "$RP; cat $work/rewithdraw.err $net/oras.log"
+check "withdrawn again: the push gives withdrawn-by once, and the index names this plan in it" \
+  "1 $(cat "$work/out-rewithdraw/plan-id" 2> /dev/null)" \
+  "$(awk '$1 == "push" { n += gsub(/dev\.pkgforge\.mirror\.withdrawn-by=/, "") } END { print n + 0 }' "$net/oras.log") $(jq -r '.annotations["dev.pkgforge.mirror.withdrawn-by"] // "none"' "$live")" \
+  "cat $net/oras.log; jq .annotations $live"
 
 # No index: plan as before the index.
 rm -f "$A/ghcr.io/v2/$CORE/manifests/index"
@@ -507,6 +547,8 @@ check "ignored: INDEX_READ=0 reads the manifest of the index alone, no blob, and
 check "ignored: INDEX_DIGEST is the digest of the manifest plan saw, and INDEX_PRIOR is empty" \
   "sha256:$(sha256sum "$A/ghcr.io/v2/$CORE/manifests/index" | cut -d ' ' -f 1)|" \
   "$(meta ignored x86_64-core INDEX_DIGEST)|$(meta ignored x86_64-core INDEX_PRIOR)" "cat $D/meta.env"
+check "ignored: the read of the manifest gets the read's deadline of the budget, 60 s, for the whole request" 60 \
+  "$(first_deadline)" "INDEX_READ=0 $RP; cat $net/manifest-deadlines"
 rm -f "$A/ghcr.io/v2/$CORE/manifests/index"
 rc=0
 REGISTRY_TOKEN=secret INDEX_READ=0 run_plan ignoredabsent "$CONF" || rc=$?
@@ -686,6 +728,12 @@ check "index_read: a verify-context that is not 64 hex digits is invalid" invali
 printf 'nothere-1-1-x86_64.pkg.tar.zst\tm\t0\t0\n' >> "$work/big-index.tsv"
 put_index "$A" "$BIG" "$work/big.db" "$work/big-index.tsv" ""
 check "index_read: 3 of 202 lines dropped is more than 1%: invalid" invalid "$(read_index over)" "$IR; cat $work/read-over.err"
+# A ref.db with its digest that tar cannot read: the failure is local, so
+# the index is unread, not invalid.
+printf 'not a tar archive\n' > "$work/notatar.db"
+put_index "$A" "$BIG" "$work/notatar.db" "$work/big-index.tsv" ""
+check "index_read: a ref.db with its digest that tar cannot read is unread, not invalid" unread "$(read_index notatar)" \
+  "$IR; cat $work/read-notatar.err"
 rm -f "$A/ghcr.io/v2/$BIG/manifests/index"
 check "index_read: no tag is absent" absent "$(read_index none)" "$IR"
 

@@ -60,9 +60,11 @@
 # (lib.sh throttle_pause), then the next source is asked. Any other answer,
 # other bytes too, marks the repository down for the shard
 # ($WORK/down/r-<repository, each / a _>), and no file of the shard asks it
-# again. The absent rule looks at the upstream servers only: a file that
-# every server answers 404 for, with none that erred or gave other bytes, is
-# absent, whatever a registry source answered.
+# again. When a registry source gave no answer that decides, a file that
+# every server answers 404 for is failed, not absent: the source is known to
+# hold the bytes (plan named the sibling; on a repush, decide_push matched the
+# package blob of the own repository). The target is held, and the next run
+# tries again.
 #
 # ⭐ The signature layer is the database's own %PGPSIG%, decoded, whenever the
 # database carries one: pacman checks against that copy, and asks for the .sig
@@ -421,14 +423,15 @@ for server in "${dl_order[@]}"; do
 done
 if [ -z "$got_from" ]; then
   # Every server answered 404, and none erred or offered other bytes: the file
-  # is gone from upstream though its database still names it. Skip it rather than
-  # fail, so one stale upstream entry cannot hold the whole target; the mirror
-  # then reflects upstream, where this file is a 404 too. plan plans it again
-  # until a promoted database names it, so it is picked up if it returns. An error (a server down) or other bytes
-  # (a build in flight) is still a failure, retried next run. The rule looks
-  # at the upstream servers only: what a registry source answered does not
-  # change it.
-  if [ "$dl_error" -eq 0 ] && [ "$dl_other" -eq 0 ] && [ "$dl_absent" -gt 0 ]; then
+  # is gone from upstream though its database still names it. Skip it rather
+  # than fail, so one stale upstream entry cannot hold the whole target; the
+  # mirror then reflects upstream, where this file is a 404 too. plan plans it
+  # again until a promoted database names it, so it is picked up if it
+  # returns. An error (a server down) or other bytes (a build in flight) is
+  # still a failure, retried next run. So is a registry source that gave no
+  # answer that decides: it is known to hold the bytes, so its error is not an
+  # absence.
+  if [ "$dl_error" -eq 0 ] && [ "$dl_other" -eq 0 ] && [ "$dl_absent" -gt 0 ] && [ -z "$reg_undecided" ]; then
     result absent "every server answers 404 for it ($dl_absent of $n); upstream's database names it but no longer serves the file"
     exit 0
   fi

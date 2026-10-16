@@ -1071,9 +1071,10 @@ check "mirror-file: a sibling that answers 404 is a quiet miss: not marked down,
   "0 pushed from $UP 1 no 0" "$rc $(mf_result miss 1) $(blob_gets "$SIB1") $(down "$SIB1" miss) $(names "$SIB1" miss)" \
   "$MF 1; cat $work/mf-miss.err"
 
-# d: every server answers 404. The absent rule looks at the upstream servers
-# only: a sibling that answers 404, or 503, leaves it absent. An upstream
-# server that errs makes it failed.
+# d: every server answers 404. A sibling 404 keeps it absent. A sibling that
+# gives no answer that decides makes it failed: plan named the sibling
+# because it holds the bytes. An upstream server that errs makes it failed
+# too.
 printf 'd-1-1-any.pkg.tar.zst\t%s\n' "$SIB1" > "$mp/sources.tsv"
 reset "$absent" "$after" 0
 printf '%s\t404\tblob-unknown.json\n' "$SIB1" > "$FAKE/blobs.tsv"
@@ -1083,8 +1084,18 @@ check "mirror-file: a sibling that answers 404, and every server 404: absent" "0
 reset "$absent" "$after" 0
 printf '%s\t503\tbusy.txt\n' "$SIB1" > "$FAKE/blobs.tsv"
 rc="$(mf_run gonebusy 3)"
-check "mirror-file: a sibling that answers 503, and every server 404: absent, as upstream decides" "0 absent yes" \
-  "$rc $(cut -f 3 "$work/mf-gonebusy/results/3.tsv" 2> /dev/null) $(down "$SIB1" gonebusy)" "$MF 3; cat $work/mf-gonebusy.err"
+case "$rc:$(cut -f 3,5 "$work/mf-gonebusy/results/3.tsv" 2> /dev/null)" in
+  1:failed*"no answer that decides from ghcr.io/$SIB1 (status 1)"*) ok "mirror-file: a sibling that answers 503, and every server 404: failed, not absent, naming the sibling" ;;
+  *) fail "mirror-file: a sibling that answers 503, and every server 404: failed, not absent, naming the sibling" \
+    "got: exit $rc, $(cat "$work/mf-gonebusy/results/3.tsv" 2> /dev/null)" "$MF 3; cat $work/mf-gonebusy.err" ;;
+esac
+reset "$absent" "$after" 0
+printf '%s\t404\tblob-unknown.json\n' "$SIB1" > "$FAKE/blobs.tsv"
+printf '503\n' > "$FAKE/up/d-1-1-any.pkg.tar.zst.code"
+rc="$(mf_run upgone 3)"
+rm -f "$FAKE/up/d-1-1-any.pkg.tar.zst.code"
+check "mirror-file: a sibling that answers 404, and the upstream server errs: failed, not absent" "1 failed" \
+  "$rc $(cut -f 3 "$work/mf-upgone/results/3.tsv" 2> /dev/null)" "$MF 3; cat $work/mf-upgone.err"
 reset "$absent" "$after" 0
 printf '%s\t503\tbusy.txt\n' "$SIB1" > "$FAKE/blobs.tsv"
 printf '503\n' > "$FAKE/up/d-1-1-any.pkg.tar.zst.code"

@@ -156,8 +156,9 @@ WORKER_URL="${WORKER_URL%/}"
 HISTORY_LINES="${STATUS_HISTORY_LINES:-2000}"
 [[ "$HISTORY_LINES" =~ ^[1-9][0-9]*$ ]] || die "STATUS_HISTORY_LINES must be a positive integer, not '$HISTORY_LINES'"
 # worker-down: failed probes in this many runs in a row, over at least this
-# many seconds. The cron runs status.yml at :47 each hour, and sync.yml starts
-# it after each sync, so two runs can be minutes apart.
+# many seconds. status.yml runs on its hourly cron (:47). On main, sync.yml
+# also starts it after a scheduled sync or a sync that promoted a target, so
+# two runs can be minutes apart.
 WORKER_DOWN_RUNS=2
 WORKER_DOWN_SECONDS=3000
 owner="${MIRROR_NAMESPACE%%/*}"

@@ -96,11 +96,13 @@ env:
 jobs:
   plan:
     runs-on: ubuntu-24.04
-    # 20 min of upstream reads (PLAN_BUDGET) and 4 min of registry reads
-    # (REGISTRY_READ_BUDGET), plus the fetcher client install and the keyring
-    # image pulls for the powerpc targets, fit under 40. The registry budget
-    # stops each new read; one read in progress can run past it by up to
-    # about 4 min (lib.sh registry_get_manifest: 60 s, 3 retries).
+    # These fit under 40 min: 20 min of upstream reads (PLAN_BUDGET), 4 min
+    # of registry reads (REGISTRY_READ_BUDGET), and up to about 9 min more
+    # for the registry read in progress when that budget is spent. The
+    # fetcher client install and the keyring image pulls for the powerpc
+    # targets take the rest. The registry budget stops each new read. An
+    # index read makes up to 9 requests, each within 60 s and 5 s more
+    # (scripts/plan).
     timeout-minutes: 40
     # packages: write, because plan withdraws from a target's index the rows
     # of the files this run writes tags of (scripts/plan step 6b).
