@@ -18,7 +18,14 @@
 # returns the earlier attempt's artifact for every name not uploaded again.
 # So each artifact a chain makes carries the plan id, and scripts/stage and
 # scripts/report read none of another plan (docs/operations.md).
+#
+# The title of a run names its targets: "Sync all targets" for a scheduled run
+# or a dispatch with no targets, "Sync x86_64-core" for a dispatch of one.
+# scripts/upstream-watch (upstream-watch.yml) starts a run of the targets whose
+# upstream changed. scripts/dispatch-overdue counts only a run of every target
+# for the age of sync.yml.
 name: Sync
+run-name: Sync ${{ inputs.targets || 'all targets' }}
 
 on:
   schedule:
@@ -406,18 +413,24 @@ jobs:
           path: ${{ runner.temp }}/summaries
           merge-multiple: true
       - name: Report
+        id: report
         env:
           GH_TOKEN: ${{ github.token }}
           TRACK_ISSUES: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
         run: |
           mkdir -p "$RUNNER_TEMP/dl-plan" "$RUNNER_TEMP/summaries"
           scripts/report "$RUNNER_TEMP/dl-plan" "$RUNNER_TEMP/summaries"
+      # Only after a scheduled run, or a run that promoted a target (the
+      # promoted count of scripts/report). upstream-watch.yml can start a
+      # run every 15 minutes, and status.yml has its own hourly cron. The
+      # report writes the count before it fails a run, so a run that
+      # promotes one target and holds another still starts status.yml.
       # GitHub refuses to start a workflow that is not active, and a person
       # may disable status.yml on purpose: a notice, as in
       # scripts/dispatch-overdue, not a red sync. A state that does not read
       # still fails the step.
       - name: Start the status workflow
-        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        if: ${{ always() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || fromJSON(steps.report.outputs.promoted || '0') > 0) }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

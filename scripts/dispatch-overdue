@@ -14,6 +14,12 @@
 # A run that is queued or in progress counts as fresh: nothing starts twice.
 # A workflow with no run at all is started. The run is started on main only.
 #
+# ⛔ For sync.yml, only a run of every target counts for the age: a scheduled
+# run, or a run whose title is "Sync all targets" (the run-name of sync.yml).
+# scripts/upstream-watch starts runs of some targets only, often more than
+# one an hour, and such a run must not hold back the full sync. A run of any
+# kind that has not ended still counts as fresh. The newest 100 runs are read.
+#
 # Needs GH_TOKEN with actions: write, GITHUB_REPOSITORY, gh and jq.
 #
 # Exit status: 0 the workflow is fresh or was started, 1 could not tell or
@@ -66,28 +72,35 @@ if [ "$state" != active ]; then
 fi
 
 rc=0
-gh api "repos/$slug/actions/workflows/$wf/runs?branch=main&per_page=10" > "$work/runs.json" || rc=$?
+gh api "repos/$slug/actions/workflows/$wf/runs?branch=main&per_page=100" > "$work/runs.json" || rc=$?
 [ "$rc" -eq 0 ] || die "could not list the runs of $wf (gh ended $rc)" \
-  "reproduce: gh api 'repos/$slug/actions/workflows/$wf/runs?branch=main&per_page=10'"
+  "reproduce: gh api 'repos/$slug/actions/workflows/$wf/runs?branch=main&per_page=100'"
 
-# busy: runs that have not ended; age: minutes since the newest run started
+kind=run
+if [ "$wf" = sync.yml ]; then
+  kind="run of every target"
+fi
+# busy: runs of any kind that have not ended; age: minutes since the newest
+# run that counts started, -1 when none counts
 busy="$(jq '[.workflow_runs[] | select(.status != "completed")] | length' "$work/runs.json")"
-age="$(jq 'if (.workflow_runs | length) == 0 then -1
-  else ((now - (.workflow_runs | map(.created_at | fromdateiso8601) | max)) / 60 | floor) end' "$work/runs.json")"
+age="$(jq --arg wf "$wf" '[.workflow_runs[]
+  | select($wf != "sync.yml" or .event == "schedule" or .display_title == "Sync all targets")
+  | .created_at | fromdateiso8601]
+  | if length == 0 then -1 else ((now - max) / 60 | floor) end' "$work/runs.json")"
 
 if [ "$busy" -gt 0 ]; then
   echo "dispatch-overdue: $wf has $busy run(s) that have not ended; nothing to start"
   exit 0
 fi
 if [ "$age" -ge 0 ] && [ "$age" -le "$max" ]; then
-  echo "dispatch-overdue: $wf last started $age min ago, within $max min"
+  echo "dispatch-overdue: $wf last started a $kind $age min ago, within $max min"
   exit 0
 fi
 
 if [ "$age" -lt 0 ]; then
-  why="it has no run on main"
+  why="it has no $kind on main in its newest 100 runs"
 else
-  why="its newest run on main started $age min ago, over $max min"
+  why="its newest $kind on main started $age min ago, over $max min"
 fi
 echo "::warning::dispatch-overdue: $wf is overdue: $why; starting it"
 rc=0

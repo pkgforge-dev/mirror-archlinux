@@ -1,0 +1,79 @@
+# Start a sync of each target soon after its upstream database changes:
+# scripts/upstream-watch, every 15 minutes.
+#
+# Each tick sends one HEAD request to each <db_server>/<repo>.db, and compares
+# ETag, Last-Modified and Content-Length with the last tick. The targets that
+# changed get one sync.yml run (scripts/dispatch-sync), at most once in
+# SYNC_MIN_INTERVAL (60 min) per target. The powerpc targets are not watched:
+# their upstream needs a browser-profile client, and the watch uses curl.
+# ⭐ The 3 h cron of sync.yml stays the backstop for every target.
+#
+# The state goes from one tick to the next through the Actions cache: each
+# tick restores the newest entry and saves a new one. A tick that finds no
+# state starts no sync; it records what it reads.
+#
+# Only a run on main starts a sync. On another ref, and with dry_run, the tick
+# logs the targets it would start, and keeps the old state of their URLs.
+#
+# To stop it, disable the workflow: gh workflow disable upstream-watch.yml
+# (docs/operations.md, The upstream watch).
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only log the targets a sync would start for
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    # WATCH_BUDGET (300 s) of HEAD requests, then dispatch-sync under its own
+    # 120 s limit, fit in 10 minutes.
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The key of this run never exists yet, so the restore takes the newest
+      # entry whose key starts with upstream-watch-.
+      - name: Restore the state of the last tick
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/upstream-watch
+          key: upstream-watch-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: upstream-watch-
+      - name: Read the headers of each upstream database, and start a sync of the targets that changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WATCH_DRY_RUN: ${{ (github.ref != 'refs/heads/main' || inputs.dry_run) && '1' || '0' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/upstream-watch"
+          scripts/upstream-watch "$RUNNER_TEMP/upstream-watch/state.tsv" "$RUNNER_TEMP/upstream-watch/state.tsv" \
+            "$RUNNER_TEMP/upstream-watch-out"
+      # always(): the state is saved after a tick that fails too. It holds the
+      # old line of each change that started no sync, so the next tick sees
+      # that change again.
+      - name: Save the state for the next tick
+        if: ${{ always() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/upstream-watch
+          key: upstream-watch-${{ github.run_id }}-${{ github.run_attempt }}
