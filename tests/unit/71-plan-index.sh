@@ -326,7 +326,8 @@ RP="REPO_ROOT=<stand-ins> PATH=<curl stand-in>:\$PATH scripts/plan OUT CONF"
 #   p4   index row of another sha256                todo, withdrawn
 #   p5   indexed as absent upstream                 todo
 #   p6   new                                        todo
-#   p7   promoted and indexed, verified             skip, vouched 1
+#   p7   promoted and indexed, verified             skip, not vouched: a
+#        promoted file needs no row
 #   p8   indexed with no signature, signed now      todo (step 4), withdrawn
 #   p9   promoted with another %PGPSIG%             todo
 #   p10  indexed with no signature, none upstream   skip, vouched 1 1
@@ -382,8 +383,8 @@ check "matrix: new is todo and what is not promoted and not indexed as verified"
   "$(names "$D/new.tsv" 2)" "$RP; cat $D/new.tsv"
 check "matrix: the file only to verify has the action verify" "p3-1-1-x86_64.pkg.tar.zst verify" \
   "$(awk -F '\t' '$7 == "verify" { print $2 " " $7 }' "$D/new.tsv")" "cat $D/new.tsv"
-check "matrix: vouched names the indexed files not planned again, with their flags" \
-  "p10-1-1-x86_64.pkg.tar.zst 1 1|p2-1-1-x86_64.pkg.tar.zst 1 0|p3-1-1-x86_64.pkg.tar.zst 0 0|p7-1-1-x86_64.pkg.tar.zst 1 0|" \
+check "matrix: vouched names the indexed files not planned again and not promoted, with their flags" \
+  "p10-1-1-x86_64.pkg.tar.zst 1 1|p2-1-1-x86_64.pkg.tar.zst 1 0|p3-1-1-x86_64.pkg.tar.zst 0 0|" \
   "$(LC_ALL=C sort "$D/vouched.tsv" | tr '\t\n' ' |')" "cat $D/vouched.tsv"
 check "matrix: the indexed file with no .sig upstream stays unsigned" "p10-1-1-x86_64.pkg.tar.zst" "$(cat "$D/unsigned.txt")" "cat $D/unsigned.txt"
 subset matrix x86_64-core
@@ -427,8 +428,8 @@ D="$work/out-context/x86_64-core"
 check "context: another verify context keeps todo" "0 p11 p4 p5 p6 p8 p9" "$rc $(names "$D/todo.tsv" 2)" "$RP; cat $work/context.err"
 check "context: another verify context verifies every indexed file again" "p10 p11 p2 p3 p4 p5 p6 p8 p9" \
   "$(names "$D/new.tsv" 2)" "cat $D/new.tsv"
-check "context: and vouches for them with verified 0" \
-  "p10-1-1-x86_64.pkg.tar.zst 0 1|p2-1-1-x86_64.pkg.tar.zst 0 0|p3-1-1-x86_64.pkg.tar.zst 0 0|p7-1-1-x86_64.pkg.tar.zst 0 0|" \
+check "context: and vouches for the ones not promoted with verified 0" \
+  "p10-1-1-x86_64.pkg.tar.zst 0 1|p2-1-1-x86_64.pkg.tar.zst 0 0|p3-1-1-x86_64.pkg.tar.zst 0 0|" \
   "$(LC_ALL=C sort "$D/vouched.tsv" | tr '\t\n' ' |')" "cat $D/vouched.tsv"
 check "context: the index this run writes takes this run's context" "$CTX $OTHER_CTX" \
   "$(meta context x86_64-core INDEX_CONTEXT_OUT) $(meta context x86_64-core INDEX_CONTEXT)" "cat $D/meta.env"

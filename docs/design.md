@@ -137,7 +137,7 @@ The index holds what the runs of one ref left on the registry. A run that fails,
 
 index-write writes these rows:
 
-- each line of `PLAN/<target>/vouched.tsv`: the rows of the index that plan read, for the files it did not plan
+- each line of `PLAN/<target>/vouched.tsv`: the rows of the index that plan read, for the files it did not plan and that are not promoted
 - each file of the run with the result `pushed` or `present`: state `m`, verified 0
 - each file of the run with the result `absent`: state `a`
 - a file with any other result gets no row
@@ -166,9 +166,11 @@ A file counts as indexed when the index has a row `m` for it, and the `ref.db` r
 | --- | --- |
 | todo, the files this run mirrors | not (P or I), or again, or (A and not P) |
 | new, the files this run verifies | (not P and not V), or again, or (A and not P); so every todo file is verified |
-| vouched, the rows index-write keeps | I and not again |
+| vouched, the rows index-write keeps | I and not again and not P |
 
 A file absent upstream is tried again on each run until a promoted database names it. After that it is skipped, as a promoted file is.
+
+A promoted file needs no row: P spares it a mirror and a verify. So the index holds only the files that are not promoted. A promotion empties it of the files it takes, at the next run. A file of the run that is promoted (step 4 or 4b planned it again) gets a row from its result, and the next run drops that row.
 
 A target with no todo file and files to verify is pending with no shard (`pending.json`). It stages and verifies. Its why says `0 file(s) to mirror, N to verify`.
 
