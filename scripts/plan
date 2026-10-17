@@ -127,7 +127,8 @@
 #                           is not promoted and not indexed as verified under
 #                           VERIFY_CONTEXT (action verify)
 # OUT/<target>/vouched.tsv  filename, verified, unsigned: each indexed file
-#                           that is not todo, for scripts/index-write. verified
+#                           that is not todo and not promoted, for
+#                           scripts/index-write. verified
 #                           is the index's flag when VERIFY_CONTEXT is not known
 #                           or equals INDEX_CONTEXT, else 0. unsigned is the
 #                           index's flag, or 1 when unsigned.txt names the file.
@@ -1225,9 +1226,12 @@ plan_target() {
   #    context, and again a file of signed-now.txt (step 4 or 4b):
   #      todo     !(P or I) or again or (A and !P)
   #      new      (!P and !V) or again or (A and !P), so todo is a part of new
-  #      vouched  I and not again
+  #      vouched  I and not again and not P
   #    A file absent upstream is tried again on each run until a promoted
   #    database names it. After that it is skipped, as a promoted file is.
+  #    A promoted file needs no row: P spares it a mirror and a verify. So the
+  #    index holds only what is not promoted, and shrinks when a promotion
+  #    takes its files.
   #-------------------------------------------------------------------------#
   cut -f 1 "$dir/records.tsv" | "$WRAPPER" --tags > "$dir/pairs.tsv"
   : > "$dir/todo.tsv"
@@ -1255,7 +1259,7 @@ plan_target() {
       } else if (!P && !V) {
         print target, f, tag[f], $5, $6, $2, "verify", $7, $8 > new
       }
-      if (I && !ag) {
+      if (I && !ag && !P) {
         v = (vc == "" || vc == ic) ? xv[f] : 0
         u = (f in uns) ? 1 : xu[f]
         print f, v, u > vouched
