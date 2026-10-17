@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="144" height="20" viewBox="0 0 144 20" role="img" aria-label="powerpc: 100% · 2.3 d">
+<title>powerpc: 100% · 2.3 d</title>
+<style>.lab{fill:#555}.msg{fill:#1a7f37}text{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;font-size:11px;fill:#fff}@media (prefers-color-scheme:dark){.lab{fill:#3d444d}.msg{fill:#238636}}</style>
+<clipPath id="r"><rect width="144" height="20" rx="3"/></clipPath>
+<g clip-path="url(#r)"><rect class="lab" width="58" height="20"/><rect class="msg" x="58" width="86" height="20"/></g>
+<text x="29.0" y="14" text-anchor="middle">powerpc</text>
+<text x="101.0" y="14" text-anchor="middle">100% · 2.3 d</text>
+</svg>

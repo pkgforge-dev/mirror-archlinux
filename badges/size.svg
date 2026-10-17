@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="88" height="20" viewBox="0 0 88 20" role="img" aria-label="size: 455 GiB">
+<title>size: 455 GiB</title>
+<style>.lab{fill:#555}.msg{fill:#0969da}text{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;font-size:11px;fill:#fff}@media (prefers-color-scheme:dark){.lab{fill:#3d444d}.msg{fill:#1f6feb}}</style>
+<clipPath id="r"><rect width="88" height="20" rx="3"/></clipPath>
+<g clip-path="url(#r)"><rect class="lab" width="33" height="20"/><rect class="msg" x="33" width="55" height="20"/></g>
+<text x="16.5" y="14" text-anchor="middle">size</text>
+<text x="60.5" y="14" text-anchor="middle">455 GiB</text>
+</svg>
