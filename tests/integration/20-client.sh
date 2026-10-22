@@ -24,7 +24,7 @@ set -euo pipefail
 # tag: base
 ARCH_IMAGE=docker.io/library/archlinux:base@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
 # tag: 3
-REGISTRY_IMAGE=docker.io/library/registry:3@sha256:be9a7062dd7e3316e5c0368e42740dc991a9ceb5d382317675a8738db0112af0
+REGISTRY_IMAGE=docker.io/library/registry:3@sha256:01cd312e67026f06f5d89c3e133a4a9adc7cb9eeb9b1194e0b2954dfd770efd2
 # tag: 3.15-alpine
 PYTHON_IMAGE=docker.io/library/python:3.15-alpine@sha256:a58bff94159509f3a3f774da8c244001b74e0348139c421956abf991bfc9f1b8
 
