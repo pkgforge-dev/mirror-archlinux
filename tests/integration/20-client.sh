@@ -26,7 +26,7 @@ ARCH_IMAGE=docker.io/library/archlinux:base@sha256:52dfbd5afb23a220d5ee92dafcb4c
 # tag: 3
 REGISTRY_IMAGE=docker.io/library/registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
 # tag: 3.15-alpine
-PYTHON_IMAGE=docker.io/library/python:3.15-alpine@sha256:2699b90f4d562a22e2dd076c82f964032f64814204bff36d271a54ba4cc2c7e2
+PYTHON_IMAGE=docker.io/library/python:3.15-alpine@sha256:a58bff94159509f3a3f774da8c244001b74e0348139c421956abf991bfc9f1b8
 
 FIX="$REPO_ROOT/tests/fixtures/client"
 runtime_detect
