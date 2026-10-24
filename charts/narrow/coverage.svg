@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="1002" viewBox="0 0 420 1002" role="img" aria-labelledby="title desc">
+<title id="title">Coverage by repository</title>
+<desc id="desc">Share of each repository&#x27;s upstream files that the mirror serves, by file name and sha256, grouped by architecture.</desc>
+<style>.bg{fill:#fcfcfb;stroke:rgba(11,11,11,.10)}text{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif}.tt{font-size:16px;font-weight:600;fill:#0b0b0b}.hd{font-size:30px;font-weight:600;fill:#0b0b0b}.sub{font-size:13px;fill:#52514e}.lb{font-size:12px;fill:#0b0b0b}.gr{font-size:12px;font-weight:600;fill:#52514e;paint-order:stroke;stroke:#fcfcfb;stroke-width:5px;stroke-linejoin:round}.vl{font-size:12px;fill:#0b0b0b;font-variant-numeric:tabular-nums}.mu{fill:#6f6e69}.lg{font-size:12px;fill:#52514e}.tk{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}.ax{font-size:12px;fill:#52514e}.note{font-size:13px;fill:#6f6e69}.grid{stroke:#e9e8e3;stroke-width:1}.base{stroke:#c3c2b7;stroke-width:1}.ref{stroke:#7d7b75;stroke-width:1}.lead{stroke:#c3c2b7;stroke-width:1;fill:none}.track{fill:#ebeae5}.ring{stroke:#fcfcfb;stroke-width:2}.cut{stroke:#fcfcfb;stroke-width:2}.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.hollow{fill:none;stroke:#898781;stroke-width:1.5}.s1{fill:#2a78d6}.l1{stroke:#2a78d6}.s2{fill:#eb6834}.l2{stroke:#eb6834}.s3{fill:#1baf7a}.l3{stroke:#1baf7a}.s4{fill:#eda100}.l4{stroke:#eda100}.s5{fill:#e87ba4}.l5{stroke:#e87ba4}.s6{fill:#008300}.l6{stroke:#008300}.s7{fill:#4a3aa7}.l7{stroke:#4a3aa7}.s8{fill:#e34948}.l8{stroke:#e34948}.s0{fill:#a3a29c}.l0{stroke:#a3a29c}.st-good{fill:#0ca30c}.st-warning{fill:#fab219}.st-critical{fill:#d03b3b}.st-none{fill:#898781}.st-unknown{fill:#898781}@media (prefers-color-scheme:dark){.bg{fill:#1a1a19;stroke:rgba(255,255,255,.10)}.tt,.hd,.lb,.vl{fill:#ffffff}.sub,.gr,.ax,.lg{fill:#c3c2b7}.tk,.note,.mu{fill:#9a9890}.grid{stroke:#2a2a28}.base,.lead{stroke:#3d3d3a}.ref{stroke:#9a9890}.track{fill:#2e2e2c}.ring,.cut,.gr{stroke:#1a1a19}.s1{fill:#3987e5}.l1{stroke:#3987e5}.s2{fill:#d95926}.l2{stroke:#d95926}.s3{fill:#199e70}.l3{stroke:#199e70}.s4{fill:#c98500}.l4{stroke:#c98500}.s5{fill:#d55181}.l5{stroke:#d55181}.s6{fill:#008300}.l6{stroke:#008300}.s7{fill:#9085e9}.l7{stroke:#9085e9}.s8{fill:#e66767}.l8{stroke:#e66767}.s0{fill:#6b6a65}.l0{stroke:#6b6a65}}</style>
+<rect class="bg" x="0.5" y="0.5" width="419" height="1001" rx="12"/>
+<text x="24.0" y="40.0" class="tt">Coverage by repository</text>
+<text x="24.0" y="82.0" class="hd">98.2%</text>
+<text x="24.0" y="101.0" class="sub">of 89,189 upstream files are in the mirror, by name and</text>
+<text x="24.0" y="120.0" class="sub">sha256. 21 of 21 repositories have a snapshot.</text>
+<rect x="24.0" y="141.0" width="10" height="10" rx="2" class="s1"/>
+<text x="40.0" y="150.0" class="lg">x86_64</text>
+<rect x="98.8" y="141.0" width="10" height="10" rx="2" class="s2"/>
+<text x="114.8" y="150.0" class="lg">aarch64</text>
+<rect x="179.1" y="141.0" width="10" height="10" rx="2" class="s3"/>
+<text x="195.1" y="150.0" class="lg">armv7h</text>
+<rect x="256.3" y="141.0" width="10" height="10" rx="2" class="s4"/>
+<text x="272.3" y="150.0" class="lg">loong64</text>
+<rect x="333.8" y="141.0" width="10" height="10" rx="2" class="s5"/>
+<text x="349.8" y="150.0" class="lg">riscv64</text>
+<rect x="24.0" y="161.0" width="10" height="10" rx="2" class="s6"/>
+<text x="40.0" y="170.0" class="lg">powerpc64le</text>
+<rect x="131.2" y="161.0" width="10" height="10" rx="2" class="s7"/>
+<text x="147.2" y="170.0" class="lg">powerpc64</text>
+<rect x="228.3" y="161.0" width="10" height="10" rx="2" class="s8"/>
+<text x="244.3" y="170.0" class="lg">powerpc</text>
+<rect x="24.0" y="181.0" width="10" height="10" rx="2" class="track"/>
+<text x="40.0" y="190.0" class="lg">upstream only</text>
+<path d="M97.8 212.0V942.0" class="base"/>
+<text x="97.8" y="958.0" class="tk" text-anchor="middle">0%</text>
+<path d="M223.5 212.0V942.0" class="grid"/>
+<text x="223.5" y="958.0" class="tk" text-anchor="middle">50%</text>
+<path d="M349.2 212.0V942.0" class="grid"/>
+<text x="349.2" y="958.0" class="tk" text-anchor="middle">100%</text>
+<text x="24.0" y="225.0" class="gr">x86_64</text>
+<text x="32.0" y="250.0" class="lb">core</text>
+<g><title>x86_64-core: 299 of 299 files (100%), 1.84 of 1.84 GiB</title><path d="M97.8 240.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s1"/><rect x="97.8" y="234.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="250.0" class="vl">100%</text>
+<text x="32.0" y="274.0" class="lb">extra</text>
+<g><title>x86_64-extra: 15,050 of 15,050 files (100%), 108 of 108 GiB</title><path d="M97.8 264.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s1"/><rect x="97.8" y="258.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="274.0" class="vl">100%</text>
+<text x="32.0" y="298.0" class="lb">multilib</text>
+<g><title>x86_64-multilib: 182 of 182 files (100%), 0.35 of 0.35 GiB</title><path d="M97.8 288.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s1"/><rect x="97.8" y="282.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="298.0" class="vl">100%</text>
+<text x="24.0" y="325.0" class="gr">aarch64</text>
+<text x="32.0" y="350.0" class="lb">core</text>
+<g><title>aarch64-core: 313 of 313 files (100%), 1.47 of 1.47 GiB</title><path d="M97.8 340.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s2"/><rect x="97.8" y="334.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="350.0" class="vl">100%</text>
+<text x="32.0" y="374.0" class="lb">extra</text>
+<g><title>aarch64-extra: 12,992 of 12,992 files (100%), 54.0 of 54.0 GiB</title><path d="M97.8 364.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s2"/><rect x="97.8" y="358.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="374.0" class="vl">100%</text>
+<text x="32.0" y="398.0" class="lb">alarm</text>
+<g><title>aarch64-alarm: 75 of 75 files (100%), 0.13 of 0.13 GiB</title><path d="M97.8 388.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s2"/><rect x="97.8" y="382.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="398.0" class="vl">100%</text>
+<text x="32.0" y="422.0" class="lb">aur</text>
+<g><title>aarch64-aur: 12 of 12 files (100%), 0.01 of 0.01 GiB</title><path d="M97.8 412.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s2"/><rect x="97.8" y="406.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="422.0" class="vl">100%</text>
+<text x="24.0" y="449.0" class="gr">armv7h</text>
+<text x="32.0" y="474.0" class="lb">core</text>
+<g><title>armv7h-core: 326 of 326 files (100%), 1.51 of 1.51 GiB</title><path d="M97.8 464.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s3"/><rect x="97.8" y="458.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="474.0" class="vl">100%</text>
+<text x="32.0" y="498.0" class="lb">extra</text>
+<g><title>armv7h-extra: 12,550 of 12,550 files (100%), 42.8 of 42.8 GiB</title><path d="M97.8 488.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s3"/><rect x="97.8" y="482.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="498.0" class="vl">100%</text>
+<text x="32.0" y="522.0" class="lb">alarm</text>
+<g><title>armv7h-alarm: 125 of 125 files (100%), 0.18 of 0.18 GiB</title><path d="M97.8 512.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s3"/><rect x="97.8" y="506.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="522.0" class="vl">100%</text>
+<text x="32.0" y="546.0" class="lb">aur</text>
+<g><title>armv7h-aur: 11 of 11 files (100%), 0.01 of 0.01 GiB</title><path d="M97.8 536.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s3"/><rect x="97.8" y="530.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="546.0" class="vl">100%</text>
+<text x="24.0" y="573.0" class="gr">loong64</text>
+<text x="32.0" y="598.0" class="lb">core</text>
+<g><title>loong64-core: 295 of 295 files (100%), 1.77 of 1.77 GiB</title><path d="M97.8 588.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s4"/><rect x="97.8" y="582.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="598.0" class="vl">100%</text>
+<text x="32.0" y="622.0" class="lb">extra</text>
+<g><title>loong64-extra: 14,199 of 14,199 files (100%), 72.8 of 72.8 GiB</title><path d="M97.8 612.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s4"/><rect x="97.8" y="606.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="622.0" class="vl">100%</text>
+<text x="24.0" y="649.0" class="gr">riscv64</text>
+<text x="32.0" y="674.0" class="lb">core</text>
+<g><title>riscv64-core: 294 of 294 files (100%), 1.97 of 1.97 GiB</title><path d="M97.8 664.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s5"/><rect x="97.8" y="658.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="674.0" class="vl">100%</text>
+<text x="32.0" y="698.0" class="lb">extra</text>
+<g><title>riscv64-extra: 14,750 of 14,750 files (100%), 84.1 of 84.1 GiB</title><path d="M97.8 688.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s5"/><rect x="97.8" y="682.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="698.0" class="vl">100%</text>
+<text x="24.0" y="725.0" class="gr">powerpc64le</text>
+<text x="32.0" y="750.0" class="lb">base</text>
+<g><title>powerpc64le-base: 3,798 of 3,798 files (100%), 16.7 of 16.7 GiB</title><path d="M97.8 740.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s6"/><rect x="97.8" y="734.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="750.0" class="vl">100%</text>
+<text x="32.0" y="774.0" class="lb">base-any</text>
+<g><title>powerpc64le-base-any: 2,238 of 2,238 files (100%), 14.0 of 14.0 GiB</title><path d="M97.8 764.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s6"/><rect x="97.8" y="758.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="774.0" class="vl">100%</text>
+<text x="24.0" y="801.0" class="gr">powerpc64</text>
+<text x="32.0" y="826.0" class="lb">base</text>
+<g><title>powerpc64-base: 3,595 of 3,595 files (100%), 14.6 of 14.6 GiB</title><path d="M97.8 816.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s7"/><rect x="97.8" y="810.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="826.0" class="vl">100%</text>
+<text x="32.0" y="850.0" class="lb">base-any</text>
+<g><title>powerpc64-base-any: 2,238 of 2,238 files (100%), 14.0 of 14.0 GiB</title><path d="M97.8 840.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s7"/><rect x="97.8" y="834.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="850.0" class="vl">100%</text>
+<text x="24.0" y="877.0" class="gr">powerpc</text>
+<text x="32.0" y="902.0" class="lb">base</text>
+<g><title>powerpc-base: 2,087 of 3,609 files (57.8%), 5.12 of 13.2 GiB</title><path d="M97.8 892.0h145.4v12.0h-145.4z" class="s8"/><path d="M245.2 892.0h100.0a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-100.0z" class="track"/><rect x="97.8" y="886.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="902.0" class="vl">57.8%</text>
+<text x="32.0" y="926.0" class="lb">base-any</text>
+<g><title>powerpc-base-any: 2,238 of 2,238 files (100%), 14.0 of 14.0 GiB</title><path d="M97.8 916.0h247.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-247.4z" class="s8"/><rect x="97.8" y="910.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="361.2" y="926.0" class="vl">100%</text>
+<text x="223.5" y="980.0" class="ax" text-anchor="middle">Share of upstream files in the mirror</text>
+</svg>

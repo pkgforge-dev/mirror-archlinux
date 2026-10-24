@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="174" height="20" viewBox="0 0 174 20" role="img" aria-label="mirror: 98.2% · 21/21 repos">
+<title>mirror: 98.2% · 21/21 repos</title>
+<style>.lab{fill:#555}.msg{fill:#cf222e}text{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif;font-size:11px;fill:#fff}@media (prefers-color-scheme:dark){.lab{fill:#3d444d}.msg{fill:#da3633}}</style>
+<clipPath id="r"><rect width="174" height="20" rx="3"/></clipPath>
+<g clip-path="url(#r)"><rect class="lab" width="46" height="20"/><rect class="msg" x="46" width="128" height="20"/></g>
+<text x="23.0" y="14" text-anchor="middle">mirror</text>
+<text x="110.0" y="14" text-anchor="middle">98.2% · 21/21 repos</text>
+</svg>
