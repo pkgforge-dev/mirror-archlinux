@@ -55,7 +55,7 @@ jobs:
   # still runs out keeps the results of the files that ended.
   mirror:
     if: ${{ inputs.shards != '[]' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 250
     permissions:
       contents: read
@@ -125,7 +125,7 @@ jobs:
   stage:
     needs: mirror
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -172,7 +172,7 @@ jobs:
   verify:
     needs: stage
     if: ${{ !cancelled() && needs.stage.result == 'success' && needs.stage.outputs.has_batches == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 95
     permissions:
       contents: read
@@ -228,7 +228,7 @@ jobs:
   promote:
     needs: [stage, verify]
     if: ${{ !cancelled() && needs.stage.result == 'success' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -285,7 +285,7 @@ jobs:
   summary:
     needs: [mirror, stage, verify, promote]
     if: ${{ always() }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 25
     # packages: write, because index-write pushes the target's index tag.
     permissions:
