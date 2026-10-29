@@ -72,7 +72,7 @@ refused "a line that is not key = value" "$work/t6/x86_64-core.conf"
 # The keys that set verify's trust root
 #---------------------------------------------------------------------------#
 # tag: aarch64
-IMG='ghcr.io/pkgforge-dev/archlinux:aarch64@sha256:bfbd221276962abb832f6b476b38ba5215d7f9ea10ea7160e5e2a46c559168f4'
+IMG='ghcr.io/pkgforge-dev/archlinux:aarch64@sha256:b11985140b8de72d474606597c7654c8dc322fffdecaee835cbe89d80e8ec862'
 # trust NAME LINES...: a target file of x86_64 extra, with x86_64-core beside it
 trust() {
   local d="$work/trust-$1"
