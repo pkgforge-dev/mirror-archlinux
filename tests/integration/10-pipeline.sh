@@ -37,7 +37,7 @@ ARCH_IMAGE=docker.io/library/archlinux:base@sha256:e82623936fa1a69700b48e98b058d
 # tag: 3
 REGISTRY_IMAGE=docker.io/library/registry:3@sha256:d4032d4cc323c1731c707931ecada07a53076eac38e3b61ae57533f170f2c6c3
 # tag: 1.38
-HTTPD_IMAGE=docker.io/library/busybox:1.38@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+HTTPD_IMAGE=docker.io/library/busybox:1.38@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
 
 runtime_detect
 work="$(work_dir)"
