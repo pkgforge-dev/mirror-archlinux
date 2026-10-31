@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="962" viewBox="0 0 420 962" role="img" aria-labelledby="title desc">
+<title id="title">Snapshot age</title>
+<desc id="desc">Hours since each repository&#x27;s promoted snapshot was fetched from upstream, against the sync interval. A bar past the stale limit is cut at the end of the scale.</desc>
+<style>.bg{fill:#fcfcfb;stroke:rgba(11,11,11,.10)}text{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif}.tt{font-size:16px;font-weight:600;fill:#0b0b0b}.hd{font-size:30px;font-weight:600;fill:#0b0b0b}.sub{font-size:13px;fill:#52514e}.lb{font-size:12px;fill:#0b0b0b}.gr{font-size:12px;font-weight:600;fill:#52514e;paint-order:stroke;stroke:#fcfcfb;stroke-width:5px;stroke-linejoin:round}.vl{font-size:12px;fill:#0b0b0b;font-variant-numeric:tabular-nums}.mu{fill:#6f6e69}.lg{font-size:12px;fill:#52514e}.tk{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}.ax{font-size:12px;fill:#52514e}.note{font-size:13px;fill:#6f6e69}.grid{stroke:#e9e8e3;stroke-width:1}.base{stroke:#c3c2b7;stroke-width:1}.ref{stroke:#7d7b75;stroke-width:1}.lead{stroke:#c3c2b7;stroke-width:1;fill:none}.track{fill:#ebeae5}.ring{stroke:#fcfcfb;stroke-width:2}.cut{stroke:#fcfcfb;stroke-width:2}.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.hollow{fill:none;stroke:#898781;stroke-width:1.5}.s1{fill:#2a78d6}.l1{stroke:#2a78d6}.s2{fill:#eb6834}.l2{stroke:#eb6834}.s3{fill:#1baf7a}.l3{stroke:#1baf7a}.s4{fill:#eda100}.l4{stroke:#eda100}.s5{fill:#e87ba4}.l5{stroke:#e87ba4}.s6{fill:#008300}.l6{stroke:#008300}.s7{fill:#4a3aa7}.l7{stroke:#4a3aa7}.s8{fill:#e34948}.l8{stroke:#e34948}.s0{fill:#a3a29c}.l0{stroke:#a3a29c}.st-good{fill:#0ca30c}.st-warning{fill:#fab219}.st-critical{fill:#d03b3b}.st-none{fill:#898781}.st-unknown{fill:#898781}@media (prefers-color-scheme:dark){.bg{fill:#1a1a19;stroke:rgba(255,255,255,.10)}.tt,.hd,.lb,.vl{fill:#ffffff}.sub,.gr,.ax,.lg{fill:#c3c2b7}.tk,.note,.mu{fill:#9a9890}.grid{stroke:#2a2a28}.base,.lead{stroke:#3d3d3a}.ref{stroke:#9a9890}.track{fill:#2e2e2c}.ring,.cut,.gr{stroke:#1a1a19}.s1{fill:#3987e5}.l1{stroke:#3987e5}.s2{fill:#d95926}.l2{stroke:#d95926}.s3{fill:#199e70}.l3{stroke:#199e70}.s4{fill:#c98500}.l4{stroke:#c98500}.s5{fill:#d55181}.l5{stroke:#d55181}.s6{fill:#008300}.l6{stroke:#008300}.s7{fill:#9085e9}.l7{stroke:#9085e9}.s8{fill:#e66767}.l8{stroke:#e66767}.s0{fill:#6b6a65}.l0{stroke:#6b6a65}}</style>
+<rect class="bg" x="0.5" y="0.5" width="419" height="961" rx="12"/>
+<text x="24.0" y="40.0" class="tt">Snapshot age</text>
+<text x="24.0" y="82.0" class="hd">17.1 d</text>
+<text x="112.5" y="64.0" class="sub">oldest snapshot. Sync runs every 3 h. 19 of 21</text>
+<text x="112.5" y="81.0" class="sub">repositories match upstream now.</text>
+<circle cx="29.0" cy="108.0" r="5" class="st-good"/>
+<text x="40.0" y="112.0" class="lg">matches upstream, or within 2 syncs</text>
+<path d="M278.8 102.4l5.6 9.6h-11.2z" class="st-warning"/>
+<text x="289.8" y="112.0" class="lg">late</text>
+<path d="M29.0 123.0l5 5-5 5-5-5z" class="st-critical"/>
+<text x="40.0" y="132.0" class="lg">stale, over 3 d</text>
+<circle cx="146.3" cy="128.0" r="4.25" class="hollow"/>
+<text x="157.3" y="132.0" class="lg">not mirrored yet</text>
+<path d="M97.8 172.0V902.0" class="base"/>
+<text x="97.8" y="918.0" class="tk" text-anchor="middle">0</text>
+<path d="M176.4 172.0V902.0" class="grid"/>
+<text x="176.4" y="918.0" class="tk" text-anchor="middle">1 d</text>
+<path d="M254.9 172.0V902.0" class="grid"/>
+<text x="254.9" y="918.0" class="tk" text-anchor="middle">2 d</text>
+<path d="M333.4 172.0V902.0" class="grid"/>
+<text x="333.4" y="918.0" class="tk" text-anchor="middle">3 d</text>
+<path d="M107.7 164.0V902.0" class="ref"/>
+<text x="111.7" y="168.0" class="tk">sync every 3 h</text>
+<text x="24.0" y="185.0" class="gr">x86_64</text>
+<text x="32.0" y="210.0" class="lb">core</text>
+<g><title>x86_64-core: fetched 2026-10-31T18:36:13Z, 17 min ago, matches upstream</title><path d="M97.8 200.0h0.9v12.0h-0.9z" class="st-good"/><rect x="97.8" y="194.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="206.0" r="5" class="st-good"/>
+<text x="361.4" y="210.0" class="vl">17 min</text>
+<text x="32.0" y="234.0" class="lb">extra</text>
+<g><title>x86_64-extra: fetched 2026-10-31T18:43:15Z, 10 min ago, within 2 syncs</title><path d="M97.8 224.0h0.5v12.0h-0.5z" class="st-good"/><rect x="97.8" y="218.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="230.0" r="5" class="st-good"/>
+<text x="361.4" y="234.0" class="vl">10 min</text>
+<text x="32.0" y="258.0" class="lb">multilib</text>
+<g><title>x86_64-multilib: fetched 2026-10-30T22:16:25Z, 20.6 h ago, matches upstream</title><path d="M97.8 248.0h63.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-63.4z" class="st-good"/><rect x="97.8" y="242.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="254.0" r="5" class="st-good"/>
+<text x="361.4" y="258.0" class="vl">20.6 h</text>
+<text x="24.0" y="285.0" class="gr">aarch64</text>
+<text x="32.0" y="310.0" class="lb">core</text>
+<g><title>aarch64-core: fetched 2026-10-31T18:36:13Z, 17 min ago, matches upstream</title><path d="M97.8 300.0h0.9v12.0h-0.9z" class="st-good"/><rect x="97.8" y="294.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="306.0" r="5" class="st-good"/>
+<text x="361.4" y="310.0" class="vl">17 min</text>
+<text x="32.0" y="334.0" class="lb">extra</text>
+<g><title>aarch64-extra: fetched 2026-10-31T18:36:13Z, 17 min ago, matches upstream</title><path d="M97.8 324.0h0.9v12.0h-0.9z" class="st-good"/><rect x="97.8" y="318.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="330.0" r="5" class="st-good"/>
+<text x="361.4" y="334.0" class="vl">17 min</text>
+<text x="32.0" y="358.0" class="lb">alarm</text>
+<g><title>aarch64-alarm: fetched 2026-10-31T01:49:15Z, 17.1 h ago, matches upstream</title><path d="M97.8 348.0h51.8a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-51.8z" class="st-good"/><rect x="97.8" y="342.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="354.0" r="5" class="st-good"/>
+<text x="361.4" y="358.0" class="vl">17.1 h</text>
+<text x="32.0" y="382.0" class="lb">aur</text>
+<g><title>aarch64-aur: fetched 2026-10-14T17:28:18Z, 17.1 d ago, matches upstream</title><path d="M97.8 372.0h231.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-231.6z" class="st-good"/><path d="M317.4 385.0l4 -14" class="cut"/><path d="M323.4 385.0l4 -14" class="cut"/><rect x="97.8" y="366.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="378.0" r="5" class="st-good"/>
+<text x="361.4" y="382.0" class="vl">17.1 d</text>
+<text x="24.0" y="409.0" class="gr">armv7h</text>
+<text x="32.0" y="434.0" class="lb">core</text>
+<g><title>armv7h-core: fetched 2026-10-31T01:49:15Z, 17.1 h ago, matches upstream</title><path d="M97.8 424.0h51.8a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-51.8z" class="st-good"/><rect x="97.8" y="418.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="430.0" r="5" class="st-good"/>
+<text x="361.4" y="434.0" class="vl">17.1 h</text>
+<text x="32.0" y="458.0" class="lb">extra</text>
+<g><title>armv7h-extra: fetched 2026-10-31T01:49:15Z, 17.1 h ago, matches upstream</title><path d="M97.8 448.0h51.8a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-51.8z" class="st-good"/><rect x="97.8" y="442.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="454.0" r="5" class="st-good"/>
+<text x="361.4" y="458.0" class="vl">17.1 h</text>
+<text x="32.0" y="482.0" class="lb">alarm</text>
+<g><title>armv7h-alarm: fetched 2026-10-31T01:49:15Z, 17.1 h ago, matches upstream</title><path d="M97.8 472.0h51.8a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-51.8z" class="st-good"/><rect x="97.8" y="466.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="478.0" r="5" class="st-good"/>
+<text x="361.4" y="482.0" class="vl">17.1 h</text>
+<text x="32.0" y="506.0" class="lb">aur</text>
+<g><title>armv7h-aur: fetched 2026-10-14T17:28:18Z, 17.1 d ago, matches upstream</title><path d="M97.8 496.0h231.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-231.6z" class="st-good"/><path d="M317.4 509.0l4 -14" class="cut"/><path d="M323.4 509.0l4 -14" class="cut"/><rect x="97.8" y="490.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="502.0" r="5" class="st-good"/>
+<text x="361.4" y="506.0" class="vl">17.1 d</text>
+<text x="24.0" y="533.0" class="gr">loong64</text>
+<text x="32.0" y="558.0" class="lb">core</text>
+<g><title>loong64-core: fetched 2026-10-31T12:22:48Z, 6.5 h ago, matches upstream</title><path d="M97.8 548.0h17.3a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-17.3z" class="st-good"/><rect x="97.8" y="542.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="554.0" r="5" class="st-good"/>
+<text x="361.4" y="558.0" class="vl">6.5 h</text>
+<text x="32.0" y="582.0" class="lb">extra</text>
+<g><title>loong64-extra: fetched 2026-10-31T14:14:40Z, 4.6 h ago, matches upstream</title><path d="M97.8 572.0h11.2a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-11.2z" class="st-good"/><rect x="97.8" y="566.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="578.0" r="5" class="st-good"/>
+<text x="361.4" y="582.0" class="vl">4.6 h</text>
+<text x="24.0" y="609.0" class="gr">riscv64</text>
+<text x="32.0" y="634.0" class="lb">core</text>
+<g><title>riscv64-core: fetched 2026-10-31T18:36:13Z, 17 min ago, matches upstream</title><path d="M97.8 624.0h0.9v12.0h-0.9z" class="st-good"/><rect x="97.8" y="618.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="630.0" r="5" class="st-good"/>
+<text x="361.4" y="634.0" class="vl">17 min</text>
+<text x="32.0" y="658.0" class="lb">extra</text>
+<g><title>riscv64-extra: fetched 2026-10-31T18:43:15Z, 10 min ago, matches upstream</title><path d="M97.8 648.0h0.5v12.0h-0.5z" class="st-good"/><rect x="97.8" y="642.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="654.0" r="5" class="st-good"/>
+<text x="361.4" y="658.0" class="vl">10 min</text>
+<text x="24.0" y="685.0" class="gr">powerpc64le</text>
+<text x="32.0" y="710.0" class="lb">base</text>
+<g><title>powerpc64le-base: fetched 2026-10-27T08:56:49Z, 4.4 d ago, matches upstream</title><path d="M97.8 700.0h231.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-231.6z" class="st-good"/><path d="M317.4 713.0l4 -14" class="cut"/><path d="M323.4 713.0l4 -14" class="cut"/><rect x="97.8" y="694.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="706.0" r="5" class="st-good"/>
+<text x="361.4" y="710.0" class="vl">4.4 d</text>
+<text x="32.0" y="734.0" class="lb">base-any</text>
+<g><title>powerpc64le-base-any: fetched 2026-10-27T13:35:27Z, 4.2 d ago, matches upstream</title><path d="M97.8 724.0h231.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-231.6z" class="st-good"/><path d="M317.4 737.0l4 -14" class="cut"/><path d="M323.4 737.0l4 -14" class="cut"/><rect x="97.8" y="718.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="730.0" r="5" class="st-good"/>
+<text x="361.4" y="734.0" class="vl">4.2 d</text>
+<text x="24.0" y="761.0" class="gr">powerpc64</text>
+<text x="32.0" y="786.0" class="lb">base</text>
+<g><title>powerpc64-base: fetched 2026-10-27T08:56:49Z, 4.4 d ago, matches upstream</title><path d="M97.8 776.0h231.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-231.6z" class="st-good"/><path d="M317.4 789.0l4 -14" class="cut"/><path d="M323.4 789.0l4 -14" class="cut"/><rect x="97.8" y="770.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="782.0" r="5" class="st-good"/>
+<text x="361.4" y="786.0" class="vl">4.4 d</text>
+<text x="32.0" y="810.0" class="lb">base-any</text>
+<g><title>powerpc64-base-any: fetched 2026-10-27T13:35:27Z, 4.2 d ago, matches upstream</title><path d="M97.8 800.0h231.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-231.6z" class="st-good"/><path d="M317.4 813.0l4 -14" class="cut"/><path d="M323.4 813.0l4 -14" class="cut"/><rect x="97.8" y="794.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="806.0" r="5" class="st-good"/>
+<text x="361.4" y="810.0" class="vl">4.2 d</text>
+<text x="24.0" y="837.0" class="gr">powerpc</text>
+<text x="32.0" y="862.0" class="lb">base</text>
+<g><title>powerpc-base: fetched 2026-10-20T08:29:31Z, 11.4 d ago, stale</title><path d="M97.8 852.0h231.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-231.6z" class="st-critical"/><path d="M317.4 865.0l4 -14" class="cut"/><path d="M323.4 865.0l4 -14" class="cut"/><rect x="97.8" y="846.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<path d="M350.4 853.0l5 5-5 5-5-5z" class="st-critical"/>
+<text x="361.4" y="862.0" class="vl">11.4 d</text>
+<text x="32.0" y="886.0" class="lb">base-any</text>
+<g><title>powerpc-base-any: fetched 2026-10-27T13:35:27Z, 4.2 d ago, matches upstream</title><path d="M97.8 876.0h231.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-231.6z" class="st-good"/><path d="M317.4 889.0l4 -14" class="cut"/><path d="M323.4 889.0l4 -14" class="cut"/><rect x="97.8" y="870.0" width="298.2" height="24" fill="#000" fill-opacity="0"/></g>
+<circle cx="350.4" cy="882.0" r="5" class="st-good"/>
+<text x="361.4" y="886.0" class="vl">4.2 d</text>
+<text x="215.6" y="940.0" class="ax" text-anchor="middle">Time since the snapshot was fetched from upstream</text>
+</svg>

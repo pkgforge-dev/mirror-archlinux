@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="644" viewBox="0 0 420 644" role="img" aria-labelledby="title desc">
+<title id="title">pacman speed by path</title>
+<desc id="desc">Median seconds of pacman -Sy and -Sw through the official mirror, the Worker, and the oci wrapper with and without prefetch.</desc>
+<style>.bg{fill:#fcfcfb;stroke:rgba(11,11,11,.10)}text{font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif}.tt{font-size:16px;font-weight:600;fill:#0b0b0b}.hd{font-size:30px;font-weight:600;fill:#0b0b0b}.sub{font-size:13px;fill:#52514e}.lb{font-size:12px;fill:#0b0b0b}.gr{font-size:12px;font-weight:600;fill:#52514e;paint-order:stroke;stroke:#fcfcfb;stroke-width:5px;stroke-linejoin:round}.vl{font-size:12px;fill:#0b0b0b;font-variant-numeric:tabular-nums}.mu{fill:#6f6e69}.lg{font-size:12px;fill:#52514e}.tk{font-size:11px;fill:#6f6e69;font-variant-numeric:tabular-nums}.ax{font-size:12px;fill:#52514e}.note{font-size:13px;fill:#6f6e69}.grid{stroke:#e9e8e3;stroke-width:1}.base{stroke:#c3c2b7;stroke-width:1}.ref{stroke:#7d7b75;stroke-width:1}.lead{stroke:#c3c2b7;stroke-width:1;fill:none}.track{fill:#ebeae5}.ring{stroke:#fcfcfb;stroke-width:2}.cut{stroke:#fcfcfb;stroke-width:2}.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}.hollow{fill:none;stroke:#898781;stroke-width:1.5}.s1{fill:#2a78d6}.l1{stroke:#2a78d6}.s2{fill:#eb6834}.l2{stroke:#eb6834}.s3{fill:#1baf7a}.l3{stroke:#1baf7a}.s4{fill:#eda100}.l4{stroke:#eda100}.s5{fill:#e87ba4}.l5{stroke:#e87ba4}.s6{fill:#008300}.l6{stroke:#008300}.s7{fill:#4a3aa7}.l7{stroke:#4a3aa7}.s8{fill:#e34948}.l8{stroke:#e34948}.s0{fill:#a3a29c}.l0{stroke:#a3a29c}.st-good{fill:#0ca30c}.st-warning{fill:#fab219}.st-critical{fill:#d03b3b}.st-none{fill:#898781}.st-unknown{fill:#898781}@media (prefers-color-scheme:dark){.bg{fill:#1a1a19;stroke:rgba(255,255,255,.10)}.tt,.hd,.lb,.vl{fill:#ffffff}.sub,.gr,.ax,.lg{fill:#c3c2b7}.tk,.note,.mu{fill:#9a9890}.grid{stroke:#2a2a28}.base,.lead{stroke:#3d3d3a}.ref{stroke:#9a9890}.track{fill:#2e2e2c}.ring,.cut,.gr{stroke:#1a1a19}.s1{fill:#3987e5}.l1{stroke:#3987e5}.s2{fill:#d95926}.l2{stroke:#d95926}.s3{fill:#199e70}.l3{stroke:#199e70}.s4{fill:#c98500}.l4{stroke:#c98500}.s5{fill:#d55181}.l5{stroke:#d55181}.s6{fill:#008300}.l6{stroke:#008300}.s7{fill:#9085e9}.l7{stroke:#9085e9}.s8{fill:#e66767}.l8{stroke:#e66767}.s0{fill:#6b6a65}.l0{stroke:#6b6a65}}</style>
+<rect class="bg" x="0.5" y="0.5" width="419" height="643" rx="12"/>
+<text x="24.0" y="40.0" class="tt">pacman speed by path</text>
+<text x="24.0" y="82.0" class="hd">5.15 s</text>
+<text x="24.0" y="101.0" class="sub">for -Sy and -Sw through the oci wrapper, median of 3</text>
+<text x="24.0" y="120.0" class="sub">rounds. Official mirror: 6.11 s. Measured 2026-10-31 on</text>
+<text x="24.0" y="139.0" class="sub">runnervm48cm3 (Linux x86_64), in archlinux:base through</text>
+<text x="24.0" y="158.0" class="sub">docker.</text>
+<rect x="24.0" y="179.0" width="10" height="10" rx="2" class="s1"/>
+<text x="40.0" y="188.0" class="lg">oci wrapper</text>
+<rect x="127.4" y="179.0" width="10" height="10" rx="2" class="s0"/>
+<text x="143.4" y="188.0" class="lg">official mirror, Worker, oci serial</text>
+<path d="M155.7 210.0V584.0" class="base"/>
+<text x="155.7" y="600.0" class="tk" text-anchor="middle">0 s</text>
+<path d="M249.2 210.0V584.0" class="grid"/>
+<text x="249.2" y="600.0" class="tk" text-anchor="middle">20 s</text>
+<path d="M342.7 210.0V584.0" class="grid"/>
+<text x="342.7" y="600.0" class="tk" text-anchor="middle">40 s</text>
+<text x="24.0" y="223.0" class="gr">pacman -Sy, the databases</text>
+<text x="32.0" y="248.0" class="lb">official mirror</text>
+<g><title>official mirror, sy: median 411 ms of 793 ms, 411 ms, 411 ms; 1 files, 0.1 MiB</title><path d="M155.7 238.0h0.0a1.9 1.9 0 0 1 1.9 1.9v8.2a1.9 1.9 0 0 1 -1.9 1.9h-0.0z" class="s0"/><rect x="155.7" y="232.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="165.6" y="248.0" class="vl">411 ms</text>
+<text x="32.0" y="272.0" class="lb">Worker, native</text>
+<g><title>Worker, native, sy: median 454 ms of 557 ms, 346 ms, 454 ms; 1 files, 0.1 MiB</title><path d="M155.7 262.0h0.0a2.1 2.1 0 0 1 2.1 2.1v7.8a2.1 2.1 0 0 1 -2.1 2.1h-0.0z" class="s0"/><rect x="155.7" y="256.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="165.8" y="272.0" class="vl">454 ms</text>
+<text x="32.0" y="296.0" class="lb">oci wrapper</text>
+<g><title>oci wrapper, sy: median 547 ms of 547 ms, 585 ms, 530 ms; 1 files, 0.1 MiB</title><path d="M155.7 286.0h0.0a2.6 2.6 0 0 1 2.6 2.6v6.9a2.6 2.6 0 0 1 -2.6 2.6h-0.0z" class="s1"/><rect x="155.7" y="280.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="166.2" y="296.0" class="vl">547 ms</text>
+<text x="32.0" y="320.0" class="lb">oci wrapper, serial</text>
+<g><title>oci wrapper, serial, sy: median 535 ms of 554 ms, 535 ms, 496 ms; 1 files, 0.1 MiB</title><path d="M155.7 310.0h0.0a2.5 2.5 0 0 1 2.5 2.5v7.0a2.5 2.5 0 0 1 -2.5 2.5h-0.0z" class="s0"/><rect x="155.7" y="304.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="166.2" y="320.0" class="vl">535 ms</text>
+<text x="24.0" y="347.0" class="gr">pacman -Sw, the 80 smallest packages</text>
+<text x="32.0" y="372.0" class="lb">official mirror</text>
+<g><title>official mirror, sw-small: median 2.27 s of 1.81 s, 2.27 s, 2.30 s; 80 files, 0.6 MiB</title><path d="M155.7 362.0h6.6a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-6.6z" class="s0"/><rect x="155.7" y="356.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="174.3" y="372.0" class="vl">2.27 s</text>
+<text x="32.0" y="396.0" class="lb">Worker, native</text>
+<g><title>Worker, native, sw-small: median 1.66 s of 3.52 s, 1.66 s, 1.54 s; 80 files, 0.6 MiB</title><path d="M155.7 386.0h3.7a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-3.7z" class="s0"/><rect x="155.7" y="380.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="171.4" y="396.0" class="vl">1.66 s</text>
+<text x="32.0" y="420.0" class="lb">oci wrapper</text>
+<g><title>oci wrapper, sw-small: median 1.31 s of 1.32 s, 1.28 s, 1.31 s; 80 files, 0.6 MiB</title><path d="M155.7 410.0h2.1a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-2.1z" class="s1"/><rect x="155.7" y="404.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="169.8" y="420.0" class="vl">1.31 s</text>
+<text x="32.0" y="444.0" class="lb">oci wrapper, serial</text>
+<g><title>oci wrapper, serial, sw-small: median 38.3 s of 38.1 s, 38.3 s, 40.3 s; 80 files, 0.6 MiB</title><path d="M155.7 434.0h175.1a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-175.1z" class="s0"/><rect x="155.7" y="428.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="342.7" y="444.0" class="vl">38.3 s</text>
+<text x="24.0" y="471.0" class="gr">pacman -Sw, the 6 largest packages</text>
+<text x="32.0" y="496.0" class="lb">official mirror</text>
+<g><title>official mirror, sw-large: median 3.43 s of 3.44 s, 3.43 s, 2.93 s; 6 files, 515.0 MiB</title><path d="M155.7 486.0h12.1a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-12.1z" class="s0"/><rect x="155.7" y="480.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="179.7" y="496.0" class="vl">3.43 s</text>
+<text x="32.0" y="520.0" class="lb">Worker, native</text>
+<g><title>Worker, native, sw-large: median 2.82 s of 4.68 s, 2.82 s, 2.67 s; 6 files, 515.0 MiB</title><path d="M155.7 510.0h9.2a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-9.2z" class="s0"/><rect x="155.7" y="504.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="176.9" y="520.0" class="vl">2.82 s</text>
+<text x="32.0" y="544.0" class="lb">oci wrapper</text>
+<g><title>oci wrapper, sw-large: median 3.29 s of 3.15 s, 3.29 s, 3.37 s; 6 files, 515.0 MiB</title><path d="M155.7 534.0h11.4a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-11.4z" class="s1"/><rect x="155.7" y="528.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="179.1" y="544.0" class="vl">3.29 s</text>
+<text x="32.0" y="568.0" class="lb">oci wrapper, serial</text>
+<g><title>oci wrapper, serial, sw-large: median 6.05 s of 6.05 s, 6.00 s, 15.0 s; 6 files, 515.0 MiB</title><path d="M155.7 558.0h24.3a4.0 4.0 0 0 1 4.0 4.0v4.0a4.0 4.0 0 0 1 -4.0 4.0h-24.3z" class="s0"/><rect x="155.7" y="552.0" width="240.3" height="24" fill="#000" fill-opacity="0"/></g>
+<text x="192.0" y="568.0" class="vl">6.05 s</text>
+<text x="249.2" y="622.0" class="ax" text-anchor="middle">Seconds, median of the rounds; shorter is faster</text>
+</svg>
