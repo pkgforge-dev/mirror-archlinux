@@ -41,7 +41,7 @@ defaults:
 
 jobs:
   watch:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # WATCH_BUDGET (300 s) of HEAD requests, then dispatch-sync under its own
     # 120 s limit, fit in 10 minutes.
     timeout-minutes: 10
