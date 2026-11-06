@@ -57,7 +57,7 @@ trap 'printf "bench-consumer: line %s: \"%s\" ended %s\n" "$LINENO" "$BASH_COMMA
 export LC_ALL=C
 
 # tag: base
-ARCH_IMAGE=docker.io/library/archlinux:base@sha256:ece6c971fec3c532fd508bce299a446deaf469feecbfe7c353e995bc1a5e7bba
+ARCH_IMAGE=docker.io/library/archlinux:base@sha256:b1c2fe6e717bfd5673af8fc217e1e1c3ce0dcbb1d53c3414c8425e7ce79fc6d9
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARCH="${BENCH_ARCH:-x86_64}"
