@@ -35,7 +35,7 @@ set -euo pipefail
 # tag: base
 ARCH_IMAGE=docker.io/library/archlinux:base@sha256:b1c2fe6e717bfd5673af8fc217e1e1c3ce0dcbb1d53c3414c8425e7ce79fc6d9
 # tag: 3
-REGISTRY_IMAGE=docker.io/library/registry:3@sha256:d4032d4cc323c1731c707931ecada07a53076eac38e3b61ae57533f170f2c6c3
+REGISTRY_IMAGE=docker.io/library/registry:3@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c
 # tag: 1.38
 HTTPD_IMAGE=docker.io/library/busybox:1.38@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
 
