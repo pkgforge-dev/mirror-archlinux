@@ -199,7 +199,7 @@ jobs:
           # The node image of .github/workflows/worker.yml. Renovate moves
           # the two in one pull request (group "node image").
           # tag: 24-alpine
-          IMAGE: docker.io/library/node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85
+          IMAGE: docker.io/library/node:24-alpine@sha256:a34ab6d7f6f4813f4d0c5469d74685604b962fbdbf5793a7bc7b4998ecb867c8
         run: |
           docker run --rm -v "$PWD:/work:ro" -v "$RUNNER_TEMP/tools:/tools:ro" -w /work \
             -e TESTS_REQUIRE_TOOLS='node bash' "$IMAGE" \
