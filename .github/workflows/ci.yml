@@ -43,7 +43,7 @@ defaults:
 
 jobs:
   static:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -66,7 +66,7 @@ jobs:
 
   unit:
     name: unit (${{ matrix.leg }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -132,7 +132,7 @@ jobs:
 
   # The matrix of the next job, from tests/run.sh --list.
   integration-files:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -165,7 +165,7 @@ jobs:
 
   integration:
     needs: integration-files
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -184,7 +184,7 @@ jobs:
         run: tests/run.sh integration "$TEST_FILE"
 
   worker:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -209,7 +209,7 @@ jobs:
   # directories frees less, and that is worth a warning, not a red run.
   # debloat-runner failing outright still fails the job.
   debloat:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -234,7 +234,7 @@ jobs:
   # So Renovate may merge a new keyring_image digest on its own while the
   # keys stay the same, and a change of keys waits for a person.
   keyrings:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       contents: read
