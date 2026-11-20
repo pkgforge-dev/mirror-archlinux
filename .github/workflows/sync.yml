@@ -95,7 +95,7 @@ env:
 
 jobs:
   plan:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # These fit under 40 min: 20 min of upstream reads (PLAN_BUDGET), 4 min
     # of registry reads (REGISTRY_READ_BUDGET), and up to about 9 min more
     # for the registry read in progress when that budget is spent. The
@@ -411,7 +411,7 @@ jobs:
   report:
     needs: [plan, target]
     if: ${{ always() }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       actions: write
@@ -472,7 +472,7 @@ jobs:
   # No needs, in either direction: this runs whatever the sync does, and the
   # watchdog workflow runs the same two checks, so each witnesses the other.
   keepalive:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       actions: write
