@@ -33,7 +33,7 @@ set -euo pipefail
 . "$REPO_ROOT/tests/lib/harness.sh"
 
 # tag: base
-ARCH_IMAGE=docker.io/library/archlinux:base@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
+ARCH_IMAGE=docker.io/library/archlinux:base@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d
 # tag: 3
 REGISTRY_IMAGE=docker.io/library/registry:3@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
 # tag: 1.38
